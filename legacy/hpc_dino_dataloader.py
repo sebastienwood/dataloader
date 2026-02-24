@@ -122,7 +122,7 @@ try:
 except ImportError:
     HAS_WDS = False
 
-from dino_dali_dataloader import DINOAugConfig, DatasetSpec, build_dino_pipeline
+from legacy.dino_dali_dataloader import DINOAugConfig, DatasetSpec, build_dino_pipeline
 
 
 # ══════════════════════════════════════════════════════════════════════════════

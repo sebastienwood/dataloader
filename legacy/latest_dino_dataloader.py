@@ -100,7 +100,7 @@ except ImportError:
     HAS_DALI = False
 
 # Re-use unchanged components from the HPC loader
-from hpc_dino_dataloader import (
+from legacy.hpc_dino_dataloader import (
     AsyncH2DPrefetcher,
     DataLoaderCheckpointer,
     DataLoaderState,
@@ -108,7 +108,7 @@ from hpc_dino_dataloader import (
     NodeSharedShardCache,
     DatasetSpec,
 )
-from dino_dali_dataloader import DINOAugConfig
+from legacy.dino_dali_dataloader import DINOAugConfig
 
 
 # ══════════════════════════════════════════════════════════════════════════════

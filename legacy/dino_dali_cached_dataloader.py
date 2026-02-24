@@ -65,7 +65,7 @@ import torch
 import torch.distributed as dist
 
 # ── Base loader (previous file) ──────────────────────────────────────────────
-from dino_dali_dataloader import (
+from legacy.dino_dali_dataloader import (
     DINOAugConfig,
     DINODALIDataLoader,
     DatasetSpec,
