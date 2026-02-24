@@ -80,6 +80,7 @@ class LoaderConfig:
     # ── Shard I/O ─────────────────────────────────────────────────────────────
     node_shm_gb:             float = 128.0   # /dev/shm budget per node
     shard_prefetch_window:   int   = 64      # shards in-flight ahead of consumer
+    shard_timeout_s:         float = 300.0   # max wait for a shard (non-master ranks)
 
     # ── DALI pipeline ─────────────────────────────────────────────────────────
     dali_cpu_queue:          int   = 8       # prefetch_queue_depth cpu_size

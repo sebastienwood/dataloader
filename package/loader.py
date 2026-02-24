@@ -114,6 +114,7 @@ class DINODataLoader:
             job_id          = os.environ.get("SLURM_JOB_ID", "dino"),
             max_shm_gb      = self._cfg.node_shm_gb,
             prefetch_window = self._cfg.shard_prefetch_window,
+            shard_timeout_s = self._cfg.shard_timeout_s,
         )
         # Barrier: ensure node master has initialised /dev/shm before others read
         if dist.is_available() and dist.is_initialized():
