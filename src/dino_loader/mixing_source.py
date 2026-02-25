@@ -71,6 +71,9 @@ from dino_loader.config         import DatasetSpec
 from dino_loader.io.shard_cache import NodeSharedShardCache
 from dino_loader.datasets.utils import _extract_jpegs
 
+from dino_loader.monitor.tracing import trace
+from dino_loader.monitor.metrics import get_registry
+
 log = logging.getLogger(__name__)
 
 
@@ -393,14 +396,19 @@ class MixingSource:
         return self
 
     def __next__(self) -> List[np.ndarray]:
-        weights = self._weights.get()
-        indices = self._rng.choices(
-            range(len(self._iterators)), weights=weights, k=self._batch_size
-        )
-        return [
-            np.frombuffer(self._iterators[i].next_jpeg(), dtype=np.uint8)
-            for i in indices
-        ]
+        reg = get_registry()
+        if reg and len(self._iterators) > 0:
+            reg.set("mixing_source_queue_depth", len(self._iterators[0]._buffer))
+
+        with trace("MixingSource.__next__", "pipeline"):
+            weights = self._weights.get()
+            indices = self._rng.choices(
+                range(len(self._iterators)), weights=weights, k=self._batch_size
+            )
+            return [
+                np.frombuffer(self._iterators[i].next_jpeg(), dtype=np.uint8)
+                for i in indices
+            ]
 
     # ------------------------------------------------------------------
     # Cleanup  [F-1]

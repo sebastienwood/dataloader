@@ -267,7 +267,18 @@ class NodeSharedShardCache:
                 future.result()   # block until done
             return self._read(shm)
         else:
-            _inotify_wait(shm, self._timeout)
+            import time
+            from dino_loader.monitor.tracing import trace
+            from dino_loader.monitor.metrics import get_registry
+            
+            t0 = time.time()
+            with trace("shard_wait", "io"):
+                _inotify_wait(shm, self._timeout)
+            
+            reg = get_registry()
+            if reg:
+                reg.inc("shard_wait_time_ms", int((time.time() - t0) * 1000.0))
+            
             return self._read(shm)
 
     @contextlib.contextmanager
@@ -289,7 +300,17 @@ class NodeSharedShardCache:
                 )
                 future.result()
         else:
-            _inotify_wait(shm, self._timeout)
+            import time
+            from dino_loader.monitor.tracing import trace
+            from dino_loader.monitor.metrics import get_registry
+            
+            t0 = time.time()
+            with trace("shard_wait", "io"):
+                _inotify_wait(shm, self._timeout)
+                
+            reg = get_registry()
+            if reg:
+                reg.inc("shard_wait_time_ms", int((time.time() - t0) * 1000.0))
 
         with open(shm, "rb") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -344,6 +365,13 @@ class NodeSharedShardCache:
                 with self._lru_lock:
                     self._lru[str(shm)] = len(data)
                     self._total_bytes  += len(data)
+                    
+                from dino_loader.monitor.metrics import get_registry
+                reg = get_registry()
+                if reg:
+                    reg.inc("lustre_bytes_read", len(data))
+                    reg.inc("lustre_read_time_ms", int(elapsed * 1000.0))
+                    reg.set("shard_cache_utilization_pct", self.utilisation * 100.0)
         finally:
             with self._lru_lock:
                 self._in_flight.discard(shard_path)   # [A-5]

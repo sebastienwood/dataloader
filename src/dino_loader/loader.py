@@ -40,6 +40,9 @@ from dino_loader.distributed       import ClusterTopology, detect_topology
 from dino_loader.io.mixing_source  import MixingSource
 from dino_loader.io.shard_cache    import NodeSharedShardCache
 
+from dino_loader.monitor.metrics   import init_registry, get_registry
+from dino_loader.monitor.tracing   import trace
+
 log = logging.getLogger(__name__)
 
 try:
@@ -113,6 +116,13 @@ class DINODataLoader:
         # ── Topology (already detected & NCCL configured by slurm_init;
         #    detect again here for standalone / non-SLURM use)  ─────────────
         self._topo = detect_topology(force=self._cfg.force_topology)
+
+        # ── Initialize Metrics ────────────────────────────────────────────────
+        init_registry(
+            job_id=os.environ.get("SLURM_JOB_ID", "dino"),
+            create=(local_rank == 0),
+            local_rank=local_rank
+        )
 
         # ── Stage 1: Node-local shared shard cache ────────────────────────────
         node_master = (local_rank == 0)
@@ -233,7 +243,22 @@ class DINODataLoader:
         """Convert DALI iterator output (list of dicts) to {"global", "local"} dicts."""
         ng = self._aug_cfg.n_global_crops
         nl = self._aug_cfg.n_local_crops
-        for dali_out in self._dali_iter:
+        registry = get_registry()
+
+        import time
+        while True:
+            t0 = time.time()
+            with trace("dali_wait", "pipeline"):
+                try:
+                    dali_out = next(self._dali_iter)
+                except StopIteration:
+                    break
+            
+            if registry:
+                registry.set("pipeline_yield_time_ms", float((time.time() - t0) * 1000.0))
+                registry.inc("loader_batches_yielded", 1)
+
+            # d is a dict of strings to DALI tensors
             d = dali_out[0]
             # Cast DALI FLOAT16 → PyTorch bfloat16 for B200 tensor cores
             yield {
