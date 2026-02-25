@@ -232,7 +232,7 @@ class FP8Formatter:
         self._device  = device
         self._enabled = HAS_TE
         # amax history per view index (global_0, global_1, local_0, ...)
-        self._amax_history: Dict[int, deque] = {}
+        self._amax_history: Dict[int, torch.Tensor] = {}
         self._lock = threading.Lock()
 
         if self._enabled:
@@ -253,26 +253,30 @@ class FP8Formatter:
     def _quantise(self, tensor: torch.Tensor, view_idx: int) -> Tuple:
         t = tensor.to(self._device).float()
 
-        # Update rolling amax
-        amax_val = t.abs().max().item()
+        # Compute max synchronously on GPU, no host sync
+        amax_val = t.abs().max()
+
         with self._lock:
             if view_idx not in self._amax_history:
-                self._amax_history[view_idx] = deque([amax_val] * _AMAX_WINDOW,
-                                                     maxlen=_AMAX_WINDOW)
-            else:
-                self._amax_history[view_idx].append(amax_val)
-            window_amax = max(self._amax_history[view_idx])
+                self._amax_history[view_idx] = torch.zeros(_AMAX_WINDOW, dtype=torch.float32, device=self._device)
+            
+            # Shift history and append new amax
+            history = self._amax_history[view_idx]
+            history = torch.roll(history, shifts=-1)
+            history[-1] = amax_val
+            self._amax_history[view_idx] = history
+            
+            # window_amax is a 0D tensor
+            window_amax = history.max()
 
-        scale     = window_amax / _FP8_MAX if window_amax > 0 else 1.0
-        scale_inv = 1.0 / max(scale, 1e-12)
+        scale = torch.where(window_amax > 0, window_amax / _FP8_MAX, torch.tensor(1.0, device=self._device))
+        scale_inv = 1.0 / torch.clamp(scale, min=1e-12)
 
         fp8 = (t * scale_inv).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
 
         meta = tex.FP8TensorMeta()
-        meta.scale     = torch.tensor([scale],     dtype=torch.float32, device=self._device)
-        meta.scale_inv = torch.tensor([scale_inv], dtype=torch.float32, device=self._device)
-        meta.amax_history = torch.tensor(
-            list(self._amax_history[view_idx]), dtype=torch.float32, device=self._device
-        ).unsqueeze(0)
+        meta.scale     = scale.unsqueeze(0).float()
+        meta.scale_inv = scale_inv.unsqueeze(0).float()
+        meta.amax_history = self._amax_history[view_idx].unsqueeze(0).float()
 
         return fp8, meta

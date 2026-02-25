@@ -207,13 +207,10 @@ def _augment_view(
     imgs    = do_gray * gray + (1 - do_gray) * imgs
 
     # ── 6. Gaussian blur ──────────────────────────────────────────────────────
-    # Cast to UINT8 for gaussian_blur (DALI requirement), then back to FLOAT16
-    imgs_u8 = fn.cast(imgs, dtype=types.UINT8)
     sigma   = fn.random.uniform(range=(cfg.blur_sigma_min, cfg.blur_sigma_max))
-    blurred = fn.gaussian_blur(imgs_u8, sigma=sigma)
+    blurred = fn.gaussian_blur(imgs, sigma=sigma)
     do_blur = fn.random.coin_flip(probability=blur_prob, dtype=types.BOOL)
-    imgs_u8 = do_blur * blurred + (1 - do_blur) * imgs_u8
-    imgs    = fn.cast(imgs_u8, dtype=types.FLOAT16)
+    imgs    = do_blur * blurred + (1 - do_blur) * imgs
 
     # ── 7. Solarisation (second global crop only) ─────────────────────────────
     if solarize_prob > 0:

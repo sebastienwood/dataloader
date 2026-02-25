@@ -54,7 +54,7 @@ REJECTED / FIXED
 from __future__ import annotations
 
 import asyncio
-import atexit
+import contextlib
 import hashlib
 import logging
 import mmap
@@ -68,7 +68,7 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Set
+from typing import Iterator, Set
 
 log = logging.getLogger(__name__)
 
@@ -269,6 +269,34 @@ class NodeSharedShardCache:
         else:
             _inotify_wait(shm, self._timeout)
             return self._read(shm)
+
+    @contextlib.contextmanager
+    def get_view(self, shard_path: str) -> Iterator[memoryview]:
+        """
+        Yield a zero-copy memoryview into the shard file.
+        The caller MUST NOT let the memoryview escape the `with` block,
+        otherwise it will reference a closed mmap.
+        """
+        shm = self._shm_path(shard_path)
+
+        if self._node_master:
+            if not _is_ready(shm):
+                with self._lru_lock:
+                    if shard_path not in self._in_flight:
+                        self._in_flight.add(shard_path)
+                future = asyncio.run_coroutine_threadsafe(
+                    self._load_one(shard_path, shm), self._loop
+                )
+                future.result()
+        else:
+            _inotify_wait(shm, self._timeout)
+
+        with open(shm, "rb") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                data_len, magic = struct.unpack_from(_HDR_FMT, mm, 0)
+                if magic != _READY_MAGIC:
+                    raise RuntimeError(f"Shard {shm} has corrupt header")
+                yield memoryview(mm)[_HDR_SIZE: _HDR_SIZE + data_len]
 
     @property
     def utilisation(self) -> float:
