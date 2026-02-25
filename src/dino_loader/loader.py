@@ -29,7 +29,6 @@ from typing import Iterator, List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
-from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
 from dino_loader.augment.pipeline  import build_pipeline
 from dino_loader.cache.memory      import (AsyncPrefetchIterator, Batch,
@@ -43,6 +42,12 @@ from dino_loader.io.shard_cache    import NodeSharedShardCache
 
 log = logging.getLogger(__name__)
 
+try:
+    from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
+    HAS_DALI = True
+except ImportError:
+    HAS_DALI = False
+    log.error("nvidia-dali not installed — DINODataLoader will not build")
 
 class DINODataLoader:
     """
@@ -89,6 +94,8 @@ class DINODataLoader:
         local_world_size: int                      = 8,
         resume:           bool                     = False,
     ):
+        if not HAS_DALI:
+            raise ImportError("nvidia-dali not installed — DINODataLoader cannot be instantiated")
         # ── Resolve distributed identity ──────────────────────────────────────
         if dist.is_available() and dist.is_initialized():
             rank             = dist.get_rank()

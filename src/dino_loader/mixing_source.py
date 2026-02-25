@@ -69,6 +69,7 @@ import numpy as np
 
 from dino_loader.config         import DatasetSpec
 from dino_loader.io.shard_cache import NodeSharedShardCache
+from dino_loader.datasets.utils import _extract_jpegs
 
 log = logging.getLogger(__name__)
 
@@ -413,54 +414,3 @@ class MixingSource:
     def __del__(self):
         self.close()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Tar parsing
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _extract_jpegs(tar_view: memoryview) -> List[bytes]:
-    """
-    Highly optimized custom tar extractor directly from a memoryview.
-    Skips tarfile module overhead, reading headers directly and extracting JPEGs.
-    """
-    results: List[bytes] = []
-    
-    offset = 0
-    total_len = len(tar_view)
-    
-    while offset + 512 <= total_len:
-        # Check for end of archive (null block)
-        if tar_view[offset] == 0:
-            break
-            
-        # Parse name
-        name_end = offset
-        while name_end < offset + 100 and tar_view[name_end] != 0:
-            name_end += 1
-        name = bytes(tar_view[offset:name_end]).decode("utf-8", "ignore").lower()
-        
-        # Parse size (octal string at offset 124, length 12)
-        size_str = bytes(tar_view[offset + 124 : offset + 135]).strip(b" \0")
-        try:
-            file_size = int(size_str, 8) if size_str else 0
-        except ValueError:
-            file_size = 0
-            
-        data_offset = offset + 512
-        typeflag = tar_view[offset + 156]
-        
-        # Check if normal file (0 or '0' = 48) and jpg/jpeg
-        if typeflag in (0, 48) and (name.endswith(".jpg") or name.endswith(".jpeg")):
-            if data_offset + file_size <= total_len:
-                results.append(bytes(tar_view[data_offset : data_offset + file_size]))
-                
-        # Advance offset (512-byte aligned)
-        blocks = (file_size + 511) // 512
-        offset += 512 + blocks * 512
-
-    if not results:
-        raise RuntimeError(
-            "Shard contained no JPEG files. "
-            "Check that shards are WebDataset tars with .jpg/.jpeg members."
-        )
-    return results
