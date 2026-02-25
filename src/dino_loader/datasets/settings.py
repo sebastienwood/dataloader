@@ -8,10 +8,7 @@ except ImportError:
 
 def get_default_datasets_root() -> str:
     """Fallback default dataset root path relative to the module installation."""
-    return os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), 
-        "webdatasets"
-    )
+    return "~/.dinoloader/"
 
 def _load_toml_datasets_root() -> str | None:
     """Attempts to read the DINO_DATASETS_ROOT from a pyproject.toml in the current working directory."""
