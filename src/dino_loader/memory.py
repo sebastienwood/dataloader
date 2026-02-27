@@ -47,7 +47,9 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import time as _time
 
+from dino_loader.monitor.metrics import get_registry as _get_reg
 from dino_loader.config      import DINOAugConfig
 from dino_loader.distributed import ClusterTopology
 
@@ -204,19 +206,33 @@ class AsyncPrefetchIterator:
         return self
 
     def __next__(self) -> Batch:
+        _t_h2d = _time.monotonic()
         self._h2d.wait()
+        _h2d_ms = int((_time.monotonic() - _t_h2d) * 1000)
+
         raw = self._next
         if raw is None:
             raise StopIteration
+
+        _t_pipe = _time.monotonic()
         self._preload()
+        _pipe_ms = int((_time.monotonic() - _t_pipe) * 1000)
 
         if self._te_fmt is not None:
             raw = self._te_fmt.format(raw)
 
-        return Batch(
+        batch = Batch(
             global_crops = raw["global"],
             local_crops  = raw["local"],
         )
+
+        _reg = _get_reg()
+        if _reg is not None:
+            _reg.inc("h2d_transfer_time_ms",   _h2d_ms)
+            _reg.inc("pipeline_yield_time_ms", _pipe_ms)
+            _reg.inc("loader_batches_yielded")
+            _reg.heartbeat()
+        return batch
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -76,6 +76,8 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Iterator, Set
 
+from dino_loader.monitor.metrics import get_registry
+
 log = logging.getLogger(__name__)
 
 _HDR_FMT     = "QQ"
@@ -208,6 +210,9 @@ class NodeSharedShardCache:
 
         if node_master:
             self._init_shm()
+            # Metrics registry is already initialised by DINODataLoader.__init__
+            # before the cache is constructed.  Grab the singleton here.
+            self._metrics = get_registry()
             self._loop   = asyncio.new_event_loop()
             self._sem    = asyncio.Semaphore(prefetch_window)
             self._thread = threading.Thread(
@@ -218,6 +223,7 @@ class NodeSharedShardCache:
             self._register_signals()        # [FIX-12]
         else:
             self._base.mkdir(parents=True, exist_ok=True)
+            self._metrics = get_registry()   # non-master ranks need shard_cache_wait
 
     # ------------------------------------------------------------------
     # Public API
@@ -249,7 +255,11 @@ class NodeSharedShardCache:
                 ).result()
             return self._read(shm)
         else:
+            t_wait = time.perf_counter()
             _inotify_wait(shm, self._timeout)
+            wait_ms = int((time.perf_counter() - t_wait) * 1000)
+            if self._metrics is not None and wait_ms > 0:
+                self._metrics.inc("shard_cache_wait_time_ms", wait_ms)
             return self._read(shm)
 
     @contextlib.contextmanager
@@ -268,7 +278,11 @@ class NodeSharedShardCache:
                     self._load_one(shard_path, shm), self._loop
                 ).result()
         else:
+            t_wait = time.perf_counter()
             _inotify_wait(shm, self._timeout)
+            wait_ms = int((time.perf_counter() - t_wait) * 1000)
+            if self._metrics is not None and wait_ms > 0:
+                self._metrics.inc("shard_cache_wait_time_ms", wait_ms)
 
         with open(shm, "rb") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -302,6 +316,13 @@ class NodeSharedShardCache:
                     len(data) / (1 << 20), elapsed,
                     len(data) / (1 << 20) / max(elapsed, 1e-9),
                 )
+                # ── Publish Lustre metrics ──────────────────────────────────
+                if self._metrics is not None:
+                    self._metrics.inc("lustre_read_time_ms", int(elapsed * 1000))
+                    self._metrics.inc("lustre_bytes_read",   len(data))
+                    util = self.utilisation * 100.0
+                    self._metrics.set("shard_cache_utilization_pct", util)
+                # ───────────────────────────────────────────────────────────
                 with self._lru_lock:
                     self._evict_for_locked(len(data))
                 self._write(shm, data)

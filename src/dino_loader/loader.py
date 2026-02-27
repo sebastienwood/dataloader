@@ -69,6 +69,7 @@ from dino_loader.config         import CheckpointState, DatasetSpec, DINOAugConf
 from dino_loader.distributed    import ClusterTopology, detect_topology
 from dino_loader.mixing_source  import MixingSource
 from dino_loader.shard_cache    import NodeSharedShardCache
+from dino_loader.monitor.metrics import get_registry, init_registry
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +152,15 @@ class DINODataLoader:
 
         # ── Topology ──────────────────────────────────────────────────────────
         self._topo = detect_topology(force=self._cfg.force_topology)
+
+        # ── Monitoring registry (must precede cache construction) ─────────────────
+        # [FIX-MON] init_registry was never called; all counters were stuck at 0.
+        init_registry(
+            job_id     = self._cfg.job_id,
+            create     = (local_rank == 0),   # node master creates; others attach
+            local_rank = local_rank,
+        )
+        log.debug("Metrics registry initialised (local_rank=%d, create=%s)", local_rank, local_rank == 0)
 
         # ── Stage 1: Node-local shared shard cache ────────────────────────────
         node_master = (local_rank == 0)
@@ -304,6 +314,14 @@ class DINODataLoader:
         self._active_iter = None   # [FIX-C]
         if hasattr(self, "_source"):
             self._source.close()
+            _reg = get_registry()
+            if _reg is not None:
+                _reg.close()
+                if self._local_rank == 0:
+                    try:
+                        _reg.unlink()
+                    except Exception:
+                        pass
 
     # ══════════════════════════════════════════════════════════════════════════
     # Diagnostics
@@ -321,12 +339,18 @@ class DINODataLoader:
         """Convert DALI iterator output to {"global", "local"} dicts."""
         ng = self._aug_cfg.n_global_crops
         nl = self._aug_cfg.n_local_crops
+        _reg = get_registry()
         for dali_out in self._dali_iter:
             d = dali_out[0]
+            _t0 = time.monotonic()
             yield {
                 "global": [d[f"view_{i}"].to(torch.bfloat16)    for i in range(ng)],
                 "local":  [d[f"view_{ng+i}"].to(torch.bfloat16) for i in range(nl)],
             }
+            # Time from yield to resume = time the consumer spent processing.
+            # We want the *producer* stall, so measure before the yield:
+            if _reg is not None:
+                _reg.inc("pipeline_yield_time_ms", int((time.monotonic() - _t0) * 1000))
 
     def _restore(self) -> None:
         state = self._ckptr.load()
