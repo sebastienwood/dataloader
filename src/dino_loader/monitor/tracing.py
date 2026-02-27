@@ -84,4 +84,3 @@ def trace(name: str, cat: str = "default"):
     finally:
         end_ts = time.perf_counter_ns() // 1000
         _GLOBAL_TRACER.record(name, cat, start_ts, end_ts - start_ts)
-

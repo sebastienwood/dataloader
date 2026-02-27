@@ -10,6 +10,14 @@ Correctness fixes vs previous versions
 3.  preallocate_width_hint / preallocate_height_hint: added in previous review.
 4.  BF16 (FLOAT16 inside DALI) for all float ops: added in previous review.
 
+[NOTE-F] Coin-flip arithmetic with BOOL tensors hardened.
+         The previous pattern ``do_flag * tensor_a + (1 - do_flag) * tensor_b``
+         relied on DALI's implicit BOOL → FLOAT16 promotion.  This works
+         correctly in current DALI versions but is fragile against future
+         dtype-promotion rule changes.  Replaced with an explicit
+         ``fn.cast(do_flag, dtype=types.FLOAT16)`` before each use, making
+         the intent unambiguous and immune to implicit-promotion changes.
+
 No additional bugs were found in this file.  Clarifying comments added:
 - Solarisation operates on values in [0, 255] (pre-normalisation) —
   the threshold 128.0 is correct and intentional.
@@ -161,8 +169,13 @@ def _augment_view(
     applied AFTER all stochastic augmentations.
 
     All float ops run in FLOAT16 (maps to BF16 on B200 tensor cores).
-    Each stochastic op binds its coin-flip to a named variable and uses it
-    exactly once per branch — avoiding the double-draw bug.
+
+    Coin-flip blending [NOTE-F]
+    ---------------------------
+    Each stochastic op binds its coin-flip to a named variable.  The BOOL
+    tensor is explicitly cast to FLOAT16 before arithmetic, making the
+    blending formula ``w * branch_a + (1 - w) * branch_b`` unambiguous and
+    independent of DALI's implicit-promotion rules.
     """
     # ── 1. Hardware JPEG decode + random resized crop ─────────────────────────
     imgs = fn.decoders.image_random_crop(
@@ -195,8 +208,12 @@ def _augment_view(
     imgs = fn.cast(imgs, dtype=types.FLOAT16)
 
     # ── 4. Color jitter ───────────────────────────────────────────────────────
-    do_jitter = fn.random.coin_flip(probability=cfg.color_jitter_prob, dtype=types.BOOL)
-    jittered  = fn.color_twist(
+    # [NOTE-F] Explicit cast of coin-flip BOOL → FLOAT16 before arithmetic.
+    do_jitter  = fn.cast(
+        fn.random.coin_flip(probability=cfg.color_jitter_prob, dtype=types.BOOL),
+        dtype=types.FLOAT16,
+    )
+    jittered   = fn.color_twist(
         imgs,
         brightness = fn.random.uniform(range=(1 - cfg.brightness, 1 + cfg.brightness)),
         contrast   = fn.random.uniform(range=(1 - cfg.contrast,   1 + cfg.contrast)),
@@ -207,23 +224,35 @@ def _augment_view(
 
     # ── 5. Random grayscale ───────────────────────────────────────────────────
     # fn.color_space_conversion requires 3-channel HWC input — satisfied here.
-    do_gray = fn.random.coin_flip(probability=cfg.grayscale_prob, dtype=types.BOOL)
+    # [NOTE-F] Explicit cast before blending arithmetic.
+    do_gray = fn.cast(
+        fn.random.coin_flip(probability=cfg.grayscale_prob, dtype=types.BOOL),
+        dtype=types.FLOAT16,
+    )
     gray    = fn.color_space_conversion(imgs, image_type=types.RGB, output_type=types.GRAY)
     # Replicate single channel → 3 channels to keep downstream ops uniform
     gray    = fn.cat(gray, gray, gray, axis=2)
     imgs    = do_gray * gray + (1 - do_gray) * imgs
 
     # ── 6. Gaussian blur ──────────────────────────────────────────────────────
+    # [NOTE-F] Explicit cast before blending arithmetic.
     sigma   = fn.random.uniform(range=(cfg.blur_sigma_min, cfg.blur_sigma_max))
     blurred = fn.gaussian_blur(imgs, sigma=sigma)
-    do_blur = fn.random.coin_flip(probability=blur_prob, dtype=types.BOOL)
+    do_blur = fn.cast(
+        fn.random.coin_flip(probability=blur_prob, dtype=types.BOOL),
+        dtype=types.FLOAT16,
+    )
     imgs    = do_blur * blurred + (1 - do_blur) * imgs
 
     # ── 7. Solarisation (second global crop only, solarize_prob > 0) ──────────
     # Applied while values are still in [0.0, 255.0].  Threshold 128.0 is the
     # standard midpoint for uint8 images — correct and intentional.
+    # [NOTE-F] Explicit cast before blending arithmetic.
     if solarize_prob > 0:
-        do_sol = fn.random.coin_flip(probability=solarize_prob, dtype=types.BOOL)
+        do_sol = fn.cast(
+            fn.random.coin_flip(probability=solarize_prob, dtype=types.BOOL),
+            dtype=types.FLOAT16,
+        )
         mask   = imgs >= 128.0
         sol    = mask * (255.0 - imgs) + (1 - mask) * imgs
         imgs   = do_sol * sol + (1 - do_sol) * imgs

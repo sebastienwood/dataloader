@@ -37,8 +37,8 @@ Additional fixes
          When a dataset has very few shards (e.g. imagenet22k: ~17 shards
          per rank on a 288-GPU job), __init__ submitted two futures for the
          same shard (idx 0 mod 1 == idx 1 mod 1 == 0), triggering two
-         concurrent get_view() calls on the same file.  Fixed by deduplicating
-         the initial submission: if the path was already submitted, skip.
+         concurrent get_view() calls on the same file.  Fixed by
+         deduplicating the initial submission.
 
 [FIX-14] No per-epoch reshuffle.
          The previous implementation shuffled shards once at construction and
@@ -46,6 +46,16 @@ Additional fixes
          training requires epoch-level reshuffling for convergence.  Fixed by
          storing the base seed and re-shuffling in reset_epoch(epoch), which
          MixingSource.set_epoch() calls on all ShardIterators.
+
+[FIX-E]  _init_epoch() deduplication incorrectly advanced self._idx.
+         When n_shards_per_rank < _EXTRACTION_DEPTH (tiny datasets such as
+         imagenet22k on large jobs), the deduplication branch advanced
+         self._idx without submitting a future.  The subsequent
+         _prefetch_window() call then used the bumped idx, silently skipping
+         cache prefetch for the first shard.
+         Fix: the else branch no longer advances _idx.  The duplicate
+         submission is simply skipped; _prefetch_window() covers the shard
+         normally from its correct position.
 """
 
 from __future__ import annotations
@@ -143,6 +153,8 @@ class ShardIterator:
 
     [FIX-14] reset_epoch(epoch) re-shuffles shards deterministically using
     (base_seed + rank + epoch) so each epoch has a distinct, reproducible order.
+
+    [FIX-E]  _init_epoch() deduplication no longer advances _idx spuriously.
     """
 
     _EXTRACTION_DEPTH = 2
@@ -237,17 +249,19 @@ class ShardIterator:
         random.Random(self._seed + self._rank + epoch * 1_000_003).shuffle(self._shards)
         self._idx = 0
 
-        # [FIX-13] Deduplicate initial submissions when n_shards < _EXTRACTION_DEPTH
+        # [FIX-13] + [FIX-E]
+        # Deduplicate initial submissions when n_shards < _EXTRACTION_DEPTH.
+        # Previously the else-branch advanced self._idx without submitting a
+        # future, causing _prefetch_window() to skip the first shard's cache
+        # prefetch.  Now we simply skip the duplicate submission without
+        # touching _idx, so _prefetch_window() starts from the correct position.
         submitted: set[str] = set()
         for _ in range(self._EXTRACTION_DEPTH):
             path = self._shards[self._idx % len(self._shards)]
             if path not in submitted:
                 self._submit_next_extraction()
                 submitted.add(path)
-            else:
-                # Same shard would be submitted twice (tiny dataset); advance
-                # idx without a duplicate future so we don't double-consume.
-                self._idx += 1
+            # [FIX-E] Do NOT advance _idx here — just skip the duplicate.
 
         self._prefetch_window()
 

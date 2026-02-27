@@ -13,8 +13,8 @@ Responsibilities
 - Expose dynamic mixing: set_weights(), set_weight_by_name().
 - Handle distributed identity (auto-detects from dist if initialised).
 
-Fixes vs previous version
---------------------------
+Fixes
+-----
 [FIX-4]  Import paths corrected.  The previous loader.py imported from
          ``dino_loader.augment.pipeline``, ``dino_loader.cache.memory``,
          ``dino_loader.io.mixing_source``, and ``dino_loader.io.shard_cache``.
@@ -37,6 +37,19 @@ Fixes vs previous version
 
 [FIX-19] ``shard_extraction_workers`` now read from ``LoaderConfig`` and
          forwarded to ``MixingSource`` / ``ShardIterator``.
+
+[FIX-A]  ``_restore()`` was not calling ``self._source.set_epoch(state.epoch)``
+         after restoring epoch from a checkpoint.  All ShardIterators silently
+         started from epoch-0 shard order on every resume, regardless of the
+         saved epoch.  Fixed: ``set_epoch()`` is now called inside ``_restore()``
+         after the epoch counter is updated.
+
+[FIX-C]  ``__iter__`` could create two concurrent consumers on the same DALI
+         iterator if called twice within one epoch (e.g. by a tqdm progress bar
+         or an accidental double loop).  DALI's iterator is stateful and
+         non-reentrant; interleaving reads produces silently corrupted batches.
+         Fixed: an ``_active_iter`` flag raises RuntimeError on double-entry.
+         The flag is cleared by ``set_epoch()`` and ``__del__()``.
 """
 
 from __future__ import annotations
@@ -134,6 +147,7 @@ class DINODataLoader:
         self._epoch             = 0
         self._step              = 0
         self._steps_per_epoch   = steps_per_epoch   # [FIX-15]
+        self._active_iter: Optional[AsyncPrefetchIterator] = None  # [FIX-C]
 
         # ── Topology ──────────────────────────────────────────────────────────
         self._topo = detect_topology(force=self._cfg.force_topology)
@@ -217,13 +231,16 @@ class DINODataLoader:
         """
         Call at the start of each epoch.
 
-        [FIX-14] Now calls ``self._source.set_epoch(epoch)`` which propagates
+        [FIX-14] Calls ``self._source.set_epoch(epoch)`` which propagates
         to all ``ShardIterator.reset_epoch()`` calls, re-shuffling shards so
-        each epoch sees a distinct, reproducible order.  Previously this only
-        updated the internal counter with no effect on shard ordering.
+        each epoch sees a distinct, reproducible order.
+
+        [FIX-C] Clears ``_active_iter`` so that ``__iter__`` can be called
+        again for the new epoch without raising RuntimeError.
         """
         self._epoch = epoch
         self._source.set_epoch(epoch)   # [FIX-14]
+        self._active_iter = None        # [FIX-C] allow re-iteration for new epoch
 
     def set_weights(self, weights: Sequence[float]) -> None:
         """Update all dataset mixing weights. Thread-safe; takes effect immediately."""
@@ -244,11 +261,27 @@ class DINODataLoader:
         ))
 
     def __iter__(self) -> Iterator[Batch]:
-        return AsyncPrefetchIterator(
+        """
+        Return an iterator over batches for the current epoch.
+
+        [FIX-C] Guards against double-entry: if called while a previous
+        iteration is still active (e.g. a progress-bar wrapper inspecting the
+        iterator, or an accidental nested loop), raises RuntimeError instead
+        of silently corrupting batches via interleaved DALI reads.
+
+        Call ``set_epoch()`` to reset the guard between epochs.
+        """
+        if self._active_iter is not None:
+            raise RuntimeError(
+                "DINODataLoader.__iter__ was called while a previous iteration "
+                "is still active.  Call set_epoch() before starting a new epoch."
+            )
+        self._active_iter = AsyncPrefetchIterator(
             source = self._dali_collate(),
             h2d    = self._h2d,
             te_fmt = self._fp8_fmt,
         )
+        return self._active_iter
 
     def __len__(self) -> int:
         """
@@ -268,6 +301,7 @@ class DINODataLoader:
         return self._steps_per_epoch
 
     def __del__(self):
+        self._active_iter = None   # [FIX-C]
         if hasattr(self, "_source"):
             self._source.close()
 
@@ -300,6 +334,13 @@ class DINODataLoader:
             return
         self._epoch = state.epoch
         self._step  = state.step
+
+        # [FIX-A] Re-shuffle all shard iterators to match the restored epoch.
+        # Without this call every ShardIterator starts from epoch-0 order on
+        # resume, causing the model to see the same shard sequence regardless
+        # of which epoch was checkpointed.
+        self._source.set_epoch(state.epoch)
+
         if state.mixing_weights and state.dataset_names == self._source.dataset_names:
             self._source.set_weights(state.mixing_weights)
         elif state.dataset_names != self._source.dataset_names:

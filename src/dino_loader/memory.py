@@ -291,7 +291,7 @@ class FP8Formatter:
 
         with self._lock:
             if view_idx not in self._amax_history:
-                # Initialise history on GPU to avoid repeated host↔device xfers
+                # Initialise history on GPU to avoid repeated host<->device xfers
                 self._amax_history[view_idx] = torch.zeros(
                     _AMAX_WINDOW, dtype=torch.float32, device=self._device
                 )

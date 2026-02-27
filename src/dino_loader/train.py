@@ -120,7 +120,7 @@ def main():
                 # student_out = model(g0, g0_meta)
                 pass
 
-            # Backward, optimiser step, EMA teacher update …
+            # Backward, optimiser step, EMA teacher update ...
 
             loader.checkpoint(step)
 

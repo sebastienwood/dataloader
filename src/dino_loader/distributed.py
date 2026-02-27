@@ -152,7 +152,7 @@ def detect_topology(force: Optional[str] = None) -> ClusterTopology:
         except Exception:
             pass
 
-    # ── NVLS (NVLink-level switch reduction, NVLink gen ≥ 4) ─────────────────
+    # ── NVLS (NVLink-level switch reduction, NVLink gen >= 4) ─────────────────
     topo.has_nvlink_sharp = topo.nvlink_gen >= 4
 
     # ── Force overrides ───────────────────────────────────────────────────────
@@ -309,9 +309,9 @@ def slurm_init(
     -----------------
     1. detect_topology + configure_nccl  (before init_process_group)
     2. init_process_group
-    3. dist.barrier()                    ← NEW: ensures all ranks are up
-    4. verify_interconnect               ← safe: all ranks present
-    5. dist.barrier()                    ← callers may rely on this
+    3. dist.barrier()                    <- NEW: ensures all ranks are up
+    4. verify_interconnect               <- safe: all ranks present
+    5. dist.barrier()                    <- callers may rely on this
     """
     try:
         rank             = int(os.environ["SLURM_PROCID"])

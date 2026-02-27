@@ -93,7 +93,7 @@ class Dataset:
                         if f.endswith(".tar"):
                             tar_path = os.path.join(split_path, f)
                             idx_path = os.path.join(split_path, f[:-4] + ".idx")
-                            
+
                             # Minimal check instead of full validation here for speed
                             # We check existence and size. Full validation happens at stub gen
                             if os.path.exists(idx_path):
@@ -111,6 +111,6 @@ class Dataset:
         shards = self.resolve(global_filter, config)
         if not shards:
             return None
-        
+
         weight = config.weight if config else 1.0
         return DatasetSpec(name=self.name, shards=shards, weight=weight)

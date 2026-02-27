@@ -17,13 +17,13 @@ def _load_toml_datasets_root() -> str | None:
         if os.path.exists(pyproject_path):
             with open(pyproject_path, "rb") as f:
                 data = tomllib.load(f)
-                
+
             # Path: tool.dino_loader.datasets.root
             tool = data.get("tool", {})
             dino = tool.get("dino_loader", {})
             datasets = dino.get("datasets", {})
             root = datasets.get("root")
-            
+
             if root:
                 return os.path.abspath(root)
     except Exception:
@@ -36,17 +36,17 @@ def resolve_datasets_root(arg_path: str | None = None) -> str:
     1. Direct Argument Override (arg_path)
     2. TOML Configuration (tool.dino_loader.datasets.root in pyproject.toml)
     3. Environment Variable (DINO_DATASETS_ROOT)
-    4. Code Default Fallback (../webdatasets relative to this file's grand-parent tree)
+    4. Code Default Fallback (~/.dinoloader/)
     """
     if arg_path is not None:
         return arg_path
-        
+
     toml_path = _load_toml_datasets_root()
     if toml_path is not None:
         return toml_path
-        
+
     env_path = os.environ.get("DINO_DATASETS_ROOT")
     if env_path is not None:
         return env_path
-        
+
     return get_default_datasets_root()
