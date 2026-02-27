@@ -3,6 +3,15 @@ dino_loader.config
 ==================
 All configuration lives here.  No logic — pure dataclasses.
 Serialised to / from JSON for checkpointing (no pickle fragility).
+
+Changes vs previous version
+----------------------------
+[FIX-19] Added ``shard_extraction_workers`` to ``LoaderConfig``.
+         The field was claimed to have been "threaded through" in mixing_source
+         [F-3] but was never actually added to the dataclass, making it
+         impossible to configure without patching source.  Default is 4 (up
+         from the previous hard-coded 2) to prevent DALI starvation when
+         workers block on inotify for cold shards at epoch start. [FIX-5]
 """
 
 from __future__ import annotations
@@ -78,30 +87,33 @@ class LoaderConfig:
     Sensible defaults for a GB200 NVL72 node; adjust for your cluster.
     """
     # ── Shard I/O ─────────────────────────────────────────────────────────────
-    node_shm_gb:             float = 128.0   # /dev/shm budget per node
-    shard_prefetch_window:   int   = 64      # shards in-flight ahead of consumer
-    shard_timeout_s:         float = 300.0   # max wait for a shard (non-master ranks)
+    node_shm_gb:             float = 128.0
+    shard_prefetch_window:   int   = 64
+    shard_timeout_s:         float = 300.0
+
+    # ── Shard extraction ──────────────────────────────────────────────────────
+    # [FIX-19 / FIX-5] This field was referenced in mixing_source.py but never
+    # defined here.  Raising the default from 2 → 4 prevents DALI starvation
+    # when workers block on inotify waiting for cold shards at epoch start.
+    # Rule of thumb: set to ≥ shard_prefetch_window / 16, minimum 4.
+    shard_extraction_workers: int  = 4
 
     # ── DALI pipeline ─────────────────────────────────────────────────────────
-    dali_cpu_queue:          int   = 8       # prefetch_queue_depth cpu_size
-    dali_gpu_queue:          int   = 6       # prefetch_queue_depth gpu_size
+    dali_cpu_queue:          int   = 8
+    dali_gpu_queue:          int   = 6
     dali_num_threads:        int   = 8
-    hw_decoder_load:         float = 0.90   # fraction routed to NVJPEG HW ASIC
-
-    # ── Memory ────────────────────────────────────────────────────────────────
-    # No augmented-batch cache: breaks DINO stochasticity (see design notes).
-    # Only raw JPEG bytes are cached (in /dev/shm).
+    hw_decoder_load:         float = 0.90
 
     # ── Output format ─────────────────────────────────────────────────────────
-    use_fp8_output:          bool  = True    # emit FP8 + FP8TensorMeta for TE
-    output_dtype:            str   = "bf16"  # intermediate dtype ("bf16" | "fp32")
+    use_fp8_output:          bool  = True
+    output_dtype:            str   = "bf16"
 
     # ── Checkpointing ─────────────────────────────────────────────────────────
     checkpoint_dir:          str   = "/checkpoint/dino/dl"
     checkpoint_every_steps:  int   = 500
 
     # ── NCCL / topology ───────────────────────────────────────────────────────
-    force_topology:          Optional[str] = None  # "nvl72" | "pcie" | None=auto
+    force_topology:          Optional[str] = None
 
     # ── Misc ──────────────────────────────────────────────────────────────────
     seed:                    int   = 0
@@ -109,7 +121,11 @@ class LoaderConfig:
 
     def __post_init__(self):
         if self.output_dtype not in ("bf16", "fp32"):
-            raise ValueError(f"output_dtype must be 'bf16' or 'fp32', got {self.output_dtype!r}")
+            raise ValueError(
+                f"output_dtype must be 'bf16' or 'fp32', got {self.output_dtype!r}"
+            )
+        if self.shard_extraction_workers < 1:
+            raise ValueError("shard_extraction_workers must be ≥ 1")
 
 
 # ── Checkpoint state (JSON-serialisable) ─────────────────────────────────────

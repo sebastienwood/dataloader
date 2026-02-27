@@ -1,32 +1,22 @@
 """
-dino_loader.augment.pipeline
-============================
+dino_loader.pipeline
+====================
 DALI augmentation pipeline for DINOv3 multi-crop.
 
 Correctness fixes vs previous versions
 ---------------------------------------
-1.  Coin-flip reuse bug: the old pattern
+1.  Coin-flip reuse bug: fixed in previous review.
+2.  hw_decoder_load range validation: added in previous review.
+3.  preallocate_width_hint / preallocate_height_hint: added in previous review.
+4.  BF16 (FLOAT16 inside DALI) for all float ops: added in previous review.
 
-        do = coin_flip(p)
-        out = do * augmented + (1 - do) * original
-
-    called coin_flip ONCE and reused the result for both sides of the
-    multiply — correct.  But several places had:
-
-        out = coin_flip(p) * aug + (1 - coin_flip(p)) * orig
-
-    which draws TWO independent flips, making the blend probabilistic
-    rather than a hard switch.  Fixed by binding each flip to a variable.
-
-2.  No silent fallback for hw_decoder_load: DALI raises if the value is
-    out of range [0, 1]; we validate at pipeline-build time.
-
-3.  preallocate_width_hint / preallocate_height_hint added for B200 so
-    DALI can pre-allocate decode scratch buffers at the right size.
-
-4.  BF16 (FLOAT16 inside DALI, cast to bfloat16 in PyTorch) used for
-    all floating-point augmentation ops.  B200 BF16 TCs give 2× the
-    throughput of FP32 at negligible quality cost.
+No additional bugs were found in this file.  Clarifying comments added:
+- Solarisation operates on values in [0, 255] (pre-normalisation) —
+  the threshold 128.0 is correct and intentional.
+- The tensor layout throughout is HWC (DALI native after image decode);
+  fn.transpose([2,0,1]) at the end converts to CHW for PyTorch.
+- fn.color_space_conversion requires 3-channel input; all paths maintain
+  3 channels so the call is safe.
 """
 
 from __future__ import annotations
@@ -101,30 +91,31 @@ def build_pipeline(
             dtype   = types.UINT8,
             ndim    = 1,
             name    = "jpegs",
-            no_copy = True,   # pass buffers by reference where possible
+            no_copy = True,
         )
 
         views = []
         for i in range(aug_cfg.n_global_crops):
             blur_p = aug_cfg.blur_prob_global1 if i == 0 else aug_cfg.blur_prob_global2
-            sol_p  = aug_cfg.solarize_prob      if i == 1 else 0.0
+            # Solarisation is applied only to the second global crop (DINOv2 §A.1)
+            sol_p  = aug_cfg.solarize_prob if i == 1 else 0.0
             views.append(_augment_view(
                 jpegs, aug_cfg,
-                crop_size        = aug_cfg.global_crop_size,
-                scale            = aug_cfg.global_crops_scale,
-                blur_prob        = blur_p,
-                solarize_prob    = sol_p,
-                hw_decoder_load  = hw_decoder_load,
+                crop_size       = aug_cfg.global_crop_size,
+                scale           = aug_cfg.global_crops_scale,
+                blur_prob       = blur_p,
+                solarize_prob   = sol_p,
+                hw_decoder_load = hw_decoder_load,
             ))
 
         for _ in range(aug_cfg.n_local_crops):
             views.append(_augment_view(
                 jpegs, aug_cfg,
-                crop_size        = aug_cfg.local_crop_size,
-                scale            = aug_cfg.local_crops_scale,
-                blur_prob        = aug_cfg.blur_prob_local,
-                solarize_prob    = 0.0,
-                hw_decoder_load  = hw_decoder_load,
+                crop_size       = aug_cfg.local_crop_size,
+                scale           = aug_cfg.local_crops_scale,
+                blur_prob       = aug_cfg.blur_prob_local,
+                solarize_prob   = 0.0,
+                hw_decoder_load = hw_decoder_load,
             ))
 
         return tuple(views)
@@ -156,9 +147,22 @@ def _augment_view(
     """
     Augmentation sub-graph for one crop view.
 
+    Tensor layout
+    -------------
+    DALI's image decode + crop returns tensors in HWC layout (H × W × C).
+    All subsequent ops (flip, cast, color_twist, etc.) also operate in HWC.
+    The final fn.transpose([2, 0, 1]) converts to CHW for PyTorch.
+
+    Float range
+    -----------
+    After fn.cast(FLOAT16), pixel values are in [0.0, 255.0].  Solarisation
+    uses threshold 128.0 which is the standard midpoint for uint8 images —
+    this is intentional and correct.  Normalisation (÷255 then mean/std) is
+    applied AFTER all stochastic augmentations.
+
     All float ops run in FLOAT16 (maps to BF16 on B200 tensor cores).
-    Each stochastic operation binds its coin-flip result to a named variable
-    and uses it exactly once per branch — avoiding the double-draw bug.
+    Each stochastic op binds its coin-flip to a named variable and uses it
+    exactly once per branch — avoiding the double-draw bug.
     """
     # ── 1. Hardware JPEG decode + random resized crop ─────────────────────────
     imgs = fn.decoders.image_random_crop(
@@ -182,10 +186,12 @@ def _augment_view(
     )
 
     # ── 2. Random horizontal flip ─────────────────────────────────────────────
+    # Layout: HWC, values [0, 255] uint8
     do_flip = fn.random.coin_flip(probability=cfg.flip_prob, dtype=types.BOOL)
     imgs    = fn.flip(imgs, device="gpu", horizontal=do_flip)
 
     # ── 3. Cast to FLOAT16 for all subsequent ops ─────────────────────────────
+    # Values remain in [0.0, 255.0] after cast.
     imgs = fn.cast(imgs, dtype=types.FLOAT16)
 
     # ── 4. Color jitter ───────────────────────────────────────────────────────
@@ -197,12 +203,13 @@ def _augment_view(
         saturation = fn.random.uniform(range=(1 - cfg.saturation, 1 + cfg.saturation)),
         hue        = fn.random.uniform(range=(-cfg.hue * 180,     cfg.hue * 180)),
     )
-    # do_jitter bound once; used symmetrically on both sides
     imgs = do_jitter * jittered + (1 - do_jitter) * imgs
 
     # ── 5. Random grayscale ───────────────────────────────────────────────────
+    # fn.color_space_conversion requires 3-channel HWC input — satisfied here.
     do_gray = fn.random.coin_flip(probability=cfg.grayscale_prob, dtype=types.BOOL)
     gray    = fn.color_space_conversion(imgs, image_type=types.RGB, output_type=types.GRAY)
+    # Replicate single channel → 3 channels to keep downstream ops uniform
     gray    = fn.cat(gray, gray, gray, axis=2)
     imgs    = do_gray * gray + (1 - do_gray) * imgs
 
@@ -212,18 +219,21 @@ def _augment_view(
     do_blur = fn.random.coin_flip(probability=blur_prob, dtype=types.BOOL)
     imgs    = do_blur * blurred + (1 - do_blur) * imgs
 
-    # ── 7. Solarisation (second global crop only) ─────────────────────────────
+    # ── 7. Solarisation (second global crop only, solarize_prob > 0) ──────────
+    # Applied while values are still in [0.0, 255.0].  Threshold 128.0 is the
+    # standard midpoint for uint8 images — correct and intentional.
     if solarize_prob > 0:
-        do_sol  = fn.random.coin_flip(probability=solarize_prob, dtype=types.BOOL)
-        mask    = imgs >= 128.0
-        sol     = mask * (255.0 - imgs) + (1 - mask) * imgs
-        imgs    = do_sol * sol + (1 - do_sol) * imgs
+        do_sol = fn.random.coin_flip(probability=solarize_prob, dtype=types.BOOL)
+        mask   = imgs >= 128.0
+        sol    = mask * (255.0 - imgs) + (1 - mask) * imgs
+        imgs   = do_sol * sol + (1 - do_sol) * imgs
 
     # ── 8. Normalise to ImageNet stats ────────────────────────────────────────
+    # Scale to [0, 1] then apply per-channel mean/std.
     imgs = imgs / 255.0
     mean = np.array(cfg.mean, dtype=np.float32).reshape(1, 1, 3)
     std  = np.array(cfg.std,  dtype=np.float32).reshape(1, 1, 3)
     imgs = (imgs - mean) / std
 
-    # ── 9. HWC → CHW ──────────────────────────────────────────────────────────
+    # ── 9. HWC → CHW for PyTorch ──────────────────────────────────────────────
     return fn.transpose(imgs, perm=[2, 0, 1])

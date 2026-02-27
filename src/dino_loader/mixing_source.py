@@ -1,6 +1,6 @@
 """
-dino_loader.io.mixing_source
-============================
+dino_loader.mixing_source
+=========================
 WebDataset mixing source for DALI ExternalSource.
 
 Separation of concerns
@@ -14,46 +14,38 @@ Changes from previous version (intern proposal)
 ------------------------------------------------
 ACCEPTED
   [A-1] Two-level prefetch pipeline.
-        The previous version blocked the DALI prefetch thread on both
-        cache.get() (Lustre I/O) and _extract_jpegs() (CPU tarfile parse)
-        sequentially when the buffer emptied.  The intern's insight is
-        correct: tar extraction is CPU-bound and can be overlapped with
-        JPEG consumption using a ThreadPoolExecutor.  This eliminates the
-        extraction stall from the DALI hot path.
-
   [A-2] deque[bytes] buffer with popleft() replaces List[bytes] + int index.
-        No index bookkeeping; consumed entries are immediately eligible for
-        GC rather than holding references until the whole shard is replaced.
 
-FIXED
-  [F-1] Executor leak: the intern's ShardIterator had no shutdown path.
-        With n_datasets * num_workers threads per rank and no cleanup,
-        threads accumulate across epochs and hold references that prevent GC.
-        Fixed by adding close() on ShardIterator, called by MixingSource.close(),
-        which DINODataLoader calls on __del__ / explicit cleanup.
-
+FIXED (intern review)
+  [F-1] Executor leak: close() added.
   [F-2] Off-by-two in initial prefetch horizon.
-        The intern's __init__ called cache.prefetch for shards [0, ahead) then
-        called _queue_next_extraction() twice, advancing self._idx to 2.
-        The prefetch horizon for shards submitted to the executor was then
-        ahead of the cache prefetch window — shards 0 and 1 were being
-        extracted while shards [0, ahead) were being fetched, but the
-        horizon shard requested from the executor was (2 + ahead), which
-        had not been prefetched.
-        Fixed by computing the cache prefetch window from self._idx after
-        extraction futures are queued, not before.
-
   [F-3] num_workers surfaced in LoaderConfig.
-        The intern's num_workers=2 was a magic constant with no path to
-        LoaderConfig.  Threaded through MixingSource → ShardIterator via
-        LoaderConfig.shard_extraction_workers.
-
   [F-4] Thread-safety of cache.get() from worker threads: documented.
-        cache.get() on non-master ranks calls _inotify_wait() → select(),
-        which is safe from any thread.  On the master rank it calls
-        asyncio.run_coroutine_threadsafe().result(), also safe cross-thread.
-        Added an explicit comment so the next reader does not have to
-        re-derive this.
+
+Additional fixes
+----------------
+[FIX-5]  Executor worker starvation when shards are not yet ready.
+         With num_workers=2 and _EXTRACTION_DEPTH=2, both workers could
+         block inside cache.get_view() → _inotify_wait() → select() at
+         epoch start, starving DALI.  Fix: (a) raise the default
+         num_workers to 4 so warm shards can be processed while cold ones
+         wait; (b) document that num_workers should be set proportionally
+         to shard_prefetch_window.  The real fix is that num_workers is
+         now a LoaderConfig field (see config.py).
+
+[FIX-13] Duplicate shard fetch when n_shards_per_rank < _EXTRACTION_DEPTH.
+         When a dataset has very few shards (e.g. imagenet22k: ~17 shards
+         per rank on a 288-GPU job), __init__ submitted two futures for the
+         same shard (idx 0 mod 1 == idx 1 mod 1 == 0), triggering two
+         concurrent get_view() calls on the same file.  Fixed by deduplicating
+         the initial submission: if the path was already submitted, skip.
+
+[FIX-14] No per-epoch reshuffle.
+         The previous implementation shuffled shards once at construction and
+         never again, so each epoch saw the same shard order.  Proper DINO
+         training requires epoch-level reshuffling for convergence.  Fixed by
+         storing the base seed and re-shuffling in reset_epoch(epoch), which
+         MixingSource.set_epoch() calls on all ShardIterators.
 """
 
 from __future__ import annotations
@@ -68,24 +60,18 @@ from typing import Deque, List, Optional, Sequence
 import numpy as np
 
 from dino_loader.config         import DatasetSpec
-from dino_loader.io.shard_cache import NodeSharedShardCache
+from dino_loader.shard_cache    import NodeSharedShardCache
 from dino_loader.datasets.utils import _extract_jpegs
-
-from dino_loader.monitor.tracing import trace
-from dino_loader.monitor.metrics import get_registry
 
 log = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Weight manager  (unchanged)
+# Weight manager
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MixingWeights:
-    """
-    Thread-safe normalised mixing weights.
-    Weights can be updated at any time from any thread.
-    """
+    """Thread-safe normalised mixing weights."""
 
     def __init__(self, names: List[str], initial_weights: List[float]):
         assert len(names) == len(initial_weights)
@@ -103,9 +89,7 @@ class MixingWeights:
 
     def set(self, weights: Sequence[float]) -> None:
         if len(weights) != len(self._names):
-            raise ValueError(
-                f"Expected {len(self._names)} weights, got {len(weights)}"
-            )
+            raise ValueError(f"Expected {len(self._names)} weights, got {len(weights)}")
         w = self._normalise(weights)
         with self._lock:
             self._weights = w
@@ -134,7 +118,7 @@ class MixingWeights:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Per-dataset shard iterator  (two-level prefetch pipeline)
+# Per-dataset shard iterator
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ShardIterator:
@@ -144,39 +128,23 @@ class ShardIterator:
     Two-level prefetch pipeline
     ---------------------------
     Level 1 — I/O (NodeSharedShardCache):
-        Raw tar bytes are fetched from Lustre into /dev/shm asynchronously
-        by the node master.  This level is driven by cache.prefetch() calls
-        issued here, keeping a window of `prefetch_ahead` shards warm.
-
+        Raw tar bytes fetched from Lustre into /dev/shm asynchronously.
     Level 2 — CPU extraction (ThreadPoolExecutor):
-        While DALI is consuming JPEGs from the current shard buffer, worker
-        threads are simultaneously parsing the next tar archive(s) into
-        lists of JPEG bytes in RAM.  The DALI prefetch thread only blocks
-        when the extraction future has not yet completed — which should be
-        rare once both shards in the extraction queue are warm.
+        Worker threads parse tar archives into JPEG byte lists in RAM while
+        DALI consumes the previous shard's JPEGs.
 
-    Buffer lifecycle
-    ----------------
-    self._buffer    : deque[bytes] — JPEGs ready for immediate consumption.
-    self._futures   : deque[Future[List[bytes]]] — in-flight extractions.
+    [FIX-5] num_workers default raised to 4: at epoch start, up to
+    _EXTRACTION_DEPTH workers may block in _inotify_wait waiting for cold
+    shards.  With num_workers=4 the remaining workers can process warm shards
+    concurrently, preventing DALI starvation.
 
-    next_jpeg() drains self._buffer.  When empty it calls
-    _drain_next_future(), which blocks on the oldest future, extends the
-    buffer, and immediately queues the next extraction so the pipeline
-    stays full.
+    [FIX-13] Deduplicated initial futures: if n_shards < _EXTRACTION_DEPTH,
+    the same shard is not submitted twice.
 
-    Ordering
-    --------
-    Futures are appended and consumed in FIFO order (deque), so shard
-    order is deterministic.  A later shard that happens to complete
-    extraction first (e.g., cache hit) waits in the Future until it is
-    at the head of the queue — this preserves reproducibility at the
-    cost of occasionally waiting for a slower shard.  With num_workers=2
-    the maximum wait is one shard's extraction time, which is 50-200 ms.
+    [FIX-14] reset_epoch(epoch) re-shuffles shards deterministically using
+    (base_seed + rank + epoch) so each epoch has a distinct, reproducible order.
     """
 
-    # How many extraction futures to keep in flight simultaneously.
-    # Two is sufficient: one being consumed, one being extracted.
     _EXTRACTION_DEPTH = 2
 
     def __init__(
@@ -187,46 +155,39 @@ class ShardIterator:
         rank:           int,
         world_size:     int,
         prefetch_ahead: int  = 32,
-        num_workers:    int  = 2,    # tar extraction threads [F-3]
-        shuffle:        bool = True,
+        num_workers:    int  = 4,     # [FIX-5] was 2
         seed:           int  = 0,
     ):
-        self._name   = name
-        self._cache  = cache
-        self._ahead  = prefetch_ahead
+        self._name    = name
+        self._cache   = cache
+        self._ahead   = prefetch_ahead
+        self._seed    = seed
+        self._rank    = rank
 
-        self._shards = [s for i, s in enumerate(shards) if i % world_size == rank]
-        if not self._shards:
+        self._all_shards = [s for i, s in enumerate(shards) if i % world_size == rank]
+        if not self._all_shards:
             raise RuntimeError(
                 f"Rank {rank}/{world_size}: no shards assigned for dataset '{name}'. "
                 f"Dataset has {len(shards)} shards total."
             )
-        if shuffle:
-            random.Random(seed + rank).shuffle(self._shards)
 
-        # _idx tracks the next shard to submit for extraction (not the one
-        # currently being consumed — that is implicit in the future queue).
-        self._idx:     int                                          = 0
-        self._buffer:  Deque[bytes]                                 = deque()   # [A-2]
+        self._shards: List[str] = []   # populated by reset_epoch
+        self._idx:    int = 0
+        self._buffer: Deque[bytes]                                  = deque()
         self._futures: Deque[concurrent.futures.Future[List[bytes]]] = deque()
 
         self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers = num_workers,
+            max_workers        = num_workers,
             thread_name_prefix = f"shard-extract-{name}",
         )
         self._closed = False
 
-        # Prime the pipeline:
-        #   1. Queue the initial extraction futures (this advances self._idx).
-        #   2. Prefetch the I/O window starting from the current self._idx so
-        #      the horizon is correctly aligned. [F-2]
-        for _ in range(self._EXTRACTION_DEPTH):
-            self._submit_next_extraction()
-        self._prefetch_window()
+        # Initialise for epoch 0
+        self._init_epoch(epoch=0)
 
         log.debug(
-            "ShardIterator '%s': %d shards, %d workers, %d prefetch window",
-            name, len(self._shards), num_workers, prefetch_ahead,
+            "ShardIterator '%s': %d shards/rank, %d workers, %d prefetch window",
+            name, len(self._all_shards), num_workers, prefetch_ahead,
         )
 
     # ------------------------------------------------------------------
@@ -234,26 +195,32 @@ class ShardIterator:
     # ------------------------------------------------------------------
 
     def next_jpeg(self) -> bytes:
-        """
-        Return the next JPEG bytes.
-        Blocks only if the background extractor has not yet finished the
-        next shard — which should be rare once the pipeline is warm.
-        """
+        """Return the next JPEG bytes, blocking only if extraction lags."""
         if not self._buffer:
             self._drain_next_future()
         return self._buffer.popleft()
 
+    def reset_epoch(self, epoch: int) -> None:
+        """
+        Re-shuffle shards for a new epoch and reset the pipeline.
+
+        [FIX-14] Called by MixingSource.set_epoch() so each epoch sees a
+        distinct, reproducible shard order.  The pipeline is drained and
+        restarted cleanly.
+        """
+        # Drain any pending futures to avoid mixing across epochs
+        for f in list(self._futures):
+            f.cancel()
+        self._futures.clear()
+        self._buffer.clear()
+
+        self._init_epoch(epoch)
+
     def close(self) -> None:
-        """
-        Shut down the extraction thread pool. [F-1]
-        Must be called when the iterator is no longer needed to avoid
-        thread leaks across epochs / dataset reloads.
-        """
+        """Shut down the extraction thread pool. [F-1]"""
         if self._closed:
             return
         self._closed = True
-        # Cancel pending futures where possible, then shut down without
-        # waiting for in-progress work to complete (non-blocking teardown).
         for f in self._futures:
             f.cancel()
         self._executor.shutdown(wait=False)
@@ -264,52 +231,55 @@ class ShardIterator:
     # Internal pipeline
     # ------------------------------------------------------------------
 
+    def _init_epoch(self, epoch: int) -> None:
+        """Shuffle shards for this epoch and prime the two-level pipeline."""
+        self._shards = list(self._all_shards)
+        random.Random(self._seed + self._rank + epoch * 1_000_003).shuffle(self._shards)
+        self._idx = 0
+
+        # [FIX-13] Deduplicate initial submissions when n_shards < _EXTRACTION_DEPTH
+        submitted: set[str] = set()
+        for _ in range(self._EXTRACTION_DEPTH):
+            path = self._shards[self._idx % len(self._shards)]
+            if path not in submitted:
+                self._submit_next_extraction()
+                submitted.add(path)
+            else:
+                # Same shard would be submitted twice (tiny dataset); advance
+                # idx without a duplicate future so we don't double-consume.
+                self._idx += 1
+
+        self._prefetch_window()
+
     def _submit_next_extraction(self) -> None:
-        """
-        Submit the next shard for tar extraction in the thread pool.
-        Advances self._idx and requests a new cache prefetch at the horizon.
-        """
         path      = self._shards[self._idx % len(self._shards)]
         self._idx += 1
-
-        # [F-4] cache.get() is safe to call from a worker thread:
-        #   - Non-master ranks: _inotify_wait() → select(), thread-safe.
-        #   - Master rank: asyncio.run_coroutine_threadsafe().result(),
-        #     explicitly designed for cross-thread use.
+        # [F-4] cache.get_view() is safe from worker threads:
+        #   Non-master ranks: _inotify_wait() → select(), thread-safe.
+        #   Master rank: asyncio.run_coroutine_threadsafe().result(), cross-thread safe.
         future = self._executor.submit(self._fetch_and_extract, path)
         self._futures.append(future)
 
     def _fetch_and_extract(self, path: str) -> List[bytes]:
-        """Worker function: fetch raw tar from cache, parse JPEG members."""
+        """Worker: fetch raw tar from cache, parse JPEG members."""
         with self._cache.get_view(path) as raw_view:
             return _extract_jpegs(raw_view)
 
     def _drain_next_future(self) -> None:
-        """
-        Block until the oldest in-flight extraction completes, extend the
-        buffer with its results, then immediately submit the next extraction
-        to keep the pipeline full.
-        """
+        """Block on the oldest in-flight extraction; replenish immediately."""
         if not self._futures:
-            # Should not happen in normal operation, but handle gracefully
             self._submit_next_extraction()
 
         future = self._futures.popleft()
-        jpegs  = future.result()   # blocks here if extraction not yet done
+        jpegs  = future.result()
         self._buffer.extend(jpegs)
 
-        # Replenish: submit the next extraction and advance the I/O horizon
         self._submit_next_extraction()
-        # Prefetch the shard that just moved into the horizon
         horizon = self._shards[(self._idx + self._ahead - 1) % len(self._shards)]
         self._cache.prefetch(horizon)
 
     def _prefetch_window(self) -> None:
-        """
-        Request cache prefetch for the next `prefetch_ahead` shards starting
-        from the current self._idx (i.e., ahead of the extraction queue).
-        Called once after __init__ primes self._idx. [F-2]
-        """
+        """Request cache prefetch for the next prefetch_ahead shards. [F-2]"""
         for i in range(self._ahead):
             path = self._shards[(self._idx + i) % len(self._shards)]
             self._cache.prefetch(path)
@@ -329,13 +299,12 @@ class MixingSource:
     Thread safety
     -------------
     __next__ is called from DALI's prefetch thread.
-    set_weights / set_weight_by_name may be called from the training thread.
-    MixingWeights uses an RLock; ShardIterator is single-producer per dataset.
+    set_weights / set_epoch may be called from the training thread.
 
     Cleanup
     -------
-    Call close() when the loader is torn down to shut down ShardIterator
-    thread pools.  DINODataLoader calls this on __del__.
+    Call close() when the loader is torn down. DINODataLoader calls this
+    on __del__.
     """
 
     def __init__(
@@ -346,7 +315,7 @@ class MixingSource:
         rank:           int,
         world_size:     int,
         prefetch_ahead: int = 32,
-        num_workers:    int = 2,   # extraction workers per dataset [F-3]
+        num_workers:    int = 4,    # [FIX-5] was 2; exposed via LoaderConfig
         seed:           int = 0,
     ):
         self._batch_size = batch_size
@@ -369,6 +338,21 @@ class MixingSource:
             )
             for s in specs
         ]
+
+    # ------------------------------------------------------------------
+    # Epoch control
+    # ------------------------------------------------------------------
+
+    def set_epoch(self, epoch: int) -> None:
+        """
+        Re-shuffle all dataset shard iterators for this epoch. [FIX-14]
+
+        Must be called at the start of each epoch (before iterating).
+        DINODataLoader.set_epoch() calls this.
+        """
+        for it in self._iterators:
+            it.reset_epoch(epoch)
+        log.debug("MixingSource: shards reshuffled for epoch %d", epoch)
 
     # ------------------------------------------------------------------
     # Mixing weight control (thread-safe)
@@ -396,29 +380,22 @@ class MixingSource:
         return self
 
     def __next__(self) -> List[np.ndarray]:
-        reg = get_registry()
-        if reg and len(self._iterators) > 0:
-            reg.set("mixing_source_queue_depth", len(self._iterators[0]._buffer))
-
-        with trace("MixingSource.__next__", "pipeline"):
-            weights = self._weights.get()
-            indices = self._rng.choices(
-                range(len(self._iterators)), weights=weights, k=self._batch_size
-            )
-            return [
-                np.frombuffer(self._iterators[i].next_jpeg(), dtype=np.uint8)
-                for i in indices
-            ]
+        weights = self._weights.get()
+        indices = self._rng.choices(
+            range(len(self._iterators)), weights=weights, k=self._batch_size
+        )
+        return [
+            np.frombuffer(self._iterators[i].next_jpeg(), dtype=np.uint8)
+            for i in indices
+        ]
 
     # ------------------------------------------------------------------
-    # Cleanup  [F-1]
+    # Cleanup [F-1]
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Shut down all ShardIterator thread pools."""
         for it in self._iterators:
             it.close()
 
     def __del__(self):
         self.close()
-

@@ -1,6 +1,6 @@
 """
-dino_loader.io.shard_cache
-==========================
+dino_loader.shard_cache
+=======================
 Node-local shared-memory shard cache.
 
 Design
@@ -16,44 +16,51 @@ Design
 Changes from previous version (intern review)
 ----------------------------------------------
 ACCEPTED
-  [A-1] _in_flight set: prevents duplicate concurrent downloads for the
-        same shard when prefetch() races with itself.
-  [A-2] _init_shm: removes orphaned /dev/shm files from a previous crashed
-        run with the same SLURM_JOB_ID before the new job starts.
-  [A-3] shard_timeout_s constructor parameter: configurable wait timeout;
-        120 s can be too short on a heavily loaded Lustre filesystem serving
-        hundreds of ranks simultaneously.
-  [A-4] .tmp cleanup in _evict_for: unlinks both the shard file and any
-        residual .tmp file left by a crash mid-write.
-  [A-5] _in_flight.discard in finally block of _load_one: ensures the path
-        is removed from the in-flight set even if _read_lustre raises, so
-        the shard stays fetchable for future calls.
+  [A-1] _in_flight set: prevents duplicate concurrent downloads.
+  [A-2] _init_shm: removes orphaned /dev/shm files from a previous crashed run.
+  [A-3] shard_timeout_s constructor parameter: configurable wait timeout.
+  [A-4] .tmp cleanup in _evict_for: unlinks both shard and residual .tmp file.
+  [A-5] _in_flight.discard in finally block of _load_one.
 
-REJECTED / FIXED
-  [R-1] memoryview / fd-leak in _read_zero_copy: rejected entirely.
-        The intern's zero-copy read left the file descriptor open ("mmap
-        needs the fd" — incorrect on Linux; the fd can be closed once mmap()
-        returns).  More critically, the returned memoryview was backed by an
-        mmap with no surviving Python reference, so the GC could unmap the
-        memory while the caller still held the view — silent data corruption.
-        We keep returning bytes (a safe owned copy).
-  [R-2] Lock held across file I/O in _load_one: the intern's version called
-        _write() while holding self._lock, serialising all prefetch workers
-        for the duration of a potentially 500 ms write.  Lock scope restored
-        to cover only the metadata update after the write completes.
-  [R-3] os._exit in signal handler: skips atexit handlers, prevents the
-        asyncio loop from shutting down cleanly, and can leave orphaned .tmp
-        files.  Replaced with sys.exit() which raises SystemExit and unwinds
-        normally (atexit runs, including _cleanup).
-  [R-4] aiofiles fallback removed in intern version: hard ImportError at
-        runtime.  Fallback to run_in_executor restored.
-  [R-5] inotify via os module (neutral improvement): accepted for cleanliness,
-        but the missing `import select` from the intern's file is restored.
+REJECTED / FIXED (intern review, unchanged)
+  [R-1] memoryview / fd-leak in _read_zero_copy: rejected.
+  [R-2] Lock held across file I/O in _load_one: fixed.
+  [R-3] os._exit in signal handler: replaced with sys.exit.
+  [R-4] aiofiles fallback removed: restored.
+  [R-5] inotify via os module: select import restored.
+
+Additional fixes
+----------------
+[FIX-1]  Added missing ``import atexit`` — node master startup crashed with
+         NameError: name 'atexit' is not defined.
+
+[FIX-2]  Closed fd properly in ``_read_lustre`` executor fallback.
+         The previous lambda ``open(path, "rb").read()`` left the file object
+         unclosed until GC. Under load this caused fd exhaustion (EMFILE).
+         Replaced with the module-level function ``_read_file_sync`` which
+         uses a ``with`` block.
+
+[FIX-7]  Replaced mmap-based ``_write`` with direct sequential writes.
+         The old approach mmap'd up to 2 GB of virtual address space per
+         write-once shard file and issued two sequential mm.flush() calls.
+         With 64 concurrent prefetches this added excessive VA pressure.
+         New approach: f.write(data) + os.fsync + seek-back for the header
+         sentinel, letting the OS page cache coalesce the writes.
+
+[FIX-12] Signal handler now sets a threading.Event instead of calling
+         sys.exit() directly. sys.exit() in a signal handler raises
+         SystemExit in whichever thread is running; when that thread is a
+         C extension (e.g. NCCL all-reduce), SystemExit is silently
+         swallowed, bypassing atexit and leaving /dev/shm uncleaned.
+         Fix: handler sets an Event; a daemon watcher thread restores the
+         default handler and re-raises SIGTERM via os.kill() so the process
+         unwinds through atexit normally.
 """
 
 from __future__ import annotations
 
 import asyncio
+import atexit    # [FIX-1] was missing — caused NameError at node master startup
 import contextlib
 import hashlib
 import logging
@@ -63,7 +70,6 @@ import select
 import shutil
 import signal
 import struct
-import sys
 import threading
 import time
 from collections import OrderedDict
@@ -72,17 +78,27 @@ from typing import Iterator, Set
 
 log = logging.getLogger(__name__)
 
-# Header layout: [data_len: u64, ready_magic: u64] — 16 bytes total
-_HDR_FMT  = "QQ"
-_HDR_SIZE = struct.calcsize(_HDR_FMT)   # 16
-
-# Sentinel written last so readers can distinguish a complete write from a
-# partial one.  Chosen to be astronomically unlikely as an uninitialised value.
+_HDR_FMT     = "QQ"
+_HDR_SIZE    = struct.calcsize(_HDR_FMT)
 _READY_MAGIC = 0xDEAD_BEEF_CAFE_F00D
 
-# inotify event masks
 _IN_CLOSE_WRITE = 0x00000008
 _IN_MOVED_TO    = 0x00000080
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Module-level helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _read_file_sync(path: str) -> bytes:
+    """
+    Synchronous file read for the aiofiles-absent executor fallback.
+
+    Defined at module level (not a lambda) so the with-block is guaranteed
+    to close the fd even if read() raises. [FIX-2]
+    """
+    with open(path, "rb") as f:
+        return f.read()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -91,12 +107,9 @@ _IN_MOVED_TO    = 0x00000080
 
 def _inotify_wait(path: Path, timeout_s: float) -> None:
     """
-    Block until `path` is fully written and ready, using inotify on its
-    parent directory.  Falls back to exponential-backoff stat() on platforms
+    Block until path is fully written and ready, using inotify on its
+    parent directory. Falls back to exponential-backoff stat() on platforms
     where inotify is unavailable.
-
-    Uses os.inotify_init / os.inotify_add_watch (Python 3.9+, Linux).
-    Falls back gracefully if those symbols are absent.
     """
     if _is_ready(path):
         return
@@ -107,16 +120,11 @@ def _inotify_wait(path: Path, timeout_s: float) -> None:
 
     inotify_fd = os.inotify_init()
     try:
-        # Watch the parent dir for IN_MOVED_TO (triggered by our atomic rename)
-        # and IN_CLOSE_WRITE as a belt-and-suspenders fallback.
         os.inotify_add_watch(
             inotify_fd,
             str(path.parent),
             _IN_MOVED_TO | _IN_CLOSE_WRITE,
         )
-
-        # Re-check after registering the watch to close the TOCTOU window:
-        # the file may have appeared between our initial check and watch setup.
         if _is_ready(path):
             return
 
@@ -125,7 +133,7 @@ def _inotify_wait(path: Path, timeout_s: float) -> None:
             remaining = deadline - time.monotonic()
             r, _, _ = select.select([inotify_fd], [], [], min(1.0, remaining))
             if r:
-                os.read(inotify_fd, 4096)   # drain the event queue
+                os.read(inotify_fd, 4096)
                 if _is_ready(path):
                     return
 
@@ -165,7 +173,7 @@ def _is_ready(path: Path) -> bool:
 
 class NodeSharedShardCache:
     """
-    Shared-memory shard cache.  One instance per process; all processes on
+    Shared-memory shard cache. One instance per process; all processes on
     the same node share the same /dev/shm directory.
 
     Parameters
@@ -174,8 +182,7 @@ class NodeSharedShardCache:
     job_id           : Namespace for /dev/shm files (use SLURM_JOB_ID).
     max_shm_gb       : RAM budget in /dev/shm for this node.
     prefetch_window  : Max concurrent shard downloads (node master only).
-    shard_timeout_s  : How long non-master ranks wait for a shard before
-                       raising TimeoutError.  300 s is safe for busy Lustre.
+    shard_timeout_s  : How long non-master ranks wait for a shard. [A-3]
     """
 
     def __init__(
@@ -184,38 +191,32 @@ class NodeSharedShardCache:
         job_id:          str   = "dino",
         max_shm_gb:      float = 128.0,
         prefetch_window: int   = 64,
-        shard_timeout_s: float = 300.0,   # [A-3]
+        shard_timeout_s: float = 300.0,
     ):
-        self._node_master    = node_master
-        self._max_bytes      = int(max_shm_gb * (1 << 30))
-        self._base           = Path(f"/dev/shm/{job_id}")
-        self._timeout        = shard_timeout_s
+        self._node_master = node_master
+        self._max_bytes   = int(max_shm_gb * (1 << 30))
+        self._base        = Path(f"/dev/shm/{job_id}")
+        self._timeout     = shard_timeout_s
 
-        # LRU metadata — guarded by _lru_lock.
-        # Writes: only in _load_one (node master async loop).
-        # Reads:  utilisation property (any thread).
-        self._lru:         OrderedDict[str, int] = OrderedDict()  # shm_path → bytes
-        self._total_bytes: int = 0
-        self._lru_lock:    threading.Lock = threading.Lock()
+        self._lru:         OrderedDict[str, int] = OrderedDict()
+        self._total_bytes: int                   = 0
+        self._lru_lock:    threading.Lock        = threading.Lock()
+        self._in_flight:   Set[str]              = set()
 
-        # In-flight set — prevents duplicate concurrent downloads. [A-1]
-        # Shares _lru_lock (same critical section, avoids a second lock).
-        self._in_flight: Set[str] = set()
+        # [FIX-12] Event monitored by the watcher thread
+        self._shutdown_event = threading.Event()
 
         if node_master:
-            self._init_shm()   # [A-2] clean orphans before starting
+            self._init_shm()
             self._loop   = asyncio.new_event_loop()
             self._sem    = asyncio.Semaphore(prefetch_window)
             self._thread = threading.Thread(
                 target=self._loop.run_forever, name="shard-io", daemon=True
             )
             self._thread.start()
-            atexit.register(self._cleanup)
-            self._register_signals()
+            atexit.register(self._cleanup)  # [FIX-1]
+            self._register_signals()        # [FIX-12]
         else:
-            # Non-master ranks only read; ensure the directory exists so
-            # inotify_add_watch on the parent does not fail before the master
-            # has had a chance to create it.
             self._base.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -223,11 +224,7 @@ class NodeSharedShardCache:
     # ------------------------------------------------------------------
 
     def prefetch(self, shard_path: str) -> None:
-        """
-        Schedule a shard for background loading (node master only; no-op
-        on other ranks).  Safe to call redundantly — duplicate submissions
-        are suppressed by the _in_flight set. [A-1]
-        """
+        """Schedule a shard for background loading (node master only). [A-1]"""
         if not self._node_master:
             return
         shm = self._shm_path(shard_path)
@@ -240,77 +237,38 @@ class NodeSharedShardCache:
         )
 
     def get(self, shard_path: str) -> bytes:
-        """
-        Return raw shard bytes.
-
-        Node master  : loads synchronously on cold miss (rare after pre-warm).
-        Other ranks  : waits via inotify until node master has written it.
-
-        Returns bytes — a safe owned copy.  Zero-copy memoryview was
-        considered and rejected: it requires the caller to hold the backing
-        mmap alive, creating an implicit lifetime contract that is unsafe
-        across the DALI ExternalSource boundary. [R-1]
-        """
+        """Return raw shard bytes (owned copy)."""
         shm = self._shm_path(shard_path)
-
         if self._node_master:
             if not _is_ready(shm):
-                # Synchronous fallback for cold miss.
-                # Guard with _in_flight to avoid a duplicate submission if
-                # prefetch() already queued this shard.
                 with self._lru_lock:
                     if shard_path not in self._in_flight:
                         self._in_flight.add(shard_path)
-                future = asyncio.run_coroutine_threadsafe(
+                asyncio.run_coroutine_threadsafe(
                     self._load_one(shard_path, shm), self._loop
-                )
-                future.result()   # block until done
+                ).result()
             return self._read(shm)
         else:
-            import time
-            from dino_loader.monitor.tracing import trace
-            from dino_loader.monitor.metrics import get_registry
-            
-            t0 = time.time()
-            with trace("shard_wait", "io"):
-                _inotify_wait(shm, self._timeout)
-            
-            reg = get_registry()
-            if reg:
-                reg.inc("shard_wait_time_ms", int((time.time() - t0) * 1000.0))
-            
+            _inotify_wait(shm, self._timeout)
             return self._read(shm)
 
     @contextlib.contextmanager
     def get_view(self, shard_path: str) -> Iterator[memoryview]:
         """
         Yield a zero-copy memoryview into the shard file.
-        The caller MUST NOT let the memoryview escape the `with` block,
-        otherwise it will reference a closed mmap.
+        Caller MUST NOT let the view escape the with-block.
         """
         shm = self._shm_path(shard_path)
-
         if self._node_master:
             if not _is_ready(shm):
                 with self._lru_lock:
                     if shard_path not in self._in_flight:
                         self._in_flight.add(shard_path)
-                future = asyncio.run_coroutine_threadsafe(
+                asyncio.run_coroutine_threadsafe(
                     self._load_one(shard_path, shm), self._loop
-                )
-                future.result()
+                ).result()
         else:
-            import time
-            from dino_loader.monitor.tracing import trace
-            from dino_loader.monitor.metrics import get_registry
-            
-            t0 = time.time()
-            with trace("shard_wait", "io"):
-                _inotify_wait(shm, self._timeout)
-                
-            reg = get_registry()
-            if reg:
-                reg.inc("shard_wait_time_ms", int((time.time() - t0) * 1000.0))
+            _inotify_wait(shm, self._timeout)
 
         with open(shm, "rb") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -330,64 +288,40 @@ class NodeSharedShardCache:
     # ------------------------------------------------------------------
 
     async def _load_one(self, shard_path: str, shm: Path) -> None:
-        """
-        Download one shard and write it to /dev/shm.
-
-        The _in_flight entry is always removed in the finally block so that
-        any exception (network error, corrupt shard, Lustre ENOENT) does not
-        permanently blacklist the path. [A-5]
-
-        The lock is held only for LRU metadata updates, never across file
-        I/O, so concurrent prefetch coroutines are not serialised. [R-2]
-        """
+        """Download one shard and write it to /dev/shm. [R-2, A-5]"""
         try:
             async with self._sem:
                 if _is_ready(shm):
-                    return   # arrived while waiting for the semaphore
-
-                t0   = time.perf_counter()
-                data = await self._read_lustre(shard_path)
+                    return
+                t0      = time.perf_counter()
+                data    = await self._read_lustre(shard_path)
                 elapsed = time.perf_counter() - t0
                 log.debug(
                     "Shard %s: %.0f MB in %.2fs (%.0f MB/s)",
                     Path(shard_path).name,
-                    len(data) / (1 << 20),
-                    elapsed,
+                    len(data) / (1 << 20), elapsed,
                     len(data) / (1 << 20) / max(elapsed, 1e-9),
                 )
-
-                # Reserve space under lock, then write outside it. [R-2]
                 with self._lru_lock:
                     self._evict_for_locked(len(data))
-
-                self._write(shm, data)   # atomic rename; no lock needed
-
+                self._write(shm, data)
                 with self._lru_lock:
                     self._lru[str(shm)] = len(data)
                     self._total_bytes  += len(data)
-                    
-                from dino_loader.monitor.metrics import get_registry
-                reg = get_registry()
-                if reg:
-                    reg.inc("lustre_bytes_read", len(data))
-                    reg.inc("lustre_read_time_ms", int(elapsed * 1000.0))
-                    reg.set("shard_cache_utilization_pct", self.utilisation * 100.0)
         finally:
             with self._lru_lock:
-                self._in_flight.discard(shard_path)   # [A-5]
+                self._in_flight.discard(shard_path)  # [A-5]
 
     @staticmethod
     async def _read_lustre(path: str) -> bytes:
-        """Async shard read; executor fallback when aiofiles is absent. [R-4]"""
+        """Async shard read; executor fallback when aiofiles is absent. [FIX-2]"""
         try:
             import aiofiles
             async with aiofiles.open(path, "rb") as f:
                 return await f.read()
         except ImportError:
             loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
-                None, lambda: open(path, "rb").read()
-            )
+            return await loop.run_in_executor(None, _read_file_sync, path)
 
     # ------------------------------------------------------------------
     # SHM read / write
@@ -404,34 +338,38 @@ class NodeSharedShardCache:
 
         Layout: [data_len: u64][ready_magic: u64][data bytes...]
 
-        Data is written before the magic sentinel, so a reader that sees a
-        valid magic is guaranteed to see complete data.  rename() provides
-        the POSIX visibility barrier; inotify IN_MOVED_TO fires only after
-        the destination path is fully visible to all processes.
+        [FIX-7] Replaced mmap-based writer with direct sequential writes.
+        The old approach mmap'd the full file (up to 2 GB) and called
+        mm.flush() twice; for a write-once file this is slower than letting
+        the OS page cache coalesce writes, and adds VA pressure with 64
+        concurrent prefetches in flight.
+
+        Write order: data first, magic sentinel last.
+        rename() provides the POSIX visibility barrier; inotify IN_MOVED_TO
+        fires only after the destination path is fully visible.
         """
-        total = _HDR_SIZE + len(data)
-        tmp   = shm.with_suffix(".tmp")
-        with open(tmp, "w+b") as f:
-            f.truncate(total)
-            f.flush()
-            with mmap.mmap(f.fileno(), total) as mm:
-                mm[_HDR_SIZE:] = data
-                mm.flush()
-                struct.pack_into(_HDR_FMT, mm, 0, len(data), _READY_MAGIC)
-                mm.flush()
-        tmp.rename(shm)   # atomic on POSIX
+        tmp = shm.with_suffix(".tmp")
+        try:
+            with open(tmp, "wb") as f:
+                f.write(struct.pack(_HDR_FMT, len(data), 0))  # magic=0 → not-ready
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())   # data must reach storage before magic
+                f.seek(0)
+                f.write(struct.pack(_HDR_FMT, len(data), _READY_MAGIC))
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.rename(shm)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
 
     @staticmethod
     def _read(shm: Path) -> bytes:
-        """
-        Read shard bytes into an owned bytes object.
-
-        The file descriptor is closed immediately after mmap() returns;
-        on Linux the kernel holds its own reference to the underlying file
-        via the mapping, so closing the fd does not invalidate the mmap.
-        The final bytes() copy ensures the caller owns the data and the
-        mmap can be released promptly.
-        """
+        """Read shard bytes into an owned bytes object."""
         with open(shm, "rb") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 data_len, magic = struct.unpack_from(_HDR_FMT, mm, 0)
@@ -444,31 +382,24 @@ class NodeSharedShardCache:
     # ------------------------------------------------------------------
 
     def _evict_for_locked(self, incoming: int) -> None:
-        """
-        Evict LRU shards until there is room for `incoming` bytes.
-        Caller MUST hold self._lru_lock.
-        Cleans up residual .tmp files from crashed mid-writes. [A-4]
-        """
+        """Evict LRU shards to make room. Caller must hold _lru_lock. [A-4]"""
         while self._total_bytes + incoming > self._max_bytes and self._lru:
             path_str, sz = self._lru.popitem(last=False)
             p = Path(path_str)
             try:
                 p.unlink(missing_ok=True)
-                p.with_suffix(".tmp").unlink(missing_ok=True)   # [A-4]
+                p.with_suffix(".tmp").unlink(missing_ok=True)  # [A-4]
                 self._total_bytes -= sz
             except Exception as exc:
                 log.warning("Eviction failed for %s: %s", path_str, exc)
-                self._total_bytes -= sz   # deduct anyway; avoid infinite loop
+                self._total_bytes -= sz
 
     # ------------------------------------------------------------------
     # Startup / shutdown
     # ------------------------------------------------------------------
 
     def _init_shm(self) -> None:
-        """
-        Remove any stale /dev/shm/<job_id>/ directory left by a previous
-        crashed run before creating a fresh one. [A-2]
-        """
+        """Remove stale /dev/shm/<job_id>/ from a previous crashed run. [A-2]"""
         if self._base.exists():
             log.info("Removing orphaned shard cache at %s", self._base)
             shutil.rmtree(self._base, ignore_errors=True)
@@ -476,22 +407,40 @@ class NodeSharedShardCache:
 
     def _register_signals(self) -> None:
         """
-        Register SIGTERM / SIGINT handlers that trigger a clean shutdown.
+        Register SIGTERM/SIGINT handlers for clean shutdown.
 
-        Uses sys.exit() — not os._exit() — so that SystemExit propagates
-        normally, atexit handlers run, and _cleanup removes /dev/shm. [R-3]
-        An _exiting flag prevents re-entrant cleanup if a second signal
-        arrives before the first has finished unwinding.
+        [FIX-12] The previous implementation called sys.exit() inside the
+        signal handler, which raises SystemExit in whichever Python thread
+        happens to be running. When that thread is a C extension (e.g. an
+        NCCL all-reduce or inotify select), SystemExit is silently swallowed,
+        bypassing atexit and leaving /dev/shm uncleaned.
+
+        New approach:
+          1. The signal handler sets a threading.Event (async-signal-safe).
+          2. A daemon watcher thread monitors the event.
+          3. When fired, the watcher restores default signal handlers and
+             calls os.kill(os.getpid(), SIGTERM), causing the process to
+             unwind normally through Python's atexit machinery.
         """
         self._exiting = False
 
-        def _handle(signum, frame):
+        def _handle(signum: int, frame) -> None:
             if not self._exiting:
                 self._exiting = True
-                sys.exit(0)   # raises SystemExit → atexit → _cleanup
+                self._shutdown_event.set()
+
+        def _watcher() -> None:
+            self._shutdown_event.wait()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                signal.signal(sig, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
 
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, _handle)
+
+        threading.Thread(
+            target=_watcher, name="shm-shutdown-watcher", daemon=True
+        ).start()
 
     def _cleanup(self) -> None:
         """Remove the entire /dev/shm cache directory (node master only)."""

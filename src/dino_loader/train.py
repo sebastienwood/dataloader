@@ -36,10 +36,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("train")
 
+# Approximate total images across all datasets (used for scheduler / len())
+_TOTAL_IMAGES = 50_000 * 10_000 + 30_000 * 10_000 + 5_000 * 10_000  # ~850 M
+
 
 def main():
-    # ── 1. Distributed init (topology detection + NCCL config inside) ─────────
-    env = slurm_init()                     # raises clearly if SLURM vars missing
+    # ── 1. Distributed init ────────────────────────────────────────────────────
+    env = slurm_init()
     device = torch.device(f"cuda:{env.local_rank % torch.cuda.device_count()}")
 
     # ── 2. Dataset catalogue ──────────────────────────────────────────────────
@@ -62,28 +65,34 @@ def main():
     ]
 
     # ── 3. Config ─────────────────────────────────────────────────────────────
+    batch_size = 512
     aug_cfg = DINOAugConfig(n_local_crops=8)
     cfg     = LoaderConfig(
-        node_shm_gb            = 256,   # GB200 NVL72 nodes have 2 TB RAM
-        shard_prefetch_window  = 128,
-        dali_cpu_queue         = 8,
-        dali_gpu_queue         = 6,
-        hw_decoder_load        = 0.90,
-        use_fp8_output         = True,
-        checkpoint_dir         = f"/lustre/ckpts/{os.environ['SLURM_JOB_ID']}/dl",
-        checkpoint_every_steps = 500,
+        # GB200 NVL72 nodes have 2 TB system RAM; /dev/shm defaults to 50%
+        # of RAM on most Linux distros — set explicitly to avoid surprises.
+        node_shm_gb              = 256,
+        shard_prefetch_window    = 128,
+        shard_extraction_workers = 8,    # proportional to prefetch_window
+        dali_cpu_queue           = 8,
+        dali_gpu_queue           = 6,
+        hw_decoder_load          = 0.90,
+        use_fp8_output           = True,
+        checkpoint_dir           = f"/lustre/ckpts/{os.environ['SLURM_JOB_ID']}/dl",
+        checkpoint_every_steps   = 500,
     )
 
     # ── 4. Loader ─────────────────────────────────────────────────────────────
+    steps_per_epoch = _TOTAL_IMAGES // (batch_size * env.world_size)
     loader = DINODataLoader(
         specs            = specs,
-        batch_size       = 512,           # per-GPU; 512 × 288 GPUs = 147k global
+        batch_size       = batch_size,
         aug_cfg          = aug_cfg,
         config           = cfg,
         device_id        = env.local_rank % torch.cuda.device_count(),
         local_rank       = env.local_rank,
         local_world_size = env.local_world_size,
-        resume           = True,          # safe to always pass True
+        resume           = True,
+        steps_per_epoch  = steps_per_epoch,   # enables len(loader)
     )
 
     # ── 5. (Placeholder) ViT model ────────────────────────────────────────────
@@ -92,9 +101,9 @@ def main():
 
     # ── 6. Training loop ──────────────────────────────────────────────────────
     for epoch in range(100):
-        loader.set_epoch(epoch)
+        loader.set_epoch(epoch)   # re-shuffles shards for this epoch
 
-        # Example: data curriculum — shift toward curated data over time
+        # Data curriculum — shift toward curated data over time
         if epoch == 10:
             loader.set_weights([0.4, 0.4, 0.2])
         elif epoch == 30:
@@ -117,10 +126,10 @@ def main():
 
             if env.rank == 0 and step % 200 == 0:
                 elapsed = time.perf_counter() - t_epoch
-                imgs_per_sec = (512 * env.world_size * (step + 1)) / max(elapsed, 1e-6)
+                imgs_per_sec = (batch_size * env.world_size * (step + 1)) / max(elapsed, 1e-6)
                 log.info(
-                    "E%03d S%06d | %.1fk img/s | shm %.0f%%",
-                    epoch, step,
+                    "E%03d S%06d/%06d | %.1fk img/s | shm %.0f%%",
+                    epoch, step, len(loader),
                     imgs_per_sec / 1000,
                     loader.shard_cache_utilisation * 100,
                 )
