@@ -12,6 +12,19 @@ Changes vs previous version
          impossible to configure without patching source.  Default is 4 (up
          from the previous hard-coded 2) to prevent DALI starvation when
          workers block on inotify for cold shards at epoch start. [FIX-5]
+
+[FIX-20] Added ``shm_warn_threshold`` to ``LoaderConfig``.
+         The /dev/shm utilisation was tracked by MetricsRegistry but nothing
+         triggered a warning when approaching capacity.  A silent OOM in
+         /dev/shm causes shard writes to fail with ENOSPC, which surfaces as
+         a confusing "Shard not ready after 300s" timeout rather than a clear
+         capacity error.  Default 0.85 (warn at 85% utilisation).
+
+[FIX-21] Added ``cpu_affinity_enabled`` to ``LoaderConfig``.
+         ShardIterator extraction threads are now optionally bound to the CPU
+         cores local to the GPU's NUMA domain.  Disabled by default for
+         portability (requires the ``psutil`` package); set to True on NVL72
+         / B200 clusters for measurable throughput improvement.
 """
 
 from __future__ import annotations
@@ -91,12 +104,22 @@ class LoaderConfig:
     shard_prefetch_window:   int   = 64
     shard_timeout_s:         float = 300.0
 
+    # [FIX-20] Warn when /dev/shm utilisation exceeds this fraction (0–1).
+    # At 85% utilisation a warning is emitted every ``checkpoint_every_steps``
+    # steps so operators can react before writes start failing with ENOSPC.
+    shm_warn_threshold:      float = 0.85
+
     # ── Shard extraction ──────────────────────────────────────────────────────
     # [FIX-19 / FIX-5] This field was referenced in mixing_source.py but never
     # defined here.  Raising the default from 2 → 4 prevents DALI starvation
     # when workers block on inotify waiting for cold shards at epoch start.
     # Rule of thumb: set to ≥ shard_prefetch_window / 16, minimum 4.
     shard_extraction_workers: int  = 4
+
+    # [FIX-21] Bind extraction threads to CPU cores local to the GPU's NUMA
+    # domain.  Requires ``psutil``; silently ignored if not installed or if
+    # NUMA topology cannot be resolved.  Recommended on NVL72 / B200 PCIe.
+    cpu_affinity_enabled:    bool  = False
 
     # ── DALI pipeline ─────────────────────────────────────────────────────────
     dali_cpu_queue:          int   = 8
@@ -126,6 +149,10 @@ class LoaderConfig:
             )
         if self.shard_extraction_workers < 1:
             raise ValueError("shard_extraction_workers must be ≥ 1")
+        if not (0.0 < self.shm_warn_threshold <= 1.0):
+            raise ValueError(
+                f"shm_warn_threshold must be in (0, 1], got {self.shm_warn_threshold}"
+            )
 
 
 # ── Checkpoint state (JSON-serialisable) ─────────────────────────────────────

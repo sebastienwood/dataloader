@@ -50,25 +50,38 @@ Fixes
          non-reentrant; interleaving reads produces silently corrupted batches.
          Fixed: an ``_active_iter`` flag raises RuntimeError on double-entry.
          The flag is cleared by ``set_epoch()`` and ``__del__()``.
+
+[FIX-20] ``shm_warn_threshold`` from ``LoaderConfig`` is now forwarded to
+         ``NodeSharedShardCache`` so operators receive a log.warning before
+         /dev/shm capacity is exhausted.  Additionally, ``checkpoint()``
+         logs the current utilisation at WARNING level if above threshold,
+         giving a periodic reminder in the training log regardless of whether
+         a new shard write happens to trigger the rate-limited warning in
+         the cache itself.
+
+[FIX-21] ``cpu_affinity_enabled`` and ``device_id`` are now forwarded to
+         ``MixingSource`` → ``ShardIterator`` so NUMA-aware thread affinity
+         can be activated via ``LoaderConfig(cpu_affinity_enabled=True)``.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Iterator, List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 
 # [FIX-4] Corrected flat import paths (no augment/ cache/ io/ subdirectories)
-from dino_loader.pipeline       import build_pipeline
-from dino_loader.memory         import AsyncPrefetchIterator, Batch, FP8Formatter, H2DStream
-from dino_loader.checkpoint     import DataLoaderCheckpointer
-from dino_loader.config         import CheckpointState, DatasetSpec, DINOAugConfig, LoaderConfig
-from dino_loader.distributed    import ClusterTopology, detect_topology
-from dino_loader.mixing_source  import MixingSource
-from dino_loader.shard_cache    import NodeSharedShardCache
+from dino_loader.pipeline        import build_pipeline
+from dino_loader.memory          import AsyncPrefetchIterator, Batch, FP8Formatter, H2DStream
+from dino_loader.checkpoint      import DataLoaderCheckpointer
+from dino_loader.config          import CheckpointState, DatasetSpec, DINOAugConfig, LoaderConfig
+from dino_loader.distributed     import ClusterTopology, detect_topology
+from dino_loader.mixing_source   import MixingSource
+from dino_loader.shard_cache     import NodeSharedShardCache
 from dino_loader.monitor.metrics import get_registry, init_registry
 
 log = logging.getLogger(__name__)
@@ -139,51 +152,54 @@ class DINODataLoader:
             rank             = dist.get_rank()
             world_size       = dist.get_world_size()
             local_rank       = int(os.environ.get("LOCAL_RANK", local_rank))
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", local_world_size))
 
-        self._rank              = rank
-        self._world             = world_size
-        self._device            = torch.device(f"cuda:{device_id}")
-        self._aug_cfg           = aug_cfg or DINOAugConfig()
-        self._cfg               = config  or LoaderConfig()
-        self._epoch             = 0
-        self._step              = 0
-        self._steps_per_epoch   = steps_per_epoch   # [FIX-15]
+        self._rank             = rank
+        self._local_rank       = local_rank
+        self._steps_per_epoch  = steps_per_epoch
+        self._epoch            = 0
+        self._step             = 0
         self._active_iter: Optional[AsyncPrefetchIterator] = None  # [FIX-C]
+        self._cfg              = config  or LoaderConfig()
+        self._aug_cfg          = aug_cfg or DINOAugConfig()
 
-        # ── Topology ──────────────────────────────────────────────────────────
-        self._topo = detect_topology(force=self._cfg.force_topology)
+        # ── Topology detection ────────────────────────────────────────────────
+        self._topo: ClusterTopology = detect_topology(
+            force=self._cfg.force_topology
+        )
+        self._device = torch.device(f"cuda:{device_id}")
 
-        # ── Monitoring registry (must precede cache construction) ─────────────────
-        # [FIX-MON] init_registry was never called; all counters were stuck at 0.
+        # ── Metrics registry ──────────────────────────────────────────────────
         init_registry(
-            job_id     = self._cfg.job_id,
-            create     = (local_rank == 0),   # node master creates; others attach
+            job_id     = os.environ.get("SLURM_JOB_ID", "dino"),
+            create     = (local_rank == 0),
             local_rank = local_rank,
         )
-        log.debug("Metrics registry initialised (local_rank=%d, create=%s)", local_rank, local_rank == 0)
 
-        # ── Stage 1: Node-local shared shard cache ────────────────────────────
-        node_master = (local_rank == 0)
+        # ── Stage 1: Shard cache ──────────────────────────────────────────────
         self._shard_cache = NodeSharedShardCache(
-            node_master     = node_master,
-            job_id          = os.environ.get("SLURM_JOB_ID", "dino"),
-            max_shm_gb      = self._cfg.node_shm_gb,
-            prefetch_window = self._cfg.shard_prefetch_window,
-            shard_timeout_s = self._cfg.shard_timeout_s,
+            node_master        = (local_rank == 0),
+            job_id             = os.environ.get("SLURM_JOB_ID", "dino"),
+            max_shm_gb         = self._cfg.node_shm_gb,
+            prefetch_window    = self._cfg.shard_prefetch_window,
+            shard_timeout_s    = self._cfg.shard_timeout_s,
+            shm_warn_threshold = self._cfg.shm_warn_threshold,   # [FIX-20]
         )
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
         # ── Stage 2: Mixing source ────────────────────────────────────────────
         self._source = MixingSource(
-            specs          = specs,
-            batch_size     = batch_size,
-            cache          = self._shard_cache,
-            rank           = rank,
-            world_size     = world_size,
-            prefetch_ahead = self._cfg.shard_prefetch_window,
-            num_workers    = self._cfg.shard_extraction_workers,  # [FIX-19]
-            seed           = self._cfg.seed,
+            specs                = specs,
+            batch_size           = batch_size,
+            cache                = self._shard_cache,
+            rank                 = rank,
+            world_size           = world_size,
+            prefetch_ahead       = self._cfg.shard_prefetch_window,
+            num_workers          = self._cfg.shard_extraction_workers,   # [FIX-19]
+            seed                 = self._cfg.seed,
+            device_id            = device_id,                            # [FIX-21]
+            cpu_affinity_enabled = self._cfg.cpu_affinity_enabled,       # [FIX-21]
         )
 
         # ── Stage 3: DALI pipeline ────────────────────────────────────────────
@@ -226,11 +242,14 @@ class DINODataLoader:
 
         log.info(
             "DINODataLoader ready | topology=%s | rank=%d/%d | "
-            "views=%dg+%dl | FP8=%s | extraction_workers=%d",
+            "views=%dg+%dl | FP8=%s | extraction_workers=%d | "
+            "cpu_affinity=%s | shm_warn=%.0f%%",
             self._topo.label, rank, world_size,
             self._aug_cfg.n_global_crops, self._aug_cfg.n_local_crops,
             self._cfg.use_fp8_output,
             self._cfg.shard_extraction_workers,
+            self._cfg.cpu_affinity_enabled,
+            self._cfg.shm_warn_threshold * 100,
         )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -261,7 +280,15 @@ class DINODataLoader:
         self._source.set_weight_by_name(name, weight)
 
     def checkpoint(self, step: int) -> None:
-        """Save dataloader state. Call once per step; skips internally if not due."""
+        """
+        Save dataloader state. Call once per step; skips internally if not due.
+
+        [FIX-20] Also logs a WARNING if /dev/shm utilisation is above
+        shm_warn_threshold at checkpoint time.  This provides a periodic
+        reminder in the training log (at checkpoint cadence) complementing
+        the rate-limited warning emitted by NodeSharedShardCache itself.
+        Only emitted by rank 0 to avoid N×redundant log lines.
+        """
         self._step = step
         self._ckptr.save(CheckpointState(
             step           = step,
@@ -269,6 +296,17 @@ class DINODataLoader:
             mixing_weights = self._source.current_weights,
             dataset_names  = self._source.dataset_names,
         ))
+
+        # [FIX-20] Periodic utilisation check at checkpoint cadence.
+        if self._rank == 0 and step % self._cfg.checkpoint_every_steps == 0:
+            util = self._shard_cache.utilisation
+            if util >= self._cfg.shm_warn_threshold:
+                log.warning(
+                    "checkpoint step=%d | /dev/shm utilisation %.1f%% ≥ "
+                    "warn threshold %.0f%% — consider increasing node_shm_gb "
+                    "or reducing shard_prefetch_window.",
+                    step, util * 100.0, self._cfg.shm_warn_threshold * 100.0,
+                )
 
     def __iter__(self) -> Iterator[Batch]:
         """

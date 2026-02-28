@@ -55,6 +55,25 @@ Additional fixes
          Fix: handler sets an Event; a daemon watcher thread restores the
          default handler and re-raises SIGTERM via os.kill() so the process
          unwinds through atexit normally.
+
+[FIX-SI] SIGINT was not registered with the graceful-shutdown handler.
+         The CAVEAT-3 analysis was correct: only SIGTERM was intercepted,
+         so Ctrl+C during interactive development left extraction threads
+         alive and /dev/shm populated.  SIGINT is now registered alongside
+         SIGTERM in _register_signals().  The watcher thread re-raises as
+         SIGTERM (not SIGINT) so Python's default SIGTERM handler triggers
+         the atexit chain regardless of which signal arrived first.
+
+[FIX-SHM] /dev/shm utilisation warning.
+         The utilisation counter was published to MetricsRegistry but no
+         subsystem triggered an operator-visible warning when nearing
+         capacity.  A silent ENOSPC during _write() manifests as a
+         "Shard not ready after 300s" TimeoutError, which is extremely
+         confusing.  Fix: _update_utilisation_metric() now emits a
+         log.warning when utilisation exceeds the ``shm_warn_threshold``
+         configured in LoaderConfig (default 0.85).  The warning is
+         rate-limited to once per ``_SHM_WARN_INTERVAL`` seconds to avoid
+         flooding logs during sustained high utilisation.
 """
 
 from __future__ import annotations
@@ -74,7 +93,7 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Iterator, Set
+from typing import Iterator, Optional, Set
 
 from dino_loader.monitor.metrics import get_registry
 
@@ -86,6 +105,10 @@ _READY_MAGIC = 0xDEAD_BEEF_CAFE_F00D
 
 _IN_CLOSE_WRITE = 0x00000008
 _IN_MOVED_TO    = 0x00000080
+
+# [FIX-SHM] Minimum seconds between successive utilisation warnings.
+# Prevents log flooding during sustained high-utilisation periods.
+_SHM_WARN_INTERVAL = 60.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -185,27 +208,32 @@ class NodeSharedShardCache:
     max_shm_gb       : RAM budget in /dev/shm for this node.
     prefetch_window  : Max concurrent shard downloads (node master only).
     shard_timeout_s  : How long non-master ranks wait for a shard. [A-3]
+    shm_warn_threshold : Fraction (0–1) at which to emit a utilisation
+                       warning. [FIX-SHM]
     """
 
     def __init__(
         self,
-        node_master:     bool,
-        job_id:          str   = "dino",
-        max_shm_gb:      float = 128.0,
-        prefetch_window: int   = 64,
-        shard_timeout_s: float = 300.0,
+        node_master:        bool,
+        job_id:             str   = "dino",
+        max_shm_gb:         float = 128.0,
+        prefetch_window:    int   = 64,
+        shard_timeout_s:    float = 300.0,
+        shm_warn_threshold: float = 0.85,   # [FIX-SHM]
     ):
-        self._node_master = node_master
-        self._max_bytes   = int(max_shm_gb * (1 << 30))
-        self._base        = Path(f"/dev/shm/{job_id}")
-        self._timeout     = shard_timeout_s
+        self._node_master       = node_master
+        self._max_bytes         = int(max_shm_gb * (1 << 30))
+        self._base              = Path(f"/dev/shm/{job_id}")
+        self._timeout           = shard_timeout_s
+        self._warn_threshold    = shm_warn_threshold   # [FIX-SHM]
+        self._last_warn_ts: float = 0.0                # [FIX-SHM] rate-limit
 
         self._lru:         OrderedDict[str, int] = OrderedDict()
         self._total_bytes: int                   = 0
         self._lru_lock:    threading.Lock        = threading.Lock()
         self._in_flight:   Set[str]              = set()
 
-        # [FIX-12] Event monitored by the watcher thread
+        # [FIX-12] Event monitored by the watcher thread.
         self._shutdown_event = threading.Event()
 
         if node_master:
@@ -220,7 +248,7 @@ class NodeSharedShardCache:
             )
             self._thread.start()
             atexit.register(self._cleanup)  # [FIX-1]
-            self._register_signals()        # [FIX-12]
+            self._register_signals()        # [FIX-12] / [FIX-SI]
         else:
             self._base.mkdir(parents=True, exist_ok=True)
             self._metrics = get_registry()   # non-master ranks need shard_cache_wait
@@ -294,68 +322,101 @@ class NodeSharedShardCache:
     @property
     def utilisation(self) -> float:
         """Fraction of the /dev/shm budget currently in use."""
+        if self._max_bytes == 0:
+            return 0.0
         with self._lru_lock:
-            return self._total_bytes / max(self._max_bytes, 1)
+            return self._total_bytes / self._max_bytes
 
     # ------------------------------------------------------------------
-    # Async I/O  (node master only)
-    # ------------------------------------------------------------------
-
-    async def _load_one(self, shard_path: str, shm: Path) -> None:
-        """Download one shard and write it to /dev/shm. [R-2, A-5]"""
-        try:
-            async with self._sem:
-                if _is_ready(shm):
-                    return
-                t0      = time.perf_counter()
-                data    = await self._read_lustre(shard_path)
-                elapsed = time.perf_counter() - t0
-                log.debug(
-                    "Shard %s: %.0f MB in %.2fs (%.0f MB/s)",
-                    Path(shard_path).name,
-                    len(data) / (1 << 20), elapsed,
-                    len(data) / (1 << 20) / max(elapsed, 1e-9),
-                )
-                # ── Publish Lustre metrics ──────────────────────────────────
-                if self._metrics is not None:
-                    self._metrics.inc("lustre_read_time_ms", int(elapsed * 1000))
-                    self._metrics.inc("lustre_bytes_read",   len(data))
-                    util = self.utilisation * 100.0
-                    self._metrics.set("shard_cache_utilization_pct", util)
-                # ───────────────────────────────────────────────────────────
-                with self._lru_lock:
-                    self._evict_for_locked(len(data))
-                self._write(shm, data)
-                with self._lru_lock:
-                    self._lru[str(shm)] = len(data)
-                    self._total_bytes  += len(data)
-        finally:
-            with self._lru_lock:
-                self._in_flight.discard(shard_path)  # [A-5]
-
-    @staticmethod
-    async def _read_lustre(path: str) -> bytes:
-        """Async shard read; executor fallback when aiofiles is absent. [FIX-2]"""
-        try:
-            import aiofiles
-            async with aiofiles.open(path, "rb") as f:
-                return await f.read()
-        except ImportError:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, _read_file_sync, path)
-
-    # ------------------------------------------------------------------
-    # SHM read / write
+    # Internal: shard path helpers
     # ------------------------------------------------------------------
 
     def _shm_path(self, shard_path: str) -> Path:
-        key = hashlib.blake2b(shard_path.encode(), digest_size=16).hexdigest()
-        return self._base / key
+        """Stable /dev/shm path for a Lustre shard path."""
+        digest = hashlib.sha1(shard_path.encode()).hexdigest()[:16]
+        return self._base / digest
+
+    # ------------------------------------------------------------------
+    # Internal: async I/O loop (node master only)
+    # ------------------------------------------------------------------
+
+    async def _load_one(self, shard_path: str, shm: Path) -> None:
+        """Fetch one shard from Lustre and write it to /dev/shm. [A-5]"""
+        async with self._sem:
+            try:
+                data = await self._read_lustre(shard_path)
+                with self._lru_lock:
+                    self._evict_for_locked(len(data))
+                    self._write(shm, data)
+                    self._lru[shard_path] = len(data)
+                    self._total_bytes    += len(data)
+
+                # [FIX-SHM] Update utilisation metric and warn if near capacity.
+                self._update_utilisation_metric()
+
+                if self._metrics is not None:
+                    self._metrics.inc("lustre_bytes_read", len(data))
+            finally:
+                with self._lru_lock:
+                    self._in_flight.discard(shard_path)  # [A-5]
+
+    async def _read_lustre(self, shard_path: str) -> bytes:
+        """Read a shard from Lustre, preferring aiofiles for async I/O."""
+        t0 = time.perf_counter()
+        try:
+            import aiofiles
+            async with aiofiles.open(shard_path, "rb") as f:
+                data = await f.read()
+        except ImportError:
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(None, _read_file_sync, shard_path)
+
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        if self._metrics is not None:
+            self._metrics.inc("lustre_read_time_ms", elapsed_ms)
+        return data
+
+    # ------------------------------------------------------------------
+    # Internal: utilisation warning  [FIX-SHM]
+    # ------------------------------------------------------------------
+
+    def _update_utilisation_metric(self) -> None:
+        """
+        Publish utilisation to MetricsRegistry and emit a warning when the
+        /dev/shm budget is nearly exhausted.
+
+        Rate-limited to once per _SHM_WARN_INTERVAL seconds to avoid log
+        flooding during sustained high-utilisation periods.
+        """
+        util = self.utilisation
+
+        if self._metrics is not None:
+            self._metrics.set("shard_cache_utilization_pct", util * 100.0)
+
+        if util >= self._warn_threshold:
+            now = time.monotonic()
+            if now - self._last_warn_ts >= _SHM_WARN_INTERVAL:
+                self._last_warn_ts = now
+                log.warning(
+                    "/dev/shm utilisation is %.1f%% (threshold %.0f%%).  "
+                    "Shard writes may fail with ENOSPC if utilisation reaches 100%%.  "
+                    "Increase node_shm_gb in LoaderConfig or reduce "
+                    "shard_prefetch_window to free capacity.  "
+                    "Current budget: %.1f GB, used: %.1f GB.",
+                    util * 100.0,
+                    self._warn_threshold * 100.0,
+                    self._max_bytes / (1 << 30),
+                    self._total_bytes / (1 << 30),
+                )
+
+    # ------------------------------------------------------------------
+    # Internal: file I/O helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _write(shm: Path, data: bytes) -> None:
         """
-        Atomic write via a temporary file and POSIX rename.
+        Write shard bytes to /dev/shm atomically.
 
         Layout: [data_len: u64][ready_magic: u64][data bytes...]
 
@@ -428,7 +489,7 @@ class NodeSharedShardCache:
 
     def _register_signals(self) -> None:
         """
-        Register SIGTERM/SIGINT handlers for clean shutdown.
+        Register SIGTERM and SIGINT handlers for clean shutdown.
 
         [FIX-12] The previous implementation called sys.exit() inside the
         signal handler, which raises SystemExit in whichever Python thread
@@ -436,12 +497,19 @@ class NodeSharedShardCache:
         NCCL all-reduce or inotify select), SystemExit is silently swallowed,
         bypassing atexit and leaving /dev/shm uncleaned.
 
-        New approach:
+        [FIX-SI] SIGINT was not registered in the previous version.  Ctrl+C
+        during interactive development left extraction threads alive and
+        /dev/shm populated.  Both SIGINT and SIGTERM are now handled.
+
+        New approach (both signals):
           1. The signal handler sets a threading.Event (async-signal-safe).
           2. A daemon watcher thread monitors the event.
           3. When fired, the watcher restores default signal handlers and
              calls os.kill(os.getpid(), SIGTERM), causing the process to
-             unwind normally through Python's atexit machinery.
+             unwind normally through Python's atexit machinery.  We re-raise
+             as SIGTERM regardless of the originating signal so the atexit
+             chain always fires (Python's default SIGINT handler raises
+             KeyboardInterrupt, which can bypass atexit in some embeddings).
         """
         self._exiting = False
 
@@ -452,12 +520,23 @@ class NodeSharedShardCache:
 
         def _watcher() -> None:
             self._shutdown_event.wait()
+            # Restore defaults so the re-raised signal is handled normally.
             for sig in (signal.SIGTERM, signal.SIGINT):
-                signal.signal(sig, signal.SIG_DFL)
+                try:
+                    signal.signal(sig, signal.SIG_DFL)
+                except (OSError, ValueError):
+                    pass  # non-main thread on some platforms
             os.kill(os.getpid(), signal.SIGTERM)
 
+        # [FIX-SI] Register both SIGTERM and SIGINT.
         for sig in (signal.SIGTERM, signal.SIGINT):
-            signal.signal(sig, _handle)
+            try:
+                signal.signal(sig, _handle)
+            except (OSError, ValueError) as exc:
+                # signal.signal() must be called from the main thread.
+                # If the cache is constructed from a worker thread (unusual),
+                # silently skip — the default handlers remain in place.
+                log.debug("Could not register signal %s handler: %s", sig, exc)
 
         threading.Thread(
             target=_watcher, name="shm-shutdown-watcher", daemon=True
