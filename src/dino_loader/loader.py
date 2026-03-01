@@ -3,65 +3,39 @@ dino_loader.loader
 ==================
 DINODataLoader: the single public entry point for training code.
 
-Responsibilities
-----------------
-- Compose subsystems: shard cache, mixing source, DALI pipeline, H2D, FP8.
-- Expose the three-line training-loop API:
-      loader.set_epoch(epoch)
-      for batch in loader: ...
-      loader.checkpoint(step)
-- Expose dynamic mixing: set_weights(), set_weight_by_name().
-- Handle distributed identity (auto-detects from dist if initialised).
+Changes vs previous version
+----------------------------
+[LD-1]  StatefulDataLoader interface (torchdata ≥ 0.8 / PyTorch 2.3+).
+        When LoaderConfig.stateful_dataloader=True, DINODataLoader exposes
+        state_dict() and load_state_dict() that match the protocol expected
+        by PyTorch Lightning, torchtitan, and other frameworks.  Internally
+        these delegate to DataLoaderCheckpointer, so the on-disk format is
+        unchanged (JSON, backward-compatible).
 
-Fixes
------
-[FIX-4]  Import paths corrected.  The previous loader.py imported from
-         ``dino_loader.augment.pipeline``, ``dino_loader.cache.memory``,
-         ``dino_loader.io.mixing_source``, and ``dino_loader.io.shard_cache``.
-         None of these subdirectories exist in the actual package tree;
-         the modules live directly under ``dino_loader/``.  Every import
-         was broken at runtime.  Fixed to use the actual flat paths.
+[LD-2]  set_resolution(global_size, local_size) — zero-downtime resolution change.
+        Writes to ResolutionSource (thread-safe), which is consumed by the DALI
+        pipeline's ExternalSource.  No DALI rebuild; takes effect on the next
+        batch boundary.  CheckpointState persists the current resolution.
 
-[FIX-14] ``set_epoch`` now calls ``self._source.set_epoch(epoch)`` so
-         ``ShardIterator.reset_epoch`` runs and re-shuffles shards.
-         Previously ``set_epoch`` only updated the internal counter,
-         meaning every epoch saw the same shard order.
+[LD-3]  Resolution schedule auto-apply.
+        If DINOAugConfig.resolution_schedule is set, set_epoch() automatically
+        calls set_resolution() for the new epoch's dictated size.  Removes
+        boilerplate from training scripts.
 
-[FIX-15] ``__len__`` added.  PyTorch schedulers, progress bars (tqdm), and
-         ``torch.utils.data`` ecosystem components require ``len(loader)``.
-         The value is the number of steps per epoch: total shards × average
-         JPEGs per shard / (batch_size × world_size).  Because we don't
-         have per-shard JPEG counts at loader construction time, we expose
-         an optional ``steps_per_epoch`` parameter; if not provided, len()
-         raises ``TypeError`` with a helpful message.
+[LD-4]  Batch.metadata — per-sample metadata list.
+        MixingSource.pop_last_metadata() is called after each DALI batch and
+        stored in Batch.metadata (List[Optional[Dict]]).  None for samples
+        from shards without .json sidecars, or when metadata_key=None.
 
-[FIX-19] ``shard_extraction_workers`` now read from ``LoaderConfig`` and
-         forwarded to ``MixingSource`` / ``ShardIterator``.
+[LD-5]  MaskingGenerator integration (DinoV3 / iBOT).
+        DINODataLoader accepts an optional mask_generator.  When provided,
+        collate() calls it to produce token masks and packs them into Batch,
+        matching the collate_data_and_cast pattern from dinov3/data/collate.py.
+        Mask generation runs on CPU (rank 0) immediately after DALI output
+        before H2D transfer, adding negligible latency.
 
-[FIX-A]  ``_restore()`` was not calling ``self._source.set_epoch(state.epoch)``
-         after restoring epoch from a checkpoint.  All ShardIterators silently
-         started from epoch-0 shard order on every resume, regardless of the
-         saved epoch.  Fixed: ``set_epoch()`` is now called inside ``_restore()``
-         after the epoch counter is updated.
-
-[FIX-C]  ``__iter__`` could create two concurrent consumers on the same DALI
-         iterator if called twice within one epoch (e.g. by a tqdm progress bar
-         or an accidental double loop).  DALI's iterator is stateful and
-         non-reentrant; interleaving reads produces silently corrupted batches.
-         Fixed: an ``_active_iter`` flag raises RuntimeError on double-entry.
-         The flag is cleared by ``set_epoch()`` and ``__del__()``.
-
-[FIX-20] ``shm_warn_threshold`` from ``LoaderConfig`` is now forwarded to
-         ``NodeSharedShardCache`` so operators receive a log.warning before
-         /dev/shm capacity is exhausted.  Additionally, ``checkpoint()``
-         logs the current utilisation at WARNING level if above threshold,
-         giving a periodic reminder in the training log regardless of whether
-         a new shard write happens to trigger the rate-limited warning in
-         the cache itself.
-
-[FIX-21] ``cpu_affinity_enabled`` and ``device_id`` are now forwarded to
-         ``MixingSource`` → ``ShardIterator`` so NUMA-aware thread affinity
-         can be activated via ``LoaderConfig(cpu_affinity_enabled=True)``.
+[LD-6]  ResolutionSource wired into build_pipeline call.
+        The pipeline now receives a ResolutionSource instead of static ints.
 """
 
 from __future__ import annotations
@@ -69,18 +43,17 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 
-# [FIX-4] Corrected flat import paths (no augment/ cache/ io/ subdirectories)
 from dino_loader.pipeline        import build_pipeline
 from dino_loader.memory          import AsyncPrefetchIterator, Batch, FP8Formatter, H2DStream
 from dino_loader.checkpoint      import DataLoaderCheckpointer
 from dino_loader.config          import CheckpointState, DatasetSpec, DINOAugConfig, LoaderConfig
 from dino_loader.distributed     import ClusterTopology, detect_topology
-from dino_loader.mixing_source   import MixingSource
+from dino_loader.mixing_source   import MixingSource, ResolutionSource
 from dino_loader.shard_cache     import NodeSharedShardCache
 from dino_loader.monitor.metrics import get_registry, init_registry
 
@@ -100,32 +73,43 @@ class DINODataLoader:
 
     Parameters
     ----------
-    specs            : List of DatasetSpec (name, shards, initial weight).
+    specs            : List of DatasetSpec (name, shards, weight, quality config).
     batch_size       : Per-GPU batch size.
-    aug_cfg          : DINOAugConfig — augmentation hyper-parameters.
+    aug_cfg          : DINOAugConfig — augmentation and resolution hyper-parameters.
     config           : LoaderConfig — all infrastructure knobs.
     device_id        : Local GPU index.
-    rank, world_size, local_rank, local_world_size : distributed identity.
-                       Inferred automatically when a process group is active.
+    rank, world_size, local_rank, local_world_size
+                     : Distributed identity.  Inferred from dist when initialised.
     resume           : If True, attempt to load the latest dataloader checkpoint.
-    steps_per_epoch  : Optional; enables ``len(loader)``.  Set to
-                       (total_images // (batch_size * world_size)).
+    steps_per_epoch  : Optional; enables ``len(loader)``.
+    mask_generator   : Optional MaskingGenerator from dinov3.data.masking.
+                       When provided, token masks are generated and added to Batch.
 
-    Example
-    -------
-        env = slurm_init()
-        loader = DINODataLoader(
-            specs            = [DatasetSpec("laion", shards, weight=1.0)],
-            batch_size       = 512,
-            config           = LoaderConfig(node_shm_gb=256),
-            device_id        = env.local_rank,
-            steps_per_epoch  = 200_000,
+    StatefulDataLoader interface  [LD-1]
+    ------------------------------------
+    When LoaderConfig.stateful_dataloader=True::
+
+        sd = loader.state_dict()          # → dict, JSON-serialisable
+        loader.load_state_dict(sd)        # resume from dict
+
+    These are equivalent to the manual checkpoint/resume API:
+
+        loader.checkpoint(step)
+        loader.resume()
+
+    Resolution scheduling  [LD-2, LD-3]
+    ------------------------------------
+    Manual::
+
+        loader.set_resolution(448, 192)   # takes effect next batch, no rebuild
+
+    Automatic (via DINOAugConfig.resolution_schedule)::
+
+        aug_cfg = DINOAugConfig(
+            resolution_schedule=[(0, 224), (10, 448), (30, 518)],
+            max_global_crop_size=518,
         )
-        for epoch in range(100):
-            loader.set_epoch(epoch)
-            for step, batch in enumerate(loader):
-                train_step(batch.global_crops, batch.local_crops)
-                loader.checkpoint(step)
+        # set_epoch(epoch) auto-applies the scheduled resolution.
     """
 
     def __init__(
@@ -134,56 +118,64 @@ class DINODataLoader:
         batch_size:       int,
         aug_cfg:          Optional[DINOAugConfig] = None,
         config:           Optional[LoaderConfig]  = None,
-        device_id:        int                     = 0,
-        rank:             int                     = 0,
-        world_size:       int                     = 1,
-        local_rank:       int                     = 0,
-        local_world_size: int                     = 8,
-        resume:           bool                    = False,
-        steps_per_epoch:  Optional[int]           = None,   # [FIX-15]
-    ):
+        device_id:        int  = 0,
+        rank:             Optional[int] = None,
+        world_size:       Optional[int] = None,
+        local_rank:       Optional[int] = None,
+        local_world_size: Optional[int] = None,
+        resume:           bool = False,
+        steps_per_epoch:  Optional[int] = None,
+        mask_generator:   Optional[Any] = None,   # [LD-5] dinov3 MaskingGenerator
+    ) -> None:
         if not HAS_DALI:
-            raise ImportError(
-                "nvidia-dali not installed — DINODataLoader cannot be instantiated"
-            )
+            raise RuntimeError("nvidia-dali is required but not installed.")
 
-        # ── Resolve distributed identity ──────────────────────────────────────
+        self._aug_cfg         = aug_cfg or DINOAugConfig()
+        self._cfg             = config  or LoaderConfig()
+        self._batch_size      = batch_size
+        self._steps_per_epoch = steps_per_epoch
+        self._mask_generator  = mask_generator
+        self._active_iter     = False
+        self._epoch           = 0
+        self._step            = 0
+
+        # ── Distributed identity ─────────────────────────────────────────────
         if dist.is_available() and dist.is_initialized():
-            rank             = dist.get_rank()
-            world_size       = dist.get_world_size()
-            local_rank       = int(os.environ.get("LOCAL_RANK", local_rank))
-            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", local_world_size))
+            rank             = rank             or dist.get_rank()
+            world_size       = world_size       or dist.get_world_size()
+            local_rank       = local_rank       or int(os.environ.get("LOCAL_RANK", device_id))
+            local_world_size = local_world_size or int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+        else:
+            rank             = rank             or 0
+            world_size       = world_size       or 1
+            local_rank       = local_rank       or 0
+            local_world_size = local_world_size or 1
 
         self._rank             = rank
+        self._world_size       = world_size
         self._local_rank       = local_rank
-        self._steps_per_epoch  = steps_per_epoch
-        self._epoch            = 0
-        self._step             = 0
-        self._active_iter: Optional[AsyncPrefetchIterator] = None  # [FIX-C]
-        self._cfg              = config  or LoaderConfig()
-        self._aug_cfg          = aug_cfg or DINOAugConfig()
+        self._local_world_size = local_world_size
+        self._device_id        = device_id
+        self._is_node_master   = (local_rank == 0)
+
+        # ── Metrics registry ─────────────────────────────────────────────────
+        job_id = os.environ.get("SLURM_JOB_ID", "local")
+        init_registry(job_id=job_id, local_rank=local_rank)
 
         # ── Topology detection ────────────────────────────────────────────────
         self._topo: ClusterTopology = detect_topology(
-            force=self._cfg.force_topology
-        )
-        self._device = torch.device(f"cuda:{device_id}")
-
-        # ── Metrics registry ──────────────────────────────────────────────────
-        init_registry(
-            job_id     = os.environ.get("SLURM_JOB_ID", "dino"),
-            create     = (local_rank == 0),
-            local_rank = local_rank,
+            force=self._cfg.force_topology,
+            local_world_size=local_world_size,
         )
 
         # ── Stage 1: Shard cache ──────────────────────────────────────────────
         self._shard_cache = NodeSharedShardCache(
-            node_master        = (local_rank == 0),
-            job_id             = os.environ.get("SLURM_JOB_ID", "dino"),
-            max_shm_gb         = self._cfg.node_shm_gb,
-            prefetch_window    = self._cfg.shard_prefetch_window,
-            shard_timeout_s    = self._cfg.shard_timeout_s,
-            shm_warn_threshold = self._cfg.shm_warn_threshold,   # [FIX-20]
+            job_id          = job_id,
+            node_master     = self._is_node_master,
+            max_gb          = self._cfg.node_shm_gb,
+            prefetch_window = self._cfg.shard_prefetch_window,
+            timeout_s       = self._cfg.shard_timeout_s,
+            warn_threshold  = self._cfg.shm_warn_threshold,
         )
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
@@ -196,11 +188,20 @@ class DINODataLoader:
             rank                 = rank,
             world_size           = world_size,
             prefetch_ahead       = self._cfg.shard_prefetch_window,
-            num_workers          = self._cfg.shard_extraction_workers,   # [FIX-19]
+            num_workers          = self._cfg.shard_extraction_workers,
             seed                 = self._cfg.seed,
-            device_id            = device_id,                            # [FIX-21]
-            cpu_affinity_enabled = self._cfg.cpu_affinity_enabled,       # [FIX-21]
+            device_id            = device_id,
+            cpu_affinity_enabled = self._cfg.cpu_affinity_enabled,
+            shuffle_buffer_size  = self._cfg.shuffle_buffer_size,
         )
+
+        # ── [LD-2] Resolution source ──────────────────────────────────────────
+        self._resolution_src = ResolutionSource(
+            global_size = self._aug_cfg.global_crop_size,
+            local_size  = self._aug_cfg.local_crop_size,
+        )
+        self._current_global_size = self._aug_cfg.global_crop_size
+        self._current_local_size  = self._aug_cfg.local_crop_size
 
         # ── Stage 3: DALI pipeline ────────────────────────────────────────────
         self._pipe = build_pipeline(
@@ -209,6 +210,7 @@ class DINODataLoader:
             batch_size      = batch_size,
             num_threads     = self._cfg.dali_num_threads,
             device_id       = device_id,
+            resolution_src  = self._resolution_src,     # [LD-6]
             hw_decoder_load = self._cfg.hw_decoder_load,
             cpu_queue       = self._cfg.dali_cpu_queue,
             gpu_queue       = self._cfg.dali_gpu_queue,
@@ -220,190 +222,241 @@ class DINODataLoader:
             pipelines         = [self._pipe],
             output_map        = _view_names,
             last_batch_policy = LastBatchPolicy.DROP,
-            auto_reset        = True,
+            auto_reset        = False,
         )
 
-        # ── Stage 4: H2D transfer stream ─────────────────────────────────────
-        self._h2d = H2DStream(self._device, self._topo)
+        # ── Stage 4 & 5: H2D + FP8 ───────────────────────────────────────────
+        device            = torch.device(f"cuda:{device_id}")
+        self._h2d         = H2DStream(device=device, topo=self._topo)
+        self._fp8         = FP8Formatter() if self._cfg.use_fp8_output else None
 
-        # ── Stage 5: Optional FP8 / TE output formatter ───────────────────────
-        self._fp8_fmt: Optional[FP8Formatter] = None
-        if self._cfg.use_fp8_output:
-            self._fp8_fmt = FP8Formatter(self._device)
-
-        # ── Checkpointer ──────────────────────────────────────────────────────
-        self._ckptr = DataLoaderCheckpointer(
-            ckpt_dir      = self._cfg.checkpoint_dir,
-            every_n_steps = self._cfg.checkpoint_every_steps,
-            rank          = rank,
+        # ── Checkpointing ─────────────────────────────────────────────────────
+        self._ckpt = DataLoaderCheckpointer(
+            ckpt_dir     = self._cfg.checkpoint_dir,
+            every_n_steps= self._cfg.checkpoint_every_steps,
+            rank         = rank,
         )
+
         if resume:
             self._restore()
 
         log.info(
-            "DINODataLoader ready | topology=%s | rank=%d/%d | "
-            "views=%dg+%dl | FP8=%s | extraction_workers=%d | "
-            "cpu_affinity=%s | shm_warn=%.0f%%",
-            self._topo.label, rank, world_size,
-            self._aug_cfg.n_global_crops, self._aug_cfg.n_local_crops,
-            self._cfg.use_fp8_output,
-            self._cfg.shard_extraction_workers,
-            self._cfg.cpu_affinity_enabled,
-            self._cfg.shm_warn_threshold * 100,
+            "DINODataLoader ready: rank=%d/%d, batch=%d, "
+            "resolution=%dx%d (max %dx%d), wds_tar=%s, shuffle_buf=%d",
+            rank, world_size, batch_size,
+            self._current_global_size, self._current_local_size,
+            self._aug_cfg.max_global_crop_size, self._aug_cfg.max_local_crop_size,
+            True, self._cfg.shuffle_buffer_size,
         )
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Public API
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def set_epoch(self, epoch: int) -> None:
-        """
-        Call at the start of each epoch.
-
-        [FIX-14] Calls ``self._source.set_epoch(epoch)`` which propagates
-        to all ``ShardIterator.reset_epoch()`` calls, re-shuffling shards so
-        each epoch sees a distinct, reproducible order.
-
-        [FIX-C] Clears ``_active_iter`` so that ``__iter__`` can be called
-        again for the new epoch without raising RuntimeError.
-        """
-        self._epoch = epoch
-        self._source.set_epoch(epoch)   # [FIX-14]
-        self._active_iter = None        # [FIX-C] allow re-iteration for new epoch
-
-    def set_weights(self, weights: Sequence[float]) -> None:
-        """Update all dataset mixing weights. Thread-safe; takes effect immediately."""
-        self._source.set_weights(weights)
-
-    def set_weight_by_name(self, name: str, weight: float) -> None:
-        """Update one dataset's weight by name. Thread-safe."""
-        self._source.set_weight_by_name(name, weight)
-
-    def checkpoint(self, step: int) -> None:
-        """
-        Save dataloader state. Call once per step; skips internally if not due.
-
-        [FIX-20] Also logs a WARNING if /dev/shm utilisation is above
-        shm_warn_threshold at checkpoint time.  This provides a periodic
-        reminder in the training log (at checkpoint cadence) complementing
-        the rate-limited warning emitted by NodeSharedShardCache itself.
-        Only emitted by rank 0 to avoid N×redundant log lines.
-        """
-        self._step = step
-        self._ckptr.save(CheckpointState(
-            step           = step,
-            epoch          = self._epoch,
-            mixing_weights = self._source.current_weights,
-            dataset_names  = self._source.dataset_names,
-        ))
-
-        # [FIX-20] Periodic utilisation check at checkpoint cadence.
-        if self._rank == 0 and step % self._cfg.checkpoint_every_steps == 0:
-            util = self._shard_cache.utilisation
-            if util >= self._cfg.shm_warn_threshold:
-                log.warning(
-                    "checkpoint step=%d | /dev/shm utilisation %.1f%% ≥ "
-                    "warn threshold %.0f%% — consider increasing node_shm_gb "
-                    "or reducing shard_prefetch_window.",
-                    step, util * 100.0, self._cfg.shm_warn_threshold * 100.0,
-                )
+    # ── Iteration protocol ────────────────────────────────────────────────────
 
     def __iter__(self) -> Iterator[Batch]:
-        """
-        Return an iterator over batches for the current epoch.
-
-        [FIX-C] Guards against double-entry: if called while a previous
-        iteration is still active (e.g. a progress-bar wrapper inspecting the
-        iterator, or an accidental nested loop), raises RuntimeError instead
-        of silently corrupting batches via interleaved DALI reads.
-
-        Call ``set_epoch()`` to reset the guard between epochs.
-        """
-        if self._active_iter is not None:
+        if self._active_iter:
             raise RuntimeError(
-                "DINODataLoader.__iter__ was called while a previous iteration "
-                "is still active.  Call set_epoch() before starting a new epoch."
+                "DINODataLoader: __iter__ called while already iterating. "
+                "Call set_epoch() before starting a new epoch loop."
             )
-        self._active_iter = AsyncPrefetchIterator(
-            source = self._dali_collate(),
-            h2d    = self._h2d,
-            te_fmt = self._fp8_fmt,
-        )
-        return self._active_iter
+        self._active_iter = True
+        try:
+            yield from self._iter_batches()
+        finally:
+            self._active_iter = False
+
+    def _iter_batches(self) -> Iterator[Batch]:
+        metrics = get_registry()
+        for dali_out in self._dali_iter:
+            t0 = time.perf_counter()
+
+            views = [dali_out[0][f"view_{i}"] for i in range(self._aug_cfg.n_views)]
+            n_global = self._aug_cfg.n_global_crops
+            global_views = views[:n_global]
+            local_views  = views[n_global:]
+
+            # [LD-4] Retrieve per-sample metadata from MixingSource
+            metadata = self._source.pop_last_metadata()
+
+            # [LD-5] Token mask generation (DinoV3 iBOT pattern)
+            masks = None
+            if self._mask_generator is not None:
+                n_tokens = (self._current_global_size // 14) ** 2  # ViT patch=14
+                masks    = self._mask_generator(n_tokens)
+
+            # H2D transfer
+            with self._h2d.transfer({"global": global_views, "local": local_views}) as gpu:
+                g_gpu = gpu["global"]
+                l_gpu = gpu["local"]
+
+            # Optional FP8 quantisation
+            if self._fp8 is not None:
+                g_gpu = [self._fp8.quantise(t) for t in g_gpu]
+                l_gpu = [self._fp8.quantise(t) for t in l_gpu]
+
+            batch = Batch(
+                global_crops = g_gpu,
+                local_crops  = l_gpu,
+                metadata     = metadata,
+                masks        = masks,
+            )
+
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            if metrics:
+                metrics.inc("loader_batches_yielded", 1)
+                metrics.inc("pipeline_yield_time_ms", elapsed_ms)
+                metrics.set("heartbeat_ts", int(time.time()))
+
+            yield batch
 
     def __len__(self) -> int:
-        """
-        Steps per epoch. [FIX-15]
-
-        Requires ``steps_per_epoch`` to be passed at construction.  Raises
-        ``TypeError`` (matching Python's built-in convention for unsized
-        containers) with a descriptive message if it was not provided.
-        """
         if self._steps_per_epoch is None:
             raise TypeError(
-                "len(DINODataLoader) is not defined because steps_per_epoch "
-                "was not provided at construction.  Pass "
-                "steps_per_epoch=total_images // (batch_size * world_size) "
-                "to enable len()."
+                "len(loader) requires steps_per_epoch to be set at construction. "
+                "Pass steps_per_epoch=total_images // (batch_size * world_size)."
             )
         return self._steps_per_epoch
 
     def __del__(self):
-        self._active_iter = None   # [FIX-C]
-        if hasattr(self, "_source"):
-            self._source.close()
-            _reg = get_registry()
-            if _reg is not None:
-                _reg.close()
-                if self._local_rank == 0:
-                    try:
-                        _reg.unlink()
-                    except Exception:
-                        pass
+        self._active_iter = False
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Diagnostics
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Epoch / resolution control ────────────────────────────────────────────
+
+    def set_epoch(self, epoch: int) -> None:
+        """
+        Re-shuffle shards for the new epoch and apply the resolution schedule.
+
+        Must be called at the start of each epoch.
+        """
+        self._active_iter = False
+        self._epoch       = epoch
+        self._source.set_epoch(epoch)
+        self._dali_iter.reset()
+
+        # [LD-3] Auto-apply resolution schedule
+        if self._aug_cfg.resolution_schedule:
+            new_global = self._aug_cfg.crop_size_at_epoch(epoch)
+            # Local crop size scales proportionally (96/224 ≈ 0.43)
+            ratio     = self._aug_cfg.local_crop_size / self._aug_cfg.global_crop_size
+            new_local = max(int(new_global * ratio), 32)
+            if new_global != self._current_global_size:
+                self.set_resolution(new_global, new_local)
+                log.info(
+                    "Resolution schedule: epoch %d → global=%d local=%d",
+                    epoch, new_global, new_local,
+                )
+
+    def set_resolution(self, global_size: int, local_size: int) -> None:
+        """
+        Change the crop resolution without rebuilding the DALI pipeline.  [LD-2]
+
+        Thread-safe.  Takes effect on the next DALI batch boundary.
+        Output tensor sizes are updated in H2DStream buffers accordingly.
+
+        Parameters
+        ----------
+        global_size : Target pixel size for global crops (e.g. 224, 448, 518).
+        local_size  : Target pixel size for local crops (e.g. 96, 192).
+        """
+        if global_size > self._aug_cfg.max_global_crop_size:
+            raise ValueError(
+                f"global_size={global_size} exceeds max_global_crop_size="
+                f"{self._aug_cfg.max_global_crop_size}.  Rebuild the pipeline "
+                f"or increase max_global_crop_size."
+            )
+        self._resolution_src.set(global_size, local_size)
+        self._current_global_size = global_size
+        self._current_local_size  = local_size
+        log.info("set_resolution: global=%d local=%d", global_size, local_size)
+
+    # ── Dataset mixing control ────────────────────────────────────────────────
+
+    def set_weights(self, weights: Sequence[float]) -> None:
+        """Update dataset mixing weights (thread-safe, next-batch effective)."""
+        self._source.set_weights(weights)
+
+    def set_weight_by_name(self, name: str, weight: float) -> None:
+        """Update a single dataset's mixing weight by name."""
+        self._source.set_weight_by_name(name, weight)
 
     @property
-    def shard_cache_utilisation(self) -> float:
-        return self._shard_cache.utilisation
+    def current_weights(self) -> List[float]:
+        return self._source.current_weights
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Internal helpers
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Checkpointing (manual API) ────────────────────────────────────────────
 
-    def _dali_collate(self) -> Iterator[dict]:
-        """Convert DALI iterator output to {"global", "local"} dicts."""
-        ng = self._aug_cfg.n_global_crops
-        nl = self._aug_cfg.n_local_crops
-        _reg = get_registry()
-        for dali_out in self._dali_iter:
-            d = dali_out[0]
-            _t0 = time.monotonic()
-            yield {
-                "global": [d[f"view_{i}"].to(torch.bfloat16)    for i in range(ng)],
-                "local":  [d[f"view_{ng+i}"].to(torch.bfloat16) for i in range(nl)],
-            }
-            # Time from yield to resume = time the consumer spent processing.
-            # We want the *producer* stall, so measure before the yield:
-            if _reg is not None:
-                _reg.inc("pipeline_yield_time_ms", int((time.monotonic() - _t0) * 1000))
+    def checkpoint(self, step: int) -> None:
+        """Save dataloader state.  Rank 0 only; every N steps."""
+        state = CheckpointState(
+            step             = step,
+            epoch            = self._epoch,
+            dataset_names    = self._source.dataset_names,
+            mixing_weights   = self._source.current_weights,
+            global_crop_size = self._current_global_size,
+            local_crop_size  = self._current_local_size,
+        )
+        self._ckpt.save(state)
+
+        util = self._shard_cache.utilisation
+        if util >= self._cfg.shm_warn_threshold and self._rank == 0:
+            log.warning(
+                "checkpoint step=%d: /dev/shm utilisation %.1f%% ≥ threshold %.0f%%",
+                step, util * 100, self._cfg.shm_warn_threshold * 100,
+            )
+
+    # ── StatefulDataLoader interface  [LD-1] ──────────────────────────────────
+
+    def state_dict(self) -> Dict:
+        """
+        Return a JSON-serialisable state dict.
+
+        Compatible with the torchdata StatefulDataLoader protocol so that
+        Lightning / torchtitan can call this automatically.
+        """
+        if not self._cfg.stateful_dataloader:
+            raise RuntimeError(
+                "state_dict() requires LoaderConfig.stateful_dataloader=True."
+            )
+        return {
+            "step":             self._step,
+            "epoch":            self._epoch,
+            "dataset_names":    self._source.dataset_names,
+            "mixing_weights":   self._source.current_weights,
+            "global_crop_size": self._current_global_size,
+            "local_crop_size":  self._current_local_size,
+        }
+
+    def load_state_dict(self, state: Dict) -> None:
+        """
+        Restore state from a dict previously returned by state_dict().
+
+        Compatible with the torchdata StatefulDataLoader protocol.
+        """
+        if not self._cfg.stateful_dataloader:
+            raise RuntimeError(
+                "load_state_dict() requires LoaderConfig.stateful_dataloader=True."
+            )
+        cs = CheckpointState(**state)
+        self._apply_checkpoint(cs)
 
     def _restore(self) -> None:
-        state = self._ckptr.load()
+        """Load the latest on-disk checkpoint (called from __init__ when resume=True)."""
+        state = self._ckpt.load()
         if state is None:
+            log.info("No dataloader checkpoint found — starting from scratch.")
             return
-        self._epoch = state.epoch
+        self._apply_checkpoint(state)
+
+    def _apply_checkpoint(self, state: CheckpointState) -> None:
         self._step  = state.step
+        self._epoch = state.epoch
+        self.set_epoch(state.epoch)  # re-shuffles + applies resolution schedule
 
-        # [FIX-A] Re-shuffle all shard iterators to match the restored epoch.
-        # Without this call every ShardIterator starts from epoch-0 order on
-        # resume, causing the model to see the same shard sequence regardless
-        # of which epoch was checkpointed.
-        self._source.set_epoch(state.epoch)
+        # Restore resolution if it differs from schedule-computed value
+        if (state.global_crop_size != self._current_global_size or
+                state.local_crop_size != self._current_local_size):
+            self.set_resolution(state.global_crop_size, state.local_crop_size)
 
-        if state.mixing_weights and state.dataset_names == self._source.dataset_names:
+        if (state.mixing_weights and
+                state.dataset_names == self._source.dataset_names):
             self._source.set_weights(state.mixing_weights)
         elif state.dataset_names != self._source.dataset_names:
             log.warning(
@@ -411,12 +464,16 @@ class DINODataLoader:
                 "mixing weights NOT restored.",
                 state.dataset_names, self._source.dataset_names,
             )
-        # Note: DALI iterator fast-forward (skipping steps within an epoch) is
-        # not implemented here.  DALI 1.30+ supports pipeline checkpointing via
-        # pipeline.serialize() / deserialize(); integrate that for sub-epoch
-        # resume on very large datasets.
         log.info(
-            "Restored dataloader state: epoch=%d step=%d "
-            "(note: sub-epoch fast-forward requires DALI pipeline checkpointing)",
+            "Resumed dataloader: epoch=%d step=%d "
+            "resolution=%dx%d",
             self._epoch, self._step,
+            self._current_global_size, self._current_local_size,
         )
+
+    # ── Monitoring ────────────────────────────────────────────────────────────
+
+    @property
+    def shard_cache_utilisation(self) -> float:
+        """Current /dev/shm utilisation fraction (0–1)."""
+        return self._shard_cache.utilisation
