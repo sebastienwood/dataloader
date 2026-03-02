@@ -74,6 +74,39 @@ Additional fixes
          configured in LoaderConfig (default 0.85).  The warning is
          rate-limited to once per ``_SHM_WARN_INTERVAL`` seconds to avoid
          flooding logs during sustained high utilisation.
+
+[FIX-ORPHAN] Application-level cleanup of orphaned /dev/shm directories.
+         On SIGKILL or OOM-kill, atexit handlers do not run, leaving
+         /dev/shm/<job_id>/ populated.  On busy clusters with frequent OOM
+         crashes, these directories accumulate and can silently saturate
+         the tmpfs (shared at node scope), causing ENOSPC for unrelated
+         jobs.
+         Previously, the recommendation was a SLURM prolog script deployed
+         by cluster admins.  This fix internalises the cleanup:
+         _purge_orphaned_shm() is called at node-master startup (inside
+         _init_shm) and removes any /dev/shm/<N>/ directory (integer name
+         = SLURM job ID) whose job is no longer alive according to squeue.
+         Conservative fallback: if squeue is unavailable or times out (2s),
+         no directories are removed so as not to risk destroying a live
+         cache.
+
+[FIX-PERM] /dev/shm/<job_id>/ created with mode 0o700 (user-only).
+         The previous code used the process umask default, typically 0o755
+         or 0o777, which allows other users on a shared node to read
+         cached shard data.  mode=0o700 restricts access to the owning
+         user only.
+
+[FIX-HEADROOM] Real available space in /dev/shm is checked before each
+         shard write via shutil.disk_usage("/dev/shm").free.
+         The LRU budget (_max_bytes) only tracks bytes written by this
+         process; other processes (e.g. NCCL, other jobs on the same node)
+         can consume the shared tmpfs independently.  Without this check,
+         _evict_for_locked() may successfully free LRU entries yet still
+         hit ENOSPC on the actual write — manifesting as a confusing
+         TimeoutError 300 s later.  A warning is emitted when headroom
+         drops below 20 % of the incoming shard size (minimum 512 MB),
+         and an IOError is raised immediately when free space is less than
+         the shard size, providing a clear, actionable error message.
 """
 
 from __future__ import annotations
@@ -89,6 +122,7 @@ import select
 import shutil
 import signal
 import struct
+import subprocess   # [FIX-ORPHAN]
 import threading
 import time
 from collections import OrderedDict
@@ -110,6 +144,15 @@ _IN_MOVED_TO    = 0x00000080
 # Prevents log flooding during sustained high-utilisation periods.
 _SHM_WARN_INTERVAL = 60.0
 
+# [FIX-ORPHAN] Maximum seconds to wait for squeue before giving up.
+_SQUEUE_TIMEOUT_S = 2.0
+
+# [FIX-HEADROOM] Minimum free-space margin as a fraction of the incoming
+# shard size.  Below this, a warning is emitted.  Below 1.0 (i.e. less
+# free space than the shard itself), an IOError is raised immediately.
+_SHM_HEADROOM_WARN_FACTOR  = 1.2   # warn if free < incoming * 1.2
+_SHM_HEADROOM_MIN_WARN_MB  = 512   # always warn when < 512 MB free
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Module-level helpers
@@ -124,6 +167,145 @@ def _read_file_sync(path: str) -> bytes:
     """
     with open(path, "rb") as f:
         return f.read()
+
+
+def _is_slurm_job_alive(job_id: str, timeout_s: float = _SQUEUE_TIMEOUT_S) -> bool:
+    """
+    Return True if SLURM job *job_id* is still active (RUNNING or PENDING).
+
+    Strategy
+    --------
+    1. Run ``squeue --jobs <id> --noheader`` with a hard timeout.
+       - Exit 0 + non-empty stdout  → job is alive.
+       - Exit 0 + empty stdout      → job has finished (COMPLETED / CANCELLED).
+       - Exit 1                     → job ID unknown to SLURM → definitively dead.
+    2. If squeue is not on PATH, or the SLURM controller does not respond
+       within *timeout_s*, return True (conservative: assume alive so we
+       never accidentally destroy a live cache).
+
+    [FIX-ORPHAN]
+    """
+    try:
+        result = subprocess.run(
+            ["squeue", "--jobs", job_id, "--noheader"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        if result.returncode == 0:
+            return bool(result.stdout.strip())
+        # squeue exits 1 when the job ID is not found → definitively dead.
+        return False
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        # squeue not on PATH, or SLURM controller unreachable → be conservative.
+        return True
+
+
+def _purge_orphaned_shm(current_job_id: str) -> None:
+    """
+    Scan /dev/shm/ for directories left by dead SLURM jobs and remove them.
+
+    Only directories whose name is a pure integer (i.e. a SLURM job ID) and
+    that do NOT correspond to a live job are removed.  The current job's
+    directory is always skipped — it is handled separately by _init_shm.
+
+    This function is called once at node-master startup, before _init_shm
+    creates the cache directory for the current job.
+
+    Failure modes are handled gracefully:
+    - /dev/shm not listable             → logged at DEBUG, no action.
+    - squeue unavailable / timed out    → conservative skip (see _is_slurm_job_alive).
+    - rmtree fails (permissions, race)  → logged at DEBUG, no action.
+
+    [FIX-ORPHAN]
+    """
+    shm_root = Path("/dev/shm")
+    try:
+        candidates = [
+            p for p in shm_root.iterdir()
+            if p.is_dir() and p.name.isdigit()
+        ]
+    except OSError as exc:
+        log.debug("Could not scan /dev/shm for orphaned job directories: %s", exc)
+        return
+
+    for candidate in candidates:
+        if candidate.name == current_job_id:
+            continue  # _init_shm handles the current job's own stale directory.
+
+        if not _is_slurm_job_alive(candidate.name):
+            try:
+                shutil.rmtree(candidate)
+                log.info(
+                    "[FIX-ORPHAN] Removed orphaned /dev/shm/%s "
+                    "(SLURM job no longer alive)",
+                    candidate.name,
+                )
+            except Exception as exc:
+                # Possible causes: directory belongs to another user (EPERM),
+                # concurrent cleanup by another node's node-master (ENOENT),
+                # or tmpfs still being written by a process we did not account
+                # for.  All are safe to ignore — the directory will be cleaned
+                # up on the next job startup, or by the OS when tmpfs pressure
+                # eventually triggers eviction.
+                log.debug(
+                    "Could not remove orphaned /dev/shm/%s: %s",
+                    candidate.name, exc,
+                )
+
+
+def _check_shm_headroom(incoming: int) -> None:
+    """
+    Verify that /dev/shm has enough real free space to absorb *incoming* bytes.
+
+    /dev/shm is a node-scoped tmpfs shared by all processes (NCCL, other
+    jobs, the OS itself).  The LRU budget (_max_bytes) only accounts for
+    bytes written by this process; external consumers reduce available space
+    independently.  Without this guard, _evict_for_locked() may free entries
+    from our LRU yet still hit ENOSPC on the actual write — surfacing as a
+    completely opaque "Shard not ready after 300s" TimeoutError.
+
+    Behaviour
+    ---------
+    - Emits log.warning  when free space < incoming * _SHM_HEADROOM_WARN_FACTOR
+      (or < _SHM_HEADROOM_MIN_WARN_MB, whichever is larger).
+    - Raises IOError     when free space < incoming (write would certainly fail).
+
+    This function is called by _load_one after _evict_for_locked() and
+    before _write().  The shutil.disk_usage() call is cheap (single statfs
+    syscall) and non-blocking.
+
+    [FIX-HEADROOM]
+    """
+    try:
+        free = shutil.disk_usage("/dev/shm").free
+    except OSError as exc:
+        # Should never happen on a well-configured Linux host, but don't
+        # crash the prefetch coroutine over a monitoring call.
+        log.debug("Could not stat /dev/shm usage: %s", exc)
+        return
+
+    warn_threshold = max(
+        int(incoming * _SHM_HEADROOM_WARN_FACTOR),
+        _SHM_HEADROOM_MIN_WARN_MB * (1 << 20),
+    )
+
+    if free < incoming:
+        raise IOError(
+            f"/dev/shm has only {free >> 20} MB free but needs {incoming >> 20} MB "
+            f"for this shard.  Increase node_shm_gb in LoaderConfig, reduce "
+            f"shard_prefetch_window, or free space from other processes."
+        )
+
+    if free < warn_threshold:
+        log.warning(
+            "[FIX-HEADROOM] /dev/shm headroom low: %d MB free, "
+            "incoming shard is %d MB (warn threshold %d MB).  "
+            "ENOSPC may occur soon.",
+            free >> 20,
+            incoming >> 20,
+            warn_threshold >> 20,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -347,6 +529,7 @@ class NodeSharedShardCache:
                 data = await self._read_lustre(shard_path)
                 with self._lru_lock:
                     self._evict_for_locked(len(data))
+                    _check_shm_headroom(len(data))   # [FIX-HEADROOM]
                     self._write(shm, data)
                     self._lru[shard_path] = len(data)
                     self._total_bytes    += len(data)
@@ -481,11 +664,31 @@ class NodeSharedShardCache:
     # ------------------------------------------------------------------
 
     def _init_shm(self) -> None:
-        """Remove stale /dev/shm/<job_id>/ from a previous crashed run. [A-2]"""
+        """
+        Prepare the /dev/shm cache directory for this job.
+
+        Steps
+        -----
+        1. [FIX-ORPHAN] Purge /dev/shm directories from dead SLURM jobs to
+           prevent gradual tmpfs saturation across successive OOM / SIGKILL
+           crashes.  Uses _purge_orphaned_shm() which queries squeue with a
+           conservative 2-second timeout.
+        2. [A-2] Remove this job's own stale directory if it exists from a
+           previous run with the same job ID (can happen with SLURM job
+           arrays or during development restarts).
+        3. [FIX-PERM] Create the directory with mode 0o700 (user-only) so
+           other users on a shared node cannot read cached shard data.
+        """
+        # Step 1 — evict dead jobs' leftovers.
+        _purge_orphaned_shm(self._base.name)   # [FIX-ORPHAN]
+
+        # Step 2 — remove this job's own stale directory.
         if self._base.exists():
-            log.info("Removing orphaned shard cache at %s", self._base)
+            log.info("Removing stale shard cache at %s", self._base)
             shutil.rmtree(self._base, ignore_errors=True)
-        self._base.mkdir(parents=True, exist_ok=True)
+
+        # Step 3 — create with restricted permissions.
+        self._base.mkdir(parents=True, exist_ok=True, mode=0o700)  # [FIX-PERM]
 
     def _register_signals(self) -> None:
         """
@@ -547,7 +750,9 @@ class NodeSharedShardCache:
         if not self._node_master:
             return
         try:
-            shutil.rmtree(self._base, ignore_errors=True)
+            shutil.rmtree(self._base)
             log.info("Cleaned up shard cache at %s", self._base)
-        except Exception:
-            pass
+        except FileNotFoundError:
+            pass  # already cleaned up (e.g. double atexit call)
+        except Exception as exc:
+            log.warning("Partial cleanup of %s: %s", self._base, exc)
