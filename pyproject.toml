@@ -23,6 +23,7 @@ dependencies = [
     # ── Pillow: CPU backend augmentation pipeline ─────────────────────────────
     "pillow~=11.0",
     "dino-datasets",
+    "dino-env",
 ]
 
 # ── Optional GPU-only / cluster dependencies ──────────────────────────────────
@@ -93,6 +94,7 @@ timeout = 120
 
 [tool.uv.sources]
 dino-datasets = { git = "https://github.com/piflepaf1-eng/dino_datasets" }
+dino-env = { git = "https://github.com/sebastienwood/dino_env" }
 
 [build-system]
 requires      = ["hatchling"]
