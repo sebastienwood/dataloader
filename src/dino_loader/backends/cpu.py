@@ -1,22 +1,19 @@
-"""dino_loader.backends.cpu.
-
+"""
+dino_loader.backends.cpu
+========================
 Pure-Python / PyTorch CPU backend.
 
-Changes in this version
------------------------
-[CPU-AUG-1]  ``build_pipeline`` now accepts an ``AugmentationSpec`` and
-             dispatches to the appropriate CPU implementation.
-[CPU-AUG-2]  ``EvalAugSpec`` → ``CPUEvalPipeline``: deterministic resize +
-             centre-crop, no stochastic ops, single view.
-[CPU-AUG-3]  ``LeJEPAAugSpec`` → ``CPULeJEPAPipeline``: context + N target
-             crops with correct scale ranges.
-[CPU-AUG-4]  ``UserAugSpec`` → ``CPUUserAugPipeline``: decodes JPEG with PIL,
-             normalises, then calls ``aug_fn``.  The user function receives
-             a ``torch.Tensor[B, C, H, W]`` identical in semantics to what
-             DALI would deliver, making CPU ↔ DALI swap transparent.
-"""
+Used for unit tests, CI, and rapid iteration on laptops. All DALI-specific
+logic lives in DALIBackend; this backend replaces it with PIL + torchvision.
 
-from __future__ import annotations
+[CPU-AUG-1] build_pipeline dispatches on AugmentationSpec subtype via
+            isinstance chains (replacing structural pattern matching which
+            requires __match_args__ and is less explicit).
+[CPU-AUG-2] EvalAugSpec → CPUEvalPipeline: deterministic resize + centre-crop.
+[CPU-AUG-3] LeJEPAAugSpec → CPULeJEPAPipeline: context + N target crops.
+[CPU-AUG-4] UserAugSpec → CPUUserAugPipeline: decodes JPEG with PIL,
+            normalises, then calls aug_fn.
+"""
 
 import contextlib
 import io
@@ -24,8 +21,9 @@ import logging
 import random
 import threading
 from collections import OrderedDict
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -54,9 +52,7 @@ except ImportError:
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Stage 1 — In-process shard cache (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
+# Stage 1 — In-process shard cache
 
 class InProcessShardCache:
     """Shard cache backed by an in-process LRU dict."""
@@ -114,15 +110,13 @@ class InProcessShardCache:
             self._total -= len(evicted)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Augmentation helpers (shared)
-# ══════════════════════════════════════════════════════════════════════════════
+# Augmentation helpers
 
 def _random_resized_crop(
-    img: Image.Image,
-    size: int,
-    scale: Tuple[float, float],
-    ratio: Tuple[float, float] = (3 / 4, 4 / 3),
+    img:   Image.Image,
+    size:  int,
+    scale: tuple[float, float],
+    ratio: tuple[float, float] = (3 / 4, 4 / 3),
 ) -> Image.Image:
     if HAS_TV:
         return TV.RandomResizedCrop(
@@ -164,7 +158,7 @@ def _resize_shorter(img: Image.Image, size: int) -> Image.Image:
 
 
 def _color_jitter(
-    img: Image.Image,
+    img:        Image.Image,
     brightness: float,
     contrast:   float,
     saturation: float,
@@ -175,26 +169,29 @@ def _color_jitter(
         return img
     if HAS_TV:
         return TV.ColorJitter(
-            brightness = brightness,
-            contrast   = contrast,
-            saturation = saturation,
-            hue        = hue,
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            hue=hue,
         )(img)
     from PIL import ImageEnhance
-    def _enhance(i, cls, lo, hi):
-        return cls(i).enhance(random.uniform(max(0.0, 1 - lo), 1 + hi))
     ops = [
-        (ImageEnhance.Brightness, brightness, brightness),
-        (ImageEnhance.Contrast,   contrast,   contrast),
-        (ImageEnhance.Color,      saturation, saturation),
+        (ImageEnhance.Brightness, brightness),
+        (ImageEnhance.Contrast,   contrast),
+        (ImageEnhance.Color,      saturation),
     ]
     random.shuffle(ops)
-    for cls, lo, hi in ops:
-        img = _enhance(img, cls, lo, hi)
+    for cls, strength in ops:
+        img = cls(img).enhance(random.uniform(max(0.0, 1 - strength), 1 + strength))
     return img
 
 
-def _gaussian_blur(img: Image.Image, sigma_min: float, sigma_max: float, prob: float) -> Image.Image:
+def _gaussian_blur(
+    img:       Image.Image,
+    sigma_min: float,
+    sigma_max: float,
+    prob:      float,
+) -> Image.Image:
     if random.random() > prob:
         return img
     sigma = random.uniform(sigma_min, sigma_max)
@@ -205,9 +202,9 @@ def _gaussian_blur(img: Image.Image, sigma_min: float, sigma_max: float, prob: f
 
 
 def _to_tensor_normalized(
-    img: Image.Image,
-    mean: Tuple[float, float, float],
-    std:  Tuple[float, float, float],
+    img:  Image.Image,
+    mean: tuple[float, float, float],
+    std:  tuple[float, float, float],
 ) -> torch.Tensor:
     if HAS_TV:
         t = TF.to_tensor(img)
@@ -217,14 +214,15 @@ def _to_tensor_normalized(
     return torch.from_numpy(arr.transpose(2, 0, 1))
 
 
-def _augment_dinov2(
+def _augment_one(
     jpeg_bytes: bytes,
     aug_cfg:    DINOAugConfig,
     crop_size:  int,
-    scale:      Tuple[float, float],
+    scale:      tuple[float, float],
     blur_prob:  float,
     sol_prob:   float,
 ) -> torch.Tensor:
+    """Apply DINOv2-style augmentation to a single JPEG."""
     try:
         img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
     except Exception:
@@ -233,28 +231,19 @@ def _augment_dinov2(
     img = _random_resized_crop(img, crop_size, scale)
     if random.random() < aug_cfg.flip_prob:
         img = img.transpose(Image.FLIP_LEFT_RIGHT)
-    img = _color_jitter(img, aug_cfg.brightness, aug_cfg.contrast, aug_cfg.saturation, aug_cfg.hue, aug_cfg.color_jitter_prob)
+    img = _color_jitter(
+        img, aug_cfg.brightness, aug_cfg.contrast,
+        aug_cfg.saturation, aug_cfg.hue, aug_cfg.color_jitter_prob,
+    )
     if random.random() < aug_cfg.grayscale_prob:
         img = img.convert("L").convert("RGB")
     img = _gaussian_blur(img, aug_cfg.blur_sigma_min, aug_cfg.blur_sigma_max, blur_prob)
-    if sol_prob > 0 and random.random() < sol_prob:
-        img = TF.solarize(img, 128) if HAS_TV else img
+    if sol_prob > 0 and random.random() < sol_prob and HAS_TV:
+        img = TF.solarize(img, 128)
     return _to_tensor_normalized(img, aug_cfg.mean, aug_cfg.std)
 
 
-def _decode_jpeg(jpeg_bytes: bytes, size: int) -> torch.Tensor | None:
-    """Decode JPEG and resize shorter side to ``size``.  Returns None on error."""
-    try:
-        img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
-        img = _resize_shorter(img, size)
-        return img
-    except Exception:
-        return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # CPU pipeline implementations
-# ══════════════════════════════════════════════════════════════════════════════
 
 class CPUAugPipeline:
     """DINOv2 multi-crop CPU augmentation pipeline."""
@@ -267,22 +256,22 @@ class CPUAugPipeline:
         resolution_src: Any,
         seed:           int = 0,
     ) -> None:
-        self._source        = source
-        self._aug_cfg       = aug_cfg
-        self._batch_size    = batch_size
+        self._source         = source
+        self._aug_cfg        = aug_cfg
+        self._batch_size     = batch_size
         self._resolution_src = resolution_src
         random.seed(seed)
 
-    def run_one_batch(self) -> Dict[str, torch.Tensor]:
+    def run_one_batch(self) -> dict[str, torch.Tensor]:
         global_size_arr, local_size_arr = self._resolution_src()
         global_size = int(global_size_arr)
         local_size  = int(local_size_arr)
 
-        jpeg_batch: List[np.ndarray] = self._source()
+        jpeg_batch: list[np.ndarray] = self._source()
         assert len(jpeg_batch) == self._batch_size
 
-        cfg = self._aug_cfg
-        output: Dict[str, List[torch.Tensor]] = {
+        cfg    = self._aug_cfg
+        output: dict[str, list[torch.Tensor]] = {
             f"view_{i}": [] for i in range(cfg.n_views)
         }
 
@@ -292,18 +281,18 @@ class CPUAugPipeline:
             for i in range(cfg.n_global_crops):
                 blur_p = cfg.blur_prob_global1 if i == 0 else cfg.blur_prob_global2
                 sol_p  = cfg.solarize_prob if i == 1 else 0.0
-                t = _augment_dinov2(
+                t = _augment_one(
                     jpeg_bytes, cfg,
-                    crop_size = global_size, scale = cfg.global_crops_scale,
-                    blur_prob = blur_p, sol_prob = sol_p,
+                    crop_size=global_size, scale=cfg.global_crops_scale,
+                    blur_prob=blur_p, sol_prob=sol_p,
                 )
                 output[f"view_{view_idx}"].append(t)
                 view_idx += 1
             for _ in range(cfg.n_local_crops):
-                t = _augment_dinov2(
+                t = _augment_one(
                     jpeg_bytes, cfg,
-                    crop_size = local_size, scale = cfg.local_crops_scale,
-                    blur_prob = cfg.blur_prob_local, sol_prob = 0.0,
+                    crop_size=local_size, scale=cfg.local_crops_scale,
+                    blur_prob=cfg.blur_prob_local, sol_prob=0.0,
                 )
                 output[f"view_{view_idx}"].append(t)
                 view_idx += 1
@@ -319,13 +308,13 @@ class CPUEvalPipeline:
         self._aug_spec   = aug_spec
         self._batch_size = batch_size
 
-    def run_one_batch(self) -> Dict[str, torch.Tensor]:
-        jpeg_batch: List[np.ndarray] = self._source()
+    def run_one_batch(self) -> dict[str, torch.Tensor]:
+        jpeg_batch: list[np.ndarray] = self._source()
         assert len(jpeg_batch) == self._batch_size
 
-        spec = self._aug_spec
+        spec        = self._aug_spec
         resize_size = int(spec.crop_size * 256 / 224)
-        tensors: List[torch.Tensor] = []
+        tensors: list[torch.Tensor] = []
 
         for jpeg_arr in jpeg_batch:
             try:
@@ -348,12 +337,12 @@ class CPULeJEPAPipeline:
         self._aug_spec   = aug_spec
         self._batch_size = batch_size
 
-    def run_one_batch(self) -> Dict[str, torch.Tensor]:
-        jpeg_batch: List[np.ndarray] = self._source()
+    def run_one_batch(self) -> dict[str, torch.Tensor]:
+        jpeg_batch: list[np.ndarray] = self._source()
         assert len(jpeg_batch) == self._batch_size
 
-        spec = self._aug_spec
-        output: Dict[str, List[torch.Tensor]] = {
+        spec   = self._aug_spec
+        output: dict[str, list[torch.Tensor]] = {
             "context": [],
             **{f"target_{i}": [] for i in range(spec.n_target_views)},
         }
@@ -365,14 +354,12 @@ class CPULeJEPAPipeline:
             except Exception:
                 img = Image.new("RGB", (224, 224))
 
-            # Context: large crop with colour jitter.
             ctx = _random_resized_crop(img, spec.context_crop_size, spec.context_scale)
             ctx = _color_jitter(ctx, 0.8, 0.8, 0.8, 0.2, 0.8)
             if random.random() < 0.5:
                 ctx = ctx.transpose(Image.FLIP_LEFT_RIGHT)
             output["context"].append(_to_tensor_normalized(ctx, spec.mean, spec.std))
 
-            # Targets: small crops, no colour jitter.
             for i in range(spec.n_target_views):
                 tgt = _random_resized_crop(img, spec.target_crop_size, spec.target_scale)
                 output[f"target_{i}"].append(_to_tensor_normalized(tgt, spec.mean, spec.std))
@@ -388,12 +375,12 @@ class CPUUserAugPipeline:
         self._aug_spec   = aug_spec
         self._batch_size = batch_size
 
-    def run_one_batch(self) -> Dict[str, torch.Tensor]:
-        jpeg_batch: List[np.ndarray] = self._source()
+    def run_one_batch(self) -> dict[str, torch.Tensor]:
+        jpeg_batch: list[np.ndarray] = self._source()
         assert len(jpeg_batch) == self._batch_size
 
-        spec = self._aug_spec
-        tensors: List[torch.Tensor] = []
+        spec    = self._aug_spec
+        tensors: list[torch.Tensor] = []
 
         for jpeg_arr in jpeg_batch:
             try:
@@ -408,14 +395,10 @@ class CPUUserAugPipeline:
         return spec.aug_fn(decoded_batch)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CPUPipelineIterator — DALI-compatible wrapper
-# ══════════════════════════════════════════════════════════════════════════════
-
 class CPUPipelineIterator:
     """Wraps any CPU*Pipeline in the DALIGenericIterator API."""
 
-    def __init__(self, pipeline: Any, output_map: List[str], batch_size: int) -> None:
+    def __init__(self, pipeline: Any, output_map: list[str], batch_size: int) -> None:
         self._pipe       = pipeline
         self._output_map = output_map
         self._exhausted  = False
@@ -423,7 +406,7 @@ class CPUPipelineIterator:
     def __iter__(self) -> "CPUPipelineIterator":
         return self
 
-    def __next__(self) -> List[Dict[str, torch.Tensor]]:
+    def __next__(self) -> list[dict[str, torch.Tensor]]:
         if self._exhausted:
             raise StopIteration
         try:
@@ -436,19 +419,21 @@ class CPUPipelineIterator:
         self._exhausted = False
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Null H2D / FP8 stubs
-# ══════════════════════════════════════════════════════════════════════════════
 
 class NullH2DStream:
     def __init__(self, device: torch.device, topo: Any) -> None:
         self._device = device
 
     @contextlib.contextmanager
-    def transfer(self, cpu_batch: Dict[str, List[torch.Tensor]]):
+    def transfer(
+        self, cpu_batch: dict[str, list[torch.Tensor]]
+    ) -> Iterator[dict[str, list[torch.Tensor]]]:
         yield cpu_batch
 
-    def send(self, cpu_batch: Dict[str, List[torch.Tensor]]) -> Dict[str, List[torch.Tensor]]:
+    def send(
+        self, cpu_batch: dict[str, list[torch.Tensor]]
+    ) -> dict[str, list[torch.Tensor]]:
         return cpu_batch
 
     def wait(self) -> None:
@@ -460,22 +445,19 @@ class NullFP8Formatter:
         return tensor
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Distributed stubs
-# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class StubClusterTopology:
-    nvlink_gen:              int  = 0
-    nvlink_lanes_per_gpu:    int  = 0
-    gpus_per_nvlink_domain:  int  = 1
-    is_grace_blackwell:      bool = False
-    has_pcie:                bool = False
-    has_infiniband:          bool = False
-    has_sharp:               bool = False
-    has_nvlink_sharp:        bool = False
-    cuda_major:              int  = 0
-    cuda_minor:              int  = 0
+    nvlink_gen:             int  = 0
+    nvlink_lanes_per_gpu:   int  = 0
+    gpus_per_nvlink_domain: int  = 1
+    has_pcie:               bool = False
+    has_infiniband:         bool = False
+    has_sharp:              bool = False
+    has_nvlink_sharp:       bool = False
+    cuda_major:             int  = 0
+    cuda_minor:             int  = 0
 
     @property
     def is_nvl72(self) -> bool:
@@ -488,10 +470,10 @@ class StubClusterTopology:
 
 @dataclass
 class StubDistribEnv:
-    rank:             int                  = 0
-    world_size:       int                  = 1
-    local_rank:       int                  = 0
-    local_world_size: int                  = 1
+    rank:             int                        = 0
+    world_size:       int                        = 1
+    local_rank:       int                        = 0
+    local_world_size: int                        = 1
     topology:         StubClusterTopology | None = None
 
     def __post_init__(self) -> None:
@@ -499,12 +481,10 @@ class StubDistribEnv:
             self.topology = StubClusterTopology()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # CPUBackend — assembles all stages
-# ══════════════════════════════════════════════════════════════════════════════
 
 class CPUBackend:
-    """Concrete backend: pure-Python CPU path."""
+    """Concrete backend: pure-Python CPU path for tests and CI."""
 
     @property
     def name(self) -> str:
@@ -555,34 +535,40 @@ class CPUBackend:
         dali_fp8_output:    bool        = False,
     ) -> Any:
         """Dispatch to the appropriate CPU pipeline based on aug_spec type."""
-        match aug_spec:
-            case DinoV2AugSpec(aug_cfg=cfg):
-                log.info("CPUBackend: DinoV2AugSpec pipeline (batch=%d)", batch_size)
-                return CPUAugPipeline(
-                    source         = source,
-                    aug_cfg        = cfg,
-                    batch_size     = batch_size,
-                    resolution_src = resolution_src,
-                    seed           = seed,
-                )
-            case EvalAugSpec():
-                log.info("CPUBackend: EvalAugSpec pipeline (crop=%d)", aug_spec.crop_size)
-                return CPUEvalPipeline(source=source, aug_spec=aug_spec, batch_size=batch_size)
-            case LeJEPAAugSpec():
-                log.info("CPUBackend: LeJEPAAugSpec pipeline")
-                return CPULeJEPAPipeline(source=source, aug_spec=aug_spec, batch_size=batch_size)
-            case UserAugSpec():
-                log.info("CPUBackend: UserAugSpec pipeline (decode_size=%d)", aug_spec.decode_size)
-                return CPUUserAugPipeline(source=source, aug_spec=aug_spec, batch_size=batch_size)
-            case _:
-                msg = f"CPUBackend: unsupported aug_spec type {type(aug_spec).__name__}."
-                raise TypeError(msg)
+        if isinstance(aug_spec, DinoV2AugSpec):
+            log.info("CPUBackend: DinoV2AugSpec pipeline (batch=%d)", batch_size)
+            return CPUAugPipeline(
+                source         = source,
+                aug_cfg        = aug_spec.aug_cfg,
+                batch_size     = batch_size,
+                resolution_src = resolution_src,
+                seed           = seed,
+            )
+        if isinstance(aug_spec, EvalAugSpec):
+            log.info("CPUBackend: EvalAugSpec pipeline (crop=%d)", aug_spec.crop_size)
+            return CPUEvalPipeline(
+                source=source, aug_spec=aug_spec, batch_size=batch_size
+            )
+        if isinstance(aug_spec, LeJEPAAugSpec):
+            log.info("CPUBackend: LeJEPAAugSpec pipeline")
+            return CPULeJEPAPipeline(
+                source=source, aug_spec=aug_spec, batch_size=batch_size
+            )
+        if isinstance(aug_spec, UserAugSpec):
+            log.info(
+                "CPUBackend: UserAugSpec pipeline (decode_size=%d)", aug_spec.decode_size
+            )
+            return CPUUserAugPipeline(
+                source=source, aug_spec=aug_spec, batch_size=batch_size
+            )
+        msg = f"CPUBackend: unsupported aug_spec type {type(aug_spec).__name__}."
+        raise TypeError(msg)
 
     def build_pipeline_iterator(
         self,
         pipeline:   Any,
         aug_spec:   Any,
-        output_map: List[str],
+        output_map: list[str],
         batch_size: int,
     ) -> CPUPipelineIterator:
         return CPUPipelineIterator(
@@ -603,7 +589,7 @@ class CPUBackend:
         world_size:       int = 1,
         local_rank:       int = 0,
         local_world_size: int = 1,
-        force_topology:   Optional[str] = None,
+        force_topology:   str | None = None,
     ) -> StubDistribEnv:
         return StubDistribEnv(
             rank             = rank,

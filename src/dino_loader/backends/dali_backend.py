@@ -1,24 +1,14 @@
-"""dino_loader.backends.dali_backend.
-
-Concrete backend: NVIDIA DALI + CUDA + SLURM production path.
-
-Changes in this version
------------------------
-[DALI-AUG-1]  ``build_pipeline`` now accepts an ``AugmentationSpec`` and
-              dispatches to the correct ``pipeline.py`` builder.
-              ``DALIBackend`` remains the integration layer; all DALI graph
-              construction lives in ``pipeline.py``.
-
-[DALI-AUG-2]  ``build_pipeline_iterator`` now handles ``UserAugSpec``:
-              the returned iterator wraps the user function in
-              ``_UserAugIterator`` which calls ``aug_fn`` on the decoded
-              GPU tensors *after* each DALI batch.
-
-[DALI-AUG-3]  ``EvalAugSpec`` and ``LeJEPAAugSpec`` are fully native DALI
-              pipelines — no Python call boundary per batch.
 """
+dino_loader.backends.dali_backend
+==================================
+Concrete backend: NVIDIA DALI + CUDA production path.
 
-from __future__ import annotations
+[DALI-AUG-1] build_pipeline dispatches on AugmentationSpec subtype via
+             isinstance chains (replacing structural pattern matching).
+[DALI-AUG-2] UserAugSpec path: _UserAugIterator calls aug_fn on decoded GPU
+             tensors after each DALI batch.
+[DALI-AUG-3] EvalAugSpec and LeJEPAAugSpec are fully native DALI pipelines.
+"""
 
 import logging
 from typing import Any
@@ -33,35 +23,31 @@ except ImportError:
 
 
 class _UserAugIterator:
-    """Wraps a DALI decode-only iterator and applies ``UserAugSpec.aug_fn``.
+    """Wraps a DALI decode-only iterator and applies UserAugSpec.aug_fn.
 
-    DALI provides decoded, normalised ``Tensor[B, C, H, W]`` under the key
-    ``"decoded"``.  ``aug_fn`` transforms this into a dict mapping view names
-    to tensors, which is returned in the same list-of-dict format as
-    ``DALIGenericIterator``.
-
-    This means ``loader.py._raw_iter`` requires no special casing.
+    DALI provides decoded, normalised Tensor[B, C, H, W] under the key
+    "decoded". aug_fn transforms this into a dict mapping view names to
+    tensors, returned in the same list-of-dict format as DALIGenericIterator.
     """
 
     def __init__(self, dali_iter: Any, aug_spec: Any) -> None:
-        self._iter    = dali_iter
-        self._aug_fn  = aug_spec.aug_fn
-        self._map     = aug_spec.output_map
-        self._closed  = False
+        self._iter   = dali_iter
+        self._aug_fn = aug_spec.aug_fn
+        self._map    = aug_spec.output_map
+        self._closed = False
 
     def __iter__(self) -> "_UserAugIterator":
         return self
 
     def __next__(self) -> list[dict[str, Any]]:
-        raw = next(self._iter)  # list[{"decoded": Tensor[B,C,H,W]}]
-        decoded_batch = raw[0]["decoded"]
-        augmented     = self._aug_fn(decoded_batch)
+        raw             = next(self._iter)  # list[{"decoded": Tensor[B,C,H,W]}]
+        decoded_batch   = raw[0]["decoded"]
+        augmented       = self._aug_fn(decoded_batch)
 
-        # Validate output map consistency.
         missing = [k for k in self._map if k not in augmented]
         if missing:
             msg = (
-                f"UserAugSpec.aug_fn did not return expected view(s): {missing}.  "
+                f"UserAugSpec.aug_fn did not return expected view(s): {missing}. "
                 f"Got keys: {list(augmented.keys())}"
             )
             raise ValueError(msg)
@@ -74,7 +60,7 @@ class _UserAugIterator:
 
 
 class DALIBackend:
-    """Concrete backend: NVIDIA DALI + CUDA + SLURM production path."""
+    """Concrete backend: NVIDIA DALI + CUDA production path."""
 
     @property
     def name(self) -> str:
@@ -108,23 +94,20 @@ class DALIBackend:
     ) -> Any:
         from dino_loader.shard_cache import NodeSharedShardCache
         return NodeSharedShardCache(
-            node_master          = node_master,
-            job_id               = job_id,
-            max_shm_gb           = max_gb,
-            prefetch_window      = prefetch_window,
-            shard_timeout_s      = timeout_s,
-            shm_warn_threshold   = warn_threshold,
-            heartbeat_stale_s    = kwargs.get("heartbeat_stale_s", 300.0),
-            use_ring_buffer      = kwargs.get("use_ring_buffer", False),
-            adaptive_prefetch    = kwargs.get("adaptive_prefetch", False),
-            adaptive_target_util = kwargs.get("adaptive_target_util", 0.75),
+            node_master       = node_master,
+            job_id            = job_id,
+            max_shm_gb        = max_gb,
+            prefetch_window   = prefetch_window,
+            shard_timeout_s   = timeout_s,
+            shm_warn_threshold = warn_threshold,
+            heartbeat_stale_s = kwargs.get("heartbeat_stale_s", 300.0),
         )
 
     def build_pipeline(
         self,
         source:             Any,
         aug_spec:           Any,
-        aug_cfg:            Any         = None,   # legacy compat
+        aug_cfg:            Any         = None,
         batch_size:         int         = 1,
         num_threads:        int         = 8,
         device_id:          int         = 0,
@@ -137,12 +120,7 @@ class DALIBackend:
         fuse_normalization: bool        = False,
         dali_fp8_output:    bool        = False,
     ) -> Any:
-        """Build and return a compiled DALI pipeline.
-
-        Dispatches on ``aug_spec`` type via ``pipeline.build_pipeline``.
-        NormSource is constructed here for ``DinoV2AugSpec`` with
-        ``fuse_normalization=True``.
-        """
+        """Build and return a compiled DALI pipeline, dispatching on aug_spec type."""
         try:
             import nvidia.dali  # noqa: F401
         except ImportError:
@@ -165,8 +143,7 @@ class DALIBackend:
             norm_source = NormSource(aug_cfg=aug_spec.aug_cfg, specs=specs)
             source.register_dataset_index_callback(norm_source.set_dataset_indices)
             log.debug(
-                "DALIBackend: NormSource built for %d dataset(s), "
-                "fused into DALI graph.",
+                "DALIBackend: NormSource built for %d dataset(s), fused into DALI graph.",
                 len(specs),
             )
 
@@ -193,15 +170,9 @@ class DALIBackend:
         output_map: list[str],
         batch_size: int,
     ) -> Any:
-        """Wrap the pipeline in the appropriate iterator.
-
-        For ``UserAugSpec``, wraps with ``_UserAugIterator`` which calls
-        the user function after each DALI decode batch.  For all other specs,
-        returns a standard ``DALIGenericIterator``.
-        """
+        """Wrap the pipeline in the appropriate iterator."""
         if not HAS_DALI:
-            msg = "nvidia-dali required for DALIGenericIterator."
-            raise RuntimeError(msg)
+            raise RuntimeError("nvidia-dali required for DALIGenericIterator.")
 
         from dino_loader.augmentation import UserAugSpec
 
@@ -233,8 +204,9 @@ class DALIBackend:
         local_world_size: int = 1,
         force_topology:   str | None = None,
     ) -> Any:
-        from dino_loader.distributed import detect_topology, DistribEnv
-        topo = detect_topology(force=force_topology)
+        from dino_env import detect_topology, ClusterTopology
+        from dino_loader.distributed import DistribEnv
+        topo = detect_topology(force=force_topology, gpu_index=local_rank)
         return DistribEnv(
             rank             = rank,
             world_size       = world_size,

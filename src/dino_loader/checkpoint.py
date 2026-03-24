@@ -3,50 +3,24 @@ dino_loader.checkpoint
 ======================
 Dataloader state checkpointing.
 
-Design choices (unchanged)
---------------------------
+Design
+------
 - JSON (not pickle): stable across Python versions and environments.
 - Atomic write: write to .tmp → rename() — POSIX rename is atomic.
 - Rank 0 writes; all ranks can read.
 - Retains only the 3 most recent checkpoints to bound Lustre usage.
 
-Changes in this version
------------------------
-[CK-1]  Supports CheckpointState fields: global_crop_size, local_crop_size (retained).
-[CK-2]  load() returns None gracefully; warns on corrupt files (retained).
-[CK-3]  LATEST pointer file for robust checkpoint discovery (retained).
+[M3-FIX] SHA-256 integrity envelope: CheckpointState.save() wraps the payload
+          in {"payload": {...}, "sha256": "<hex>"}. load() verifies the checksum
+          before deserialising, raising ValueError on mismatch. Legacy flat-format
+          checkpoints (no "payload" key) are still supported with a WARNING.
 
-[M3-FIX] SHA-256 integrity envelope.                                   ← FIX M3
-         Previously a checkpoint file truncated by a node crash (SIGKILL
-         during the .tmp write, or Lustre write-back timeout) would produce
-         a JSONDecodeError at resume time with no actionable message.
-
-         New format: CheckpointState.save() wraps the payload in a JSON
-         envelope:
-
-             {"payload": { ... state fields ... }, "sha256": "<hex>"}
-
-         The sha256 field is the SHA-256 hex digest of
-         ``json.dumps(payload, indent=2)``.  CheckpointState.load() verifies
-         the checksum before deserialising.  A mismatch raises ValueError with
-         the stored and computed hashes so operators can identify corruption.
-
-         Backward compatibility: CheckpointState.load() detects the legacy
-         flat format (no "payload" key) and reads it without checksum
-         verification — existing checkpoints continue to work.  A WARNING
-         is logged so operators know they're on the old format.
-
-         Note: the checksum lives in config.py alongside CheckpointState
-         (the class that owns save/load).  This file (checkpoint.py) only
-         manages the checkpointer lifecycle and does not need to change for
-         the integrity feature itself.  This comment is here for traceability.
+[CK-3]   LATEST pointer file for robust checkpoint discovery. Falls back to
+          glob-sort for backward compat with older checkpoint directories.
 """
-
-from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
 
 from dino_loader.config import CheckpointState
 
@@ -57,15 +31,12 @@ _LATEST_FILE = "LATEST"
 
 
 class DataLoaderCheckpointer:
-    """
-    Manages JSON checkpoint files for DINODataLoader state.
+    """Manages JSON checkpoint files for DINODataLoader state.
 
     Writes are rank-0-only and throttled to every N steps.
     Reads are available to all ranks for resume.
 
-    File format (new — envelope with SHA-256)
-    -----------------------------------------
-    ::
+    File format (envelope with SHA-256)::
 
         {
           "payload": {
@@ -79,45 +50,43 @@ class DataLoaderCheckpointer:
           "sha256": "a3f2..."
         }
 
-    Legacy format (flat, no checksum): still supported for backward compat.
+    Legacy flat format (no checksum) is still supported for backward compat.
     """
 
-    def __init__(self, ckpt_dir: str, every_n_steps: int = 500, rank: int = 0) -> None:
+    def __init__(
+        self,
+        ckpt_dir:      str,
+        every_n_steps: int = 500,
+        rank:          int = 0,
+    ) -> None:
         self._dir   = Path(ckpt_dir)
         self._every = every_n_steps
         self._rank  = rank
         if rank == 0:
             self._dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
     def save(self, state: CheckpointState) -> None:
-        """
-        Save state to disk (rank 0 only, every N steps).
+        """Save state to disk (rank 0 only, every N steps).
 
-        Write order (race-free):
-          1. Atomic JSON write with SHA-256 envelope (tmp → rename).
-          2. Atomic LATEST pointer update (tmp → rename).
-          3. Prune old checkpoints (best-effort; does not affect LATEST).
+        Write order:
+        1. Atomic JSON write with SHA-256 envelope (tmp → rename).
+        2. Atomic LATEST pointer update (tmp → rename).
+        3. Prune old checkpoints (best-effort; does not affect LATEST).
         """
         if self._rank != 0 or state.step % self._every != 0:
             return
 
         filename = f"dl_state_{state.step:012d}.json"
         path     = self._dir / filename
-        state.save(path)   # CheckpointState.save() handles tmp→rename + checksum
+        state.save(path)
 
         self._write_latest(filename)
         self._prune()
 
         log.info("DataLoader checkpoint saved: %s", filename)
 
-    def load(self) -> Optional[CheckpointState]:
-        """
-        Load the most recent checkpoint, or return None if none exists.
-
-        Reads the LATEST pointer first; falls back to glob-sort for backward
-        compatibility with checkpoint dirs written by older versions.
+    def load(self) -> CheckpointState | None:
+        """Load the most recent checkpoint, or return None if none exists.
 
         Returns None (with a WARNING) if the checkpoint file is corrupt or
         fails the SHA-256 integrity check.
@@ -134,7 +103,6 @@ class DataLoaderCheckpointer:
             )
             return state
         except ValueError as exc:
-            # Includes SHA-256 mismatch (M3) and other validation errors.
             log.warning(
                 "Checkpoint %s failed integrity check: %s — starting from scratch.",
                 path, exc,
@@ -146,8 +114,6 @@ class DataLoaderCheckpointer:
                 path, exc,
             )
             return None
-
-    # ── state_dict / load_state_dict (torchdata StatefulDataLoader compat) ────
 
     def state_dict(self) -> dict:
         """Return checkpoint state as a plain dict."""
@@ -167,8 +133,6 @@ class DataLoaderCheckpointer:
         """Restore from a dict produced by state_dict(). Caller applies fields."""
         pass
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
     def _write_latest(self, filename: str) -> None:
         """Atomically update the LATEST pointer file."""
         latest_tmp = self._dir / f"{_LATEST_FILE}.tmp"
@@ -183,7 +147,7 @@ class DataLoaderCheckpointer:
             except Exception:
                 pass
 
-    def _resolve_latest(self) -> Optional[Path]:
+    def _resolve_latest(self) -> Path | None:
         """Return the Path of the most recent checkpoint, or None."""
         latest_ptr = self._dir / _LATEST_FILE
         if latest_ptr.exists():
@@ -203,7 +167,6 @@ class DataLoaderCheckpointer:
                     exc,
                 )
 
-        # Backward-compatible fallback
         candidates = sorted(self._dir.glob("dl_state_*.json"))
         return candidates[-1] if candidates else None
 
