@@ -77,7 +77,7 @@ from typing import Any, Dict, Iterator, List, Optional
 import torch
 
 from dino_loader.config      import DINOAugConfig
-from dino_loader.distributed import ClusterTopology
+from dino_env import ClusterTopology
 
 log = logging.getLogger(__name__)
 

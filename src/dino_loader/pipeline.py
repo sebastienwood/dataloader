@@ -42,7 +42,8 @@ from dino_loader.augmentation import (
     LeJEPAAugSpec,
     UserAugSpec,
 )
-from dino_loader.config import DINOAugConfig, DatasetSpec
+from dino_loader.config import DINOAugConfig
+from dino_datasets import DatasetSpec
 
 if TYPE_CHECKING:
     pass

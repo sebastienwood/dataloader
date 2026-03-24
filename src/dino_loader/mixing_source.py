@@ -46,7 +46,7 @@ from typing import Callable, Deque, Sequence
 import numpy as np
 
 from dino_loader.augmentation import SampleMeta, SamplePredicate
-from dino_loader.config import DatasetSpec
+from dino_datasets import DatasetSpec
 
 log = logging.getLogger(__name__)
 

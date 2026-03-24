@@ -47,12 +47,13 @@ import os
 import torch
 
 from dino_loader import (
-    DatasetSpec,
     DINOAugConfig,
     DINODataLoader,
     LoaderConfig,
-    slurm_init,
 )
+
+from dino_datasets import DatasetSpec
+from dino_env import slurm_init
 
 try:
     from dinov3.data.masking import MaskingGenerator

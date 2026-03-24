@@ -43,20 +43,10 @@ try:
     from dino_loader.loader        import DINODataLoader
     from dino_loader.memory        import Batch
     from dino_loader.mixing_source import ResolutionSource
-    from dino_loader.distributed   import (
-        slurm_init,
-        configure_nccl,
-        ClusterTopology,
-        detect_topology,
-    )
     __all__.extend([
         "DINODataLoader",
         "Batch",
         "ResolutionSource",
-        "slurm_init",
-        "configure_nccl",
-        "ClusterTopology",
-        "detect_topology",
     ])
 except ImportError as e:
     log.debug(
