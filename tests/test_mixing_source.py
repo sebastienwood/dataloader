@@ -39,7 +39,6 @@ from dino_loader.mixing_source import (
 )
 from tests.fixtures import scaffold_dataset_dir, write_shard
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # ResolutionSource  — pure, always fast
 # ══════════════════════════════════════════════════════════════════════════════
