@@ -104,7 +104,7 @@ ReaderBatch = tuple[list[np.ndarray], list[dict[str, Any] | None]]
 
 
 class ShardReaderNode(BaseNode):  # type: ignore[misc]
-    """torchdata BaseNode wrapping stages 1–2 of the dino_loader pipeline.
+    """torchdata BaseNode wrapping stages 1-2 of the dino_loader pipeline.
 
     Stage 1 — ``NodeSharedShardCache`` / ``InProcessShardCache``:
         Reads shard bytes from Lustre (rank 0) or /dev/shm (other ranks).
@@ -391,8 +391,7 @@ class MaskMapNode:
 
     """
 
-    # Provided as a torchdata BaseNode subclass when torchdata is available,
-    # or as a plain callable wrapper usable with PostProcessPipeline.map().
+    # Provided as a torchdata BaseNode subclass.
 
     def __init__(
         self,

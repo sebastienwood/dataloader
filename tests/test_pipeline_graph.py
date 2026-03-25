@@ -3,8 +3,6 @@
 Unit tests for :mod:`dino_loader.pipeline_graph` (Phase 3 — composable
 stateful post-processing pipeline built on torchdata.nodes).
 
-Tests require ``torchdata``; they are skipped automatically when absent.
-
 Coverage
 --------
 BatchMapNode
@@ -29,7 +27,6 @@ NodePipeline (via wrap_loader)
 - state_dict contains 'loader' key
 - load_state_dict restores epoch
 - current_resolution delegates to underlying loader
-- wrap_loader raises ImportError when torchdata absent
 """
 
 from __future__ import annotations
@@ -43,16 +40,7 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-try:
-    import torchdata.nodes as tn
-    _HAS_TORCHDATA = True
-except ImportError:
-    _HAS_TORCHDATA = False
-
-pytestmark = pytest.mark.skipif(
-    not _HAS_TORCHDATA,
-    reason="torchdata is not installed",
-)
+import torchdata.nodes as tn
 
 from dino_loader.memory import Batch
 
@@ -302,12 +290,3 @@ class TestNodePipelineDelegation:
     def test_current_resolution_delegation(self) -> None:
         from dino_loader.pipeline_graph import wrap_loader
         assert wrap_loader(_fake_loader(4)).current_resolution == (224, 96)
-
-
-class TestNodePipelineImportGuard:
-
-    def test_wrap_loader_raises_without_torchdata(self, monkeypatch) -> None:
-        import dino_loader.pipeline_graph as pg
-        monkeypatch.setattr(pg, "_HAS_TORCHDATA", False)
-        with pytest.raises(ImportError, match="torchdata"):
-            pg.wrap_loader(_fake_loader(4))

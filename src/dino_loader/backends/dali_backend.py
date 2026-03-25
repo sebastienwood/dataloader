@@ -205,7 +205,7 @@ class DALIBackend:
     ) -> Any:
         from dino_env import detect_topology
 
-        from dino_loader.distributed import DistribEnv
+        from dino_env import DistribEnv
         topo = detect_topology(force=force_topology, gpu_index=local_rank)
         return DistribEnv(
             rank             = rank,

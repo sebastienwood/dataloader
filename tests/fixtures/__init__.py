@@ -360,5 +360,5 @@ def make_spec(name: str, tar_paths: list, weight: float = 1.0, **kwargs):
     if _src not in sys.path:
         sys.path.insert(0, _src)
 
-    from dino_loader.config import DatasetSpec
+    from dino_datasets import DatasetSpec
     return DatasetSpec(name=name, shards=tar_paths, weight=weight, **kwargs)

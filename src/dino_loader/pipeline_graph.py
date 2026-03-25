@@ -41,8 +41,6 @@ Public API
 
 Notes
 -----
-- ``torchdata`` is an optional dependency; a clear ``ImportError`` is raised
-  if it is absent.
 - ``BatchFilterNode`` is the ``select()`` equivalent; it does *not* rebatch —
   rejected batches are simply skipped.
 - ``state_dict`` / ``load_state_dict`` are delegated to the underlying
