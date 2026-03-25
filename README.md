@@ -553,8 +553,6 @@ pip install -e ".[dev]"
 | `nvidia-dali` | GPU augmentation pipeline | **Yes** (training) |
 | `transformer-engine` | FP8 output quantisation | No (graceful fallback to BF16) |
 | `aiofiles` | Async Lustre reads | No (falls back to thread executor) |
-| `rich` | Terminal monitor UI | No |
-| `tomli` | `pyproject.toml` config on Python < 3.11 | Auto-installed |
 
 ---
 

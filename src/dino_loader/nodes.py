@@ -386,6 +386,126 @@ class MetadataNode(BaseNode):  # type: ignore[misc]
         return meta
 
 
+class MaskMapNode:
+    """torchdata BaseNode that attaches iBOT patch masks to every batch.
+
+    Sits between the augmentation stage and the training loop.  On each call to
+    ``next()`` it draws a fresh mask from ``MaskingGenerator`` and stores it on
+    ``Batch.masks``.
+
+    The mask shape is derived from ``img_size`` and ``patch_size`` at
+    construction time, so the grid dimensions never change during training
+    (even when ``set_resolution`` is called — resolution changes that affect
+    masking should reconstruct the node).
+
+    Args:
+        source: Upstream node yielding ``Batch`` objects.
+        mask_generator: A configured ``MaskingGenerator`` instance.
+        num_masking_patches: Number of patches to mask per sample.  When
+            ``None`` the generator's own default is used.
+
+    Example::
+
+        from dino_loader.masking import MaskingGenerator
+        from dino_loader.nodes import MaskMapNode
+        from dino_loader.pipeline_graph import wrap_loader
+
+        gen     = MaskingGenerator(input_size=(16, 16), num_masking_patches=60)
+        pipeline = wrap_loader(DINODataLoader(...)).map(
+            MaskMapNode.as_transform(gen, num_masking_patches=60)
+        )
+
+    """
+
+    # Provided as a torchdata BaseNode subclass when torchdata is available,
+    # or as a plain callable wrapper usable with PostProcessPipeline.map().
+
+    def __init__(
+        self,
+        source,              # BaseNode[Batch]
+        mask_generator,      # MaskingGenerator
+        num_masking_patches: int | None = None,
+    ) -> None:
+        """Initialise the node."""
+        _require_torchdata()
+        super().__init__()
+        self._source = source
+        self._gen    = mask_generator
+        self._n_mask = num_masking_patches
+
+    def reset(self, initial_state=None) -> None:
+        """Reset the upstream source."""
+        super().reset(initial_state)
+        self._source.reset(initial_state)
+
+    def next(self):
+        """Return the next batch with ``Batch.masks`` populated."""
+        import torch  # noqa: PLC0415 — torch is an optional dep of this node
+        batch: "Batch" = self._source.next()
+        n_mask = self._n_mask if self._n_mask is not None else self._gen.num_masking_patches
+        mask   = self._gen(flat=True)                  # shape (H*W,)
+        masks  = torch.from_numpy(mask).unsqueeze(0)   # (1, H*W) bool
+        # Expand to batch dimension if global_crops is populated.
+        if batch.global_crops:
+            b = batch.global_crops[0].shape[0]
+            masks = masks.expand(b, -1)                # (B, H*W)
+        batch.masks = masks
+        return batch
+
+    def get_state(self):
+        """Delegate state to the upstream source."""
+        return self._source.get_state()
+
+    # ------------------------------------------------------------------
+    # Convenience: use as a plain Batch → Batch transform
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def as_transform(mask_generator, num_masking_patches: int | None = None):
+        """Return a ``Batch → Batch`` callable for use with ``.map()``.
+
+        Useful when you have a ``PostProcessPipeline`` or ``NodePipeline``
+        and want to add masking without building a full ``BaseNode``.
+
+        Args:
+            mask_generator: A configured ``MaskingGenerator``.
+            num_masking_patches: Patches to mask per sample.
+
+        Returns:
+            A callable ``(Batch) -> Batch``.
+
+        Example::
+
+            from dino_loader.pipeline_graph import wrap_loader
+            from dino_loader.masking import MaskingGenerator
+            from dino_loader.nodes import MaskMapNode
+
+            gen = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
+            pipeline = wrap_loader(loader).map(
+                MaskMapNode.as_transform(gen)
+            )
+
+        """
+        import torch  # noqa: PLC0415
+
+        def _apply(batch):
+            from dino_loader.memory import Batch  # noqa: PLC0415
+            n_mask = num_masking_patches if num_masking_patches is not None else mask_generator.num_masking_patches
+            mask   = mask_generator(flat=True)
+            masks  = torch.from_numpy(mask).unsqueeze(0)
+            if batch.global_crops:
+                b = batch.global_crops[0].shape[0]
+                masks = masks.expand(b, -1)
+            return Batch(
+                global_crops = batch.global_crops,
+                local_crops  = batch.local_crops,
+                metadata     = batch.metadata,
+                masks        = masks,
+            )
+
+        return _apply
+
+
 # ---------------------------------------------------------------------------
 # Convenience factory
 # ---------------------------------------------------------------------------

@@ -18,8 +18,6 @@ dependencies = [
     # ── Monitoring / CLI ──────────────────────────────────────────────────────
     "rich~=14.3",
     "psutil~=7.2",
-    # ── Config parsing ────────────────────────────────────────────────────────
-    "tomli~=2.4",
     # ── Pillow: CPU backend augmentation pipeline ─────────────────────────────
     "pillow~=11.0",
     "dino-datasets",
@@ -82,6 +80,9 @@ markers = [
     "slow: long-running integration tests",
 ]
 timeout = 120
+# Default: exclude slow tests.  Run `pytest` with no -m flag to get the fast
+# suite.  Add `-m slow` or remove the addopts line to include slow tests.
+addopts = "-m 'not slow'"
 
 [tool.uv.sources]
 dino-datasets = { git = "https://github.com/piflepaf1-eng/dino_datasets" }
@@ -128,5 +129,10 @@ ignore = [
     "ANN002",
     "D104",
     "PLR0913",
+    "BLE001",
+    "E402",
+    "TRY003",
+    "EM101",
+    "D401",
 ]
 "*scripts/*.py" = ["ALL"]

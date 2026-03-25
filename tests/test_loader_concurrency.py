@@ -29,10 +29,11 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+from dino_datasets import DatasetSpec
+
 from dino_loader.config import DINOAugConfig, LoaderConfig
 from dino_loader.loader import DINODataLoader
 from tests.fixtures import scaffold_dataset_dir
-from dino_datasets import DatasetSpec
 
 
 def _small_loader(tmp_path: Path) -> DINODataLoader:

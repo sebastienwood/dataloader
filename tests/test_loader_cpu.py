@@ -180,7 +180,7 @@ class TestLoaderBasic:
     def test_multiple_batches(self, tmp_dataset_dir, small_aug_cfg, small_loader_cfg):
         """Loader can produce more than one batch without error."""
         _, tar_paths = tmp_dataset_dir
-        # 2 shards × 8 samples = 16 samples; batch_size=4 → ≥ 4 batches possible
+        # 2 shards x 8 samples = 16 samples; batch_size=4 → ≥ 4 batches possible
         loader = _make_loader(
             tar_paths, aug_cfg=small_aug_cfg, loader_cfg=small_loader_cfg,
             batch_size=4,

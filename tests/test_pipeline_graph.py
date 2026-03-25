@@ -54,7 +54,7 @@ pytestmark = pytest.mark.skipif(
     reason="torchdata is not installed",
 )
 
-from dino_loader.memory import Batch  # noqa: E402
+from dino_loader.memory import Batch
 
 # ── Fake loader stub ──────────────────────────────────────────────────────────
 

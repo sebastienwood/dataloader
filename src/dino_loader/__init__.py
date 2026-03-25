@@ -61,6 +61,7 @@ from dino_loader.nodes import (
     MetadataNode,
     ShardReaderNode,
     build_reader_graph,
+    MaskMapNode,
 )
 from dino_loader.pipeline_graph import (  # noqa: F401
     BatchFilterNode,
@@ -83,4 +84,5 @@ __all__ = [
     "ResolutionSource",
     "ShardReaderNode",
     "build_reader_graph",
+    "MaskMapNode",
 ]

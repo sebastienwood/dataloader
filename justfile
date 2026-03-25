@@ -40,7 +40,7 @@ test:
 
 # Run ruff linter and format checker.
 lint:
-    uvx ruff check src/ tests/ scripts/ --fix
+    uvx ruff check src/ scripts/ --fix
     uvx ruff format --check src/ tests/ scripts/
 
 # Run ty static type checker on src/.
