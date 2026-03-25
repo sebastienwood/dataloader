@@ -1,5 +1,4 @@
-"""
-dino_loader.backends.protocol
+"""dino_loader.backends.protocol
 ==============================
 Abstract interface (Protocol) that every backend must satisfy.
 

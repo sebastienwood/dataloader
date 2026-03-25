@@ -1,5 +1,4 @@
-"""
-train.py — Reference DINOv3 training script using dino_loader.
+r"""train.py — Reference DINOv3 training script using dino_loader.
 
 Demonstrates all improvements introduced in this version:
 
@@ -21,10 +20,10 @@ Also retained from previous version:
 Why iBOT masking stays outside DALI
 --------------------------------------
 MaskingGenerator operates on ViT patch-level indices (a bool grid of shape
-grid×grid where grid = img_size // patch_size), not on image pixels.
+gridxgrid where grid = img_size // patch_size), not on image pixels.
 DALI's computation graph only processes dense image tensors, so there is no
 way to express patch-index masking as a DALI operator.  The CPU overhead is
-~0.3 ms for a 37×37 grid — negligible compared to a 40 ms DALI decode step.
+~0.3 ms for a 37x37 grid — negligible compared to a 40 ms DALI decode step.
 
 SLURM submission examples
 --------------------------
@@ -45,21 +44,16 @@ import logging
 import os
 
 import torch
+from dino_datasets import DatasetSpec
+from dino_env import slurm_init
 
 from dino_loader import (
     DINOAugConfig,
     DINODataLoader,
     LoaderConfig,
 )
-
-from dino_datasets import DatasetSpec
-from dino_env import slurm_init
-
-try:
-    from dinov3.data.masking import MaskingGenerator
-    HAS_MASKING = True
-except ImportError:
-    HAS_MASKING = False
+from dino_loader.masking import MaskingGenerator
+from dino_loader.nodes import MaskMapNode
 
 logging.basicConfig(
     level   = logging.INFO,
@@ -74,7 +68,7 @@ _TOTAL_IMAGES = 50_000 * 10_000 + 30_000 * 10_000 + 5_000 * 10_000  # ~850 M
 def main() -> None:
     # ── 1. Distributed init ────────────────────────────────────────────────────
     env    = slurm_init()
-    device = torch.device(f"cuda:{env.local_rank % torch.cuda.device_count()}")
+    device = torch.device(f"cuda:{env.local_rank % torch.cuda.device_count()}")  # noqa: F841
 
     # ── 2. Dataset catalogue ──────────────────────────────────────────────────
     #
@@ -158,19 +152,16 @@ def main() -> None:
     # ── 5. iBOT MaskingGenerator (CPU, post-DALI) ────────────────────────────
     #
     # iBOT masking cannot be fused into DALI: MaskingGenerator produces a
-    # boolean grid over ViT patch indices (shape grid×grid), not pixel-level
+    # boolean grid over ViT patch indices (shape gridxgrid), not pixel-level
     # operations.  DALI only processes dense image tensors.  CPU overhead is
     # ~0.3 ms per batch — negligible vs 40 ms DALI decode.
     #
-    mask_generator = None
-    if HAS_MASKING:
-        patch_size = 14
-        img_size   = aug_cfg.max_global_crop_size
-        grid       = img_size // patch_size
-        mask_generator = MaskingGenerator(
-            input_size       = (grid, grid),
-            max_num_patches  = int(0.5 * grid * grid),
-        )
+    patch_size = 14
+    gen = MaskingGenerator(
+       input_size=(aug_cfg.max_global_crop_size // patch_size,
+                   aug_cfg.max_global_crop_size // patch_size),
+       num_masking_patches=int(0.5 * (aug_cfg.max_global_crop_size // patch_size) ** 2),
+   )
 
     # ── 6. Build loader ───────────────────────────────────────────────────────
     steps_per_epoch = _TOTAL_IMAGES // (batch_size * env.world_size)
@@ -185,7 +176,6 @@ def main() -> None:
         local_world_size = env.local_world_size,
         resume           = True,
         steps_per_epoch  = steps_per_epoch,
-        mask_generator   = mask_generator,
     )
 
     # ── 7. [LD-8] PostProcessPipeline — fluid API ─────────────────────────────
@@ -202,8 +192,8 @@ def main() -> None:
     # The empty_check watchdog [LD-10] fires inside _raw_iter() if no batch
     # is produced within 120s, giving a diagnostic message instead of hanging.
     #
-    def quality_filter(batch):
-        """Example: skip batches where all metadata is None (no quality signal)."""
+    def quality_filter(batch) -> bool:
+        """Example: skip batches where all metadata is None (no quality signal)."""  # noqa: D401
         if not batch.metadata:
             return True
         return any(m is not None for m in batch.metadata)
@@ -211,31 +201,32 @@ def main() -> None:
     loader = (
         base_loader
         .select(quality_filter)     # skip all-None-metadata batches
+        .map(MaskMapNode.as_transform(gen))
         .with_epoch(steps_per_epoch)
     )
 
     # ── 8. Model (placeholder) ────────────────────────────────────────────────
-    # model = TE_ViT_Giant(...).to(device)
-    # optim = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    # model = TE_ViT_Giant(...).to(device) # noqa: ERA001
+    # optim = torch.optim.AdamW(model.parameters(), lr=1e-3) # noqa: ERA001
 
     # ── 9. Training loop ──────────────────────────────────────────────────────
     for epoch in range(100):
         loader.set_epoch(epoch)
 
         # Curriculum: shift toward curated data over time
-        if epoch == 20:
+        if epoch == 20:  # noqa: PLR2004
             log.info("Epoch %d: curriculum shift — boosting imagenet22k weight", epoch)
             loader.set_weight_by_name("imagenet22k", 0.35)
 
-        for step, batch in enumerate(loader):
+        for step, batch in enumerate(loader):  # noqa: B007
             # batch.global_crops : list[Tensor[B,3,H,W]]  — BF16 (or FP8) on GPU
-            # batch.local_crops  : list[Tensor[B,3,h,w]]
+            # batch.local_crops  : list[Tensor[B,3,h,w]] # noqa: ERA001
             # batch.metadata     : list[Optional[dict]]   — per-sample JSON sidecar
             # batch.masks        : Optional[Tensor]        — iBOT patch masks
 
-            # loss = model(batch)
-            # loss.backward()
-            # optim.step()
+            # loss = model(batch) # noqa: ERA001
+            # loss.backward() # noqa: ERA001
+            # optim.step()  # noqa: ERA001
 
             loader.checkpoint(step)
 

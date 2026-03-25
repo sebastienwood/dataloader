@@ -1,5 +1,4 @@
-"""
-dino_loader.memory
+"""dino_loader.memory
 ==================
 In-memory data structures and GPU transfer utilities.
 
@@ -25,9 +24,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from dino_env import ClusterTopology
 
 from dino_loader.config import DINOAugConfig
-from dino_env import ClusterTopology
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +49,7 @@ class Batch:
         masks: iBOT token mask tensor (bool, shape batch×n_tokens) or None.
             Generated on CPU post-DALI; cannot be fused into DALI because
             masking operates on ViT patch indices, not pixel values.
+
     """
 
     global_crops: list
@@ -87,6 +87,7 @@ def allocate_buffers(
 
     Returns:
         Dict with 'global' and 'local' keys, each a list of pinned tensors.
+
     """
     def _buf(size: int) -> list[torch.Tensor]:
         return [
@@ -110,7 +111,7 @@ class H2DStream:
 
     @contextlib.contextmanager
     def transfer(
-        self, cpu_batch: dict[str, list[torch.Tensor]]
+        self, cpu_batch: dict[str, list[torch.Tensor]],
     ) -> Iterator[dict[str, list[torch.Tensor]]]:
         """Async H2D transfer context manager.
 
@@ -128,7 +129,7 @@ class H2DStream:
         yield gpu_batch
 
     def send(
-        self, cpu_batch: dict[str, list[torch.Tensor]]
+        self, cpu_batch: dict[str, list[torch.Tensor]],
     ) -> dict[str, list[torch.Tensor]]:
         """Non-context-manager variant; caller must call wait() before use."""
         with torch.cuda.stream(self._stream):

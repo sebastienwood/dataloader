@@ -1,5 +1,5 @@
-"""
-dino_loader.shard_cache
+"""dino_loader.shard_cache
+
 =======================
 Node-local shared-memory shard cache.
 
@@ -77,7 +77,7 @@ _EVICT_RETRIES = 10
 
 
 class _MmapEntry:
-    __slots__ = ("fd", "mm", "data_len", "refs")
+    __slots__ = ("data_len", "fd", "mm", "refs")
 
     def __init__(self, fd: int, mm: mmap.mmap, data_len: int) -> None:
         self.fd       = fd
@@ -111,7 +111,7 @@ class _MmapPool:
                     mm.close()
                     os.close(fd)
                     raise RuntimeError(
-                        f"Shard {path} has corrupt header (magic={magic:#x})"
+                        f"Shard {path} has corrupt header (magic={magic:#x})",
                     )
                 entry      = _MmapEntry(fd, mm, data_len)
                 entry.refs = 1
@@ -176,7 +176,7 @@ class _HeartbeatWriter:
         self._stop   = threading.Event()
         self._write()
         self._thread = threading.Thread(
-            target=self._run, name="shm-heartbeat", daemon=True
+            target=self._run, name="shm-heartbeat", daemon=True,
         )
         self._thread.start()
         log.debug("HeartbeatWriter started: %s (pid=%d)", hb_path, os.getpid())
@@ -259,10 +259,9 @@ def _is_ready(shm: Path) -> bool:
     if not shm.exists():
         return False
     try:
-        with open(shm, "rb") as f:
-            with mmap.mmap(f.fileno(), _HDR_SIZE, access=mmap.ACCESS_READ) as mm:
-                _, magic = struct.unpack_from(_HDR_FMT, mm, 0)
-                return magic == _READY_MAGIC
+        with open(shm, "rb") as f, mmap.mmap(f.fileno(), _HDR_SIZE, access=mmap.ACCESS_READ) as mm:
+            _, magic = struct.unpack_from(_HDR_FMT, mm, 0)
+            return magic == _READY_MAGIC
     except Exception:
         return False
 
@@ -318,7 +317,7 @@ def _inotify_wait(shm: Path, timeout_s: float) -> None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
-                        f"Timed out ({timeout_s:.0f}s) waiting for shard: {shm}"
+                        f"Timed out ({timeout_s:.0f}s) waiting for shard: {shm}",
                     )
                 r, _, _ = select.select([ifd], [], [], min(remaining, 1.0))
                 if r:
@@ -333,7 +332,7 @@ def _inotify_wait(shm: Path, timeout_s: float) -> None:
     while not _is_ready(shm):
         if time.monotonic() >= deadline:
             raise TimeoutError(
-                f"Timed out ({timeout_s:.0f}s) waiting for shard: {shm}"
+                f"Timed out ({timeout_s:.0f}s) waiting for shard: {shm}",
             )
         time.sleep(0.05)
 
@@ -352,6 +351,7 @@ class NodeSharedShardCache:
         shard_timeout_s: How long non-master ranks wait for a shard.
         shm_warn_threshold: Fraction (0–1) at which to emit a utilisation warning.
         heartbeat_stale_s: Seconds of no heartbeat before a dir is orphaned.
+
     """
 
     def __init__(
@@ -387,11 +387,11 @@ class NodeSharedShardCache:
             self._loop    = asyncio.new_event_loop()
             self._sem     = asyncio.Semaphore(prefetch_window)
             self._thread  = threading.Thread(
-                target=self._loop.run_forever, name="shard-io", daemon=True
+                target=self._loop.run_forever, name="shard-io", daemon=True,
             )
             self._thread.start()
             self._heartbeat: _HeartbeatWriter | None = _HeartbeatWriter(
-                self._base / _HB_FILENAME, job_id=job_id
+                self._base / _HB_FILENAME, job_id=job_id,
             )
             atexit.register(self._cleanup)
             self._register_signals()
@@ -410,7 +410,7 @@ class NodeSharedShardCache:
                 return
             self._in_flight.add(shard_path)
         asyncio.run_coroutine_threadsafe(
-            self._load_one(shard_path, shm), self._loop
+            self._load_one(shard_path, shm), self._loop,
         )
 
     def get(self, shard_path: str) -> bytes:
@@ -422,16 +422,15 @@ class NodeSharedShardCache:
                     if shard_path not in self._in_flight:
                         self._in_flight.add(shard_path)
                 asyncio.run_coroutine_threadsafe(
-                    self._load_one(shard_path, shm), self._loop
+                    self._load_one(shard_path, shm), self._loop,
                 ).result()
             return self._read(shm)
-        else:
-            t_wait  = time.perf_counter()
-            _inotify_wait(shm, self._timeout)
-            wait_ms = int((time.perf_counter() - t_wait) * 1000)
-            if self._metrics is not None and wait_ms > 0:
-                self._metrics.inc(MetricField.SHARD_CACHE_WAIT_MS, wait_ms)
-            return self._read(shm)
+        t_wait  = time.perf_counter()
+        _inotify_wait(shm, self._timeout)
+        wait_ms = int((time.perf_counter() - t_wait) * 1000)
+        if self._metrics is not None and wait_ms > 0:
+            self._metrics.inc(MetricField.SHARD_CACHE_WAIT_MS, wait_ms)
+        return self._read(shm)
 
     @contextlib.contextmanager
     def get_view(self, shard_path: str) -> Iterator[memoryview]:
@@ -443,7 +442,7 @@ class NodeSharedShardCache:
                     if shard_path not in self._in_flight:
                         self._in_flight.add(shard_path)
                 asyncio.run_coroutine_threadsafe(
-                    self._load_one(shard_path, shm), self._loop
+                    self._load_one(shard_path, shm), self._loop,
                 ).result()
         else:
             t_wait  = time.perf_counter()
@@ -543,12 +542,11 @@ class NodeSharedShardCache:
 
     @staticmethod
     def _read(shm: Path) -> bytes:
-        with open(shm, "rb") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                data_len, magic = struct.unpack_from(_HDR_FMT, mm, 0)
-                if magic != _READY_MAGIC:
-                    raise RuntimeError(f"Shard {shm} has corrupt header")
-                return bytes(mm[_HDR_SIZE: _HDR_SIZE + data_len])
+        with open(shm, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            data_len, magic = struct.unpack_from(_HDR_FMT, mm, 0)
+            if magic != _READY_MAGIC:
+                raise RuntimeError(f"Shard {shm} has corrupt header")
+            return bytes(mm[_HDR_SIZE: _HDR_SIZE + data_len])
 
     def _evict_for_locked(self, incoming: int) -> None:
         """Evict LRU shards to make room. Caller must hold _lru_lock.

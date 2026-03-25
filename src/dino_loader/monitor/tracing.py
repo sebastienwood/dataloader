@@ -1,5 +1,4 @@
-"""
-dino_loader.monitor.tracing
+"""dino_loader.monitor.tracing
 ===========================
 Explicit flamegraph tracing context across processes.
 """
@@ -9,6 +8,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
+
 
 class ProcessTracer:
     def __init__(self):
@@ -39,7 +39,7 @@ class ProcessTracer:
     def record(self, name: str, cat: str, start_us: int, dur_us: int):
         if not self.enabled or not self._f:
             return
-            
+
         event = {
             "name": name,
             "cat": cat,
@@ -47,9 +47,9 @@ class ProcessTracer:
             "ts": start_us,
             "dur": dur_us,
             "pid": os.getpid(),
-            "tid": threading.get_native_id()
+            "tid": threading.get_native_id(),
         }
-        
+
         evt_str = json.dumps(event)
         with self._lock:
             if not self._first:
@@ -69,14 +69,13 @@ def stop_tracing():
 
 @contextmanager
 def trace(name: str, cat: str = "default"):
-    """
-    Context manager to trace the duration of a block of code.
+    """Context manager to trace the duration of a block of code.
     If tracing is not enabled, this has effectively zero overhead (~ns).
     """
     if not _GLOBAL_TRACER.enabled:
         yield
         return
-        
+
     start_ts = time.perf_counter_ns() // 1000
     try:
         yield

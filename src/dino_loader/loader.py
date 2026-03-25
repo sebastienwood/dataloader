@@ -1,5 +1,4 @@
-"""
-dino_loader.loader
+"""dino_loader.loader
 ==================
 DINODataLoader: the single public entry point for training code.
 
@@ -36,6 +35,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from dino_datasets import DatasetSpec
 
 from dino_loader.augmentation import (
     AugmentationSpec,
@@ -45,15 +45,13 @@ from dino_loader.augmentation import (
     SamplePredicate,
     UserAugSpec,
 )
-from dino_loader.backends          import get_backend
+from dino_loader.backends import get_backend
 from dino_loader.backends.protocol import BackendProtocol
-from dino_loader.checkpoint        import DataLoaderCheckpointer
-from dino_loader.config            import CheckpointState, DINOAugConfig, LoaderConfig
-from dino_loader.memory            import Batch
-from dino_loader.mixing_source     import MixingSource, ResolutionSource
-from dino_loader.monitor.metrics   import get_registry, init_registry
-
-from dino_datasets import DatasetSpec
+from dino_loader.checkpoint import DataLoaderCheckpointer
+from dino_loader.config import CheckpointState, DINOAugConfig, LoaderConfig
+from dino_loader.memory import Batch
+from dino_loader.mixing_source import MixingSource, ResolutionSource
+from dino_loader.monitor.metrics import get_registry, init_registry
 
 log = logging.getLogger(__name__)
 
@@ -220,6 +218,7 @@ class DINODataLoader:
         mask_generator: Optional iBOT MaskingGenerator (CPU, post-DALI).
         sample_predicate: Optional early filter before DALI decode.
         backend: "auto" | "dali" | "cpu" | BackendProtocol instance.
+
     """
 
     def __init__(
@@ -248,7 +247,7 @@ class DINODataLoader:
             if aug_cfg is not None:
                 log.warning(
                     "DINODataLoader: both aug_spec and aug_cfg provided; "
-                    "aug_cfg is ignored (aug_spec takes precedence)."
+                    "aug_cfg is ignored (aug_spec takes precedence).",
                 )
             self._aug_spec = aug_spec
 

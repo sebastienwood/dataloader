@@ -1,5 +1,4 @@
-"""
-dino_loader.backends.dali_backend
+"""dino_loader.backends.dali_backend
 ==================================
 Concrete backend: NVIDIA DALI + CUDA production path.
 
@@ -131,8 +130,8 @@ class DALIBackend:
             )
             raise RuntimeError(msg) from None
 
-        from dino_loader.pipeline import NormSource, build_pipeline
         from dino_loader.augmentation import DinoV2AugSpec
+        from dino_loader.pipeline import NormSource, build_pipeline
 
         norm_source = None
         if (
@@ -204,7 +203,8 @@ class DALIBackend:
         local_world_size: int = 1,
         force_topology:   str | None = None,
     ) -> Any:
-        from dino_env import detect_topology, ClusterTopology
+        from dino_env import detect_topology
+
         from dino_loader.distributed import DistribEnv
         topo = detect_topology(force=force_topology, gpu_index=local_rank)
         return DistribEnv(

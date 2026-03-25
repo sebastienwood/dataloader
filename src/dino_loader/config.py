@@ -1,5 +1,4 @@
-"""
-dino_loader.config
+"""dino_loader.config
 ==================
 All loader-level configuration lives here.  No logic — pure dataclasses.
 Serialised to / from JSON for checkpointing (no pickle fragility).
@@ -58,6 +57,7 @@ class DINOAugConfig:
             local_crop_size.
         mean: Per-channel normalisation mean (ImageNet defaults).
         std: Per-channel normalisation std (ImageNet defaults).
+
     """
 
     global_crop_size:   int   = 224
@@ -155,6 +155,7 @@ class LoaderConfig:
         stall_timeout_s: Seconds before raising on no batches. 0 = disabled.
         shm_warn_threshold: /dev/shm utilisation fraction that triggers a warning.
         prometheus_port: If set, start a prometheus_client HTTP server on this port.
+
     """
 
     # I/O

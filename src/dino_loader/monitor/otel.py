@@ -1,5 +1,4 @@
-"""
-dino_loader.monitor.otel
+"""dino_loader.monitor.otel
 ========================
 Unified observability layer for dino_loader.
 
@@ -102,9 +101,9 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Optional
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +114,7 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class _LoaderCtx:
     """Immutable snapshot of the current loader context."""
+
     rank:  int = 0
     epoch: int = 0
     step:  int = 0
@@ -129,8 +129,7 @@ _ctx_var: contextvars.ContextVar[_LoaderCtx] = contextvars.ContextVar(
 
 
 class LoaderContext:
-    """
-    Read-only view of the current rank / epoch / step.
+    """Read-only view of the current rank / epoch / step.
 
     Thread-safe by construction: ``ContextVar`` reads are always consistent
     within a given execution context, and writes from one thread do not
@@ -149,8 +148,7 @@ class LoaderContext:
 
     @staticmethod
     def set(rank: int, epoch: int, step: int) -> contextvars.Token:
-        """
-        Update the context in the current thread / coroutine.
+        """Update the context in the current thread / coroutine.
 
         Returns a ``Token`` that can be passed to ``reset()`` to undo the
         change (useful in tests that need deterministic isolation).
@@ -164,8 +162,7 @@ class LoaderContext:
 
 
 def set_loader_context(rank: int, epoch: int, step: int) -> None:
-    """
-    Convenience wrapper — update the loader context from the training loop.
+    """Convenience wrapper — update the loader context from the training loop.
 
     Call this at the start of each step (inside ``_raw_iter``) so that every
     log line emitted anywhere in that step's call graph carries the correct
@@ -186,8 +183,7 @@ def set_loader_context(rank: int, epoch: int, step: int) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DINOLoggingFilter(logging.Filter):
-    """
-    Logging filter that injects ``rank``, ``epoch``, and ``step`` into every
+    """Logging filter that injects ``rank``, ``epoch``, and ``step`` into every
     ``LogRecord`` produced by a logger that has this filter installed.
 
     After installing, use ``%(rank)s``, ``%(epoch)s``, ``%(step)s`` in your
@@ -205,7 +201,7 @@ class DINOLoggingFilter(logging.Filter):
     Use ``install_logging_filter()`` rather than instantiating directly.
     """
 
-    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+    def filter(self, record: logging.LogRecord) -> bool:
         ctx = LoaderContext.get()
         record.rank  = ctx.rank
         record.epoch = ctx.epoch
@@ -214,15 +210,14 @@ class DINOLoggingFilter(logging.Filter):
 
 
 def install_logging_filter(
-    logger: Optional[logging.Logger] = None,
+    logger: logging.Logger | None = None,
     fmt: str = (
         "%(asctime)s %(levelname)-8s "
         "[rank=%(rank)s ep=%(epoch)s st=%(step)s] "
         "%(name)s %(message)s"
     ),
 ) -> logging.Filter:
-    """
-    Attach a :class:`DINOLoggingFilter` to *logger* (default: root logger).
+    """Attach a :class:`DINOLoggingFilter` to *logger* (default: root logger).
 
     Also replaces the first ``StreamHandler`` found on the logger with one
     using *fmt* so that the rank/epoch/step fields are visible immediately.
@@ -248,6 +243,7 @@ def install_logging_filter(
         logging.basicConfig(level=logging.INFO)
         log.info("starting")
         # → 14:32:01 INFO     [rank=0 ep=3 st=512] dino_loader.loader starting
+
     """
     if logger is None:
         logger = logging.getLogger()
@@ -290,8 +286,7 @@ except ImportError:
 
 
 def _build_tracer(service_name: str = "dino_loader") -> object:
-    """
-    Build and register an OTEL ``TracerProvider`` from environment variables.
+    """Build and register an OTEL ``TracerProvider`` from environment variables.
 
     Priority
     --------
@@ -330,8 +325,7 @@ _TRACER_INITIALISED = False
 
 
 def init_otel(service_name: str = "dino_loader") -> None:
-    """
-    Initialise the OTEL tracer.  Safe to call multiple times (idempotent).
+    """Initialise the OTEL tracer.  Safe to call multiple times (idempotent).
 
     Call once at loader construction time, before the first batch.  If
     ``opentelemetry-sdk`` is not installed, this is a silent no-op.
@@ -341,6 +335,7 @@ def init_otel(service_name: str = "dino_loader") -> None:
     service_name
         OTEL ``service.name`` resource attribute (overrides the default
         ``"dino_loader"`` value).
+
     """
     global _TRACER, _TRACER_INITIALISED
     if _TRACER_INITIALISED:
@@ -370,10 +365,9 @@ _STAGE_METRIC: dict[str, str] = {
 def stage(
     name: str,
     *,
-    attributes: Optional[dict] = None,
+    attributes: dict | None = None,
 ) -> Iterator[None]:
-    """
-    Context manager that instruments a named pipeline stage.
+    """Context manager that instruments a named pipeline stage.
 
     What it does (all in one call)
     -------------------------------
@@ -410,6 +404,7 @@ def stage(
 
         with stage("lustre_io", attributes={"shard": shard_path}):
             data = lustre_read(shard_path)
+
     """
     # ── Retrieve context ──────────────────────────────────────────────────────
     ctx = LoaderContext.get()
@@ -479,8 +474,7 @@ def stage(
 # ══════════════════════════════════════════════════════════════════════════════
 
 class StageTimer:
-    """
-    Manual start/stop timer for code paths where a context manager is
+    """Manual start/stop timer for code paths where a context manager is
     inconvenient (e.g. async callbacks, or stages split across methods).
 
     Example::
@@ -491,20 +485,19 @@ class StageTimer:
         elapsed_ms = timer.stop()   # records metrics + Chrome trace
     """
 
-    __slots__ = ("_name", "_attributes", "_t_start_ns")
+    __slots__ = ("_attributes", "_name", "_t_start_ns")
 
-    def __init__(self, name: str, attributes: Optional[dict] = None) -> None:
+    def __init__(self, name: str, attributes: dict | None = None) -> None:
         self._name       = name
         self._attributes = attributes
-        self._t_start_ns: Optional[int] = None
+        self._t_start_ns: int | None = None
 
-    def start(self) -> "StageTimer":
+    def start(self) -> StageTimer:
         self._t_start_ns = time.perf_counter_ns()
         return self
 
     def stop(self) -> int:
-        """
-        Stop the timer, record metrics / traces, and return elapsed ms.
+        """Stop the timer, record metrics / traces, and return elapsed ms.
 
         Calling ``stop()`` without a prior ``start()`` logs a warning and
         returns 0 — it never raises.

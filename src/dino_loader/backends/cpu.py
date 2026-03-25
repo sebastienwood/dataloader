@@ -1,5 +1,4 @@
-"""
-dino_loader.backends.cpu
+"""dino_loader.backends.cpu
 ========================
 Pure-Python / PyTorch CPU backend.
 
@@ -41,14 +40,14 @@ from dino_loader.config import DINOAugConfig
 log = logging.getLogger(__name__)
 
 try:
-    import torchvision.transforms.functional as TF
     import torchvision.transforms as TV
+    import torchvision.transforms.functional as TF
     HAS_TV = True
 except ImportError:
     HAS_TV = False
     log.warning(
         "torchvision not installed — CPU backend uses PIL-only augmentation. "
-        "Install torchvision for higher-fidelity transforms."
+        "Install torchvision for higher-fidelity transforms.",
     )
 
 
@@ -427,12 +426,12 @@ class NullH2DStream:
 
     @contextlib.contextmanager
     def transfer(
-        self, cpu_batch: dict[str, list[torch.Tensor]]
+        self, cpu_batch: dict[str, list[torch.Tensor]],
     ) -> Iterator[dict[str, list[torch.Tensor]]]:
         yield cpu_batch
 
     def send(
-        self, cpu_batch: dict[str, list[torch.Tensor]]
+        self, cpu_batch: dict[str, list[torch.Tensor]],
     ) -> dict[str, list[torch.Tensor]]:
         return cpu_batch
 
@@ -547,19 +546,19 @@ class CPUBackend:
         if isinstance(aug_spec, EvalAugSpec):
             log.info("CPUBackend: EvalAugSpec pipeline (crop=%d)", aug_spec.crop_size)
             return CPUEvalPipeline(
-                source=source, aug_spec=aug_spec, batch_size=batch_size
+                source=source, aug_spec=aug_spec, batch_size=batch_size,
             )
         if isinstance(aug_spec, LeJEPAAugSpec):
             log.info("CPUBackend: LeJEPAAugSpec pipeline")
             return CPULeJEPAPipeline(
-                source=source, aug_spec=aug_spec, batch_size=batch_size
+                source=source, aug_spec=aug_spec, batch_size=batch_size,
             )
         if isinstance(aug_spec, UserAugSpec):
             log.info(
-                "CPUBackend: UserAugSpec pipeline (decode_size=%d)", aug_spec.decode_size
+                "CPUBackend: UserAugSpec pipeline (decode_size=%d)", aug_spec.decode_size,
             )
             return CPUUserAugPipeline(
-                source=source, aug_spec=aug_spec, batch_size=batch_size
+                source=source, aug_spec=aug_spec, batch_size=batch_size,
             )
         msg = f"CPUBackend: unsupported aug_spec type {type(aug_spec).__name__}."
         raise TypeError(msg)

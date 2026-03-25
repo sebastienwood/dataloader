@@ -1,5 +1,4 @@
-"""
-dino_loader.checkpoint
+"""dino_loader.checkpoint
 ======================
 Dataloader state checkpointing.
 
@@ -131,7 +130,6 @@ class DataLoaderCheckpointer:
 
     def load_state_dict(self, d: dict) -> None:
         """Restore from a dict produced by state_dict(). Caller applies fields."""
-        pass
 
     def _write_latest(self, filename: str) -> None:
         """Atomically update the LATEST pointer file."""

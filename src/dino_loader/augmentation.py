@@ -1,5 +1,4 @@
-"""
-dino_loader.augmentation
+"""dino_loader.augmentation
 ========================
 Augmentation pipeline abstraction for dino_loader.
 
@@ -21,8 +20,9 @@ the DALI pipeline, eliminating GPU decode cost for rejected samples.
 import logging
 import warnings
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from dino_loader.config import DINOAugConfig
 
@@ -40,6 +40,7 @@ class SampleMeta:
         key: WebDataset sample key (e.g. "000042").
         shard_path: Absolute path to the .tar shard file.
         metadata: Parsed JSON sidecar dict, or None if absent.
+
     """
 
     key:        str
@@ -115,6 +116,7 @@ class DinoV2AugSpec(AugmentationSpec):
         aug_cfg: Full DINOv2 augmentation configuration.
         fuse_normalization: Fuse per-dataset mean/std into the DALI graph.
         fp8_output: Emit FP8-cast tensors directly from the DALI graph.
+
     """
 
     aug_cfg:            DINOAugConfig = field(default_factory=DINOAugConfig)
@@ -137,6 +139,7 @@ class EvalAugSpec(AugmentationSpec):
         mean: Per-channel normalisation mean.
         std: Per-channel normalisation std.
         interpolation: Resize interpolation mode ("bicubic" or "bilinear").
+
     """
 
     crop_size:     int                        = 224
@@ -178,6 +181,7 @@ class LeJEPAAugSpec(AugmentationSpec):
         target_scale: RandomResizedCrop scale range for target views.
         mean: Per-channel normalisation mean.
         std: Per-channel normalisation std.
+
     """
 
     context_crop_size: int                        = 224
@@ -229,6 +233,7 @@ class UserAugSpec(AugmentationSpec):
         mean: Per-channel normalisation mean applied before calling aug_fn.
         std: Per-channel normalisation std.
         warn_not_dali: Emit a non-DALI performance warning (default True).
+
     """
 
     aug_fn:       UserAugFn

@@ -1,5 +1,4 @@
-"""
-dino_loader.monitor.cli
+"""dino_loader.monitor.cli
 =======================
 Real-time terminal UI for Dataloader monitoring (htop style).
 
@@ -34,7 +33,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
-from .metrics import MetricsRegistry, MAX_LOCAL_RANKS
+from .metrics import MAX_LOCAL_RANKS, MetricsRegistry
 
 STALE_THRESHOLD_S: int = 10
 
@@ -79,7 +78,7 @@ def run_monitor(job_id: str) -> None:
     if registry.shm is None:
         print(
             f"[ERROR] Could not connect to shared memory for job '{job_id}'.\n"
-            "        Is the dataloader running on this node?"
+            "        Is the dataloader running on this node?",
         )
         sys.exit(1)
 
@@ -112,8 +111,8 @@ def run_monitor(job_id: str) -> None:
                             f"{time.strftime('%H:%M:%S')}",
                             style="bold white on blue",
                             justify="center",
-                        )
-                    )
+                        ),
+                    ),
                 )
 
                 m0           = data.ranks[0]
@@ -131,7 +130,7 @@ def run_monitor(job_id: str) -> None:
                 )
                 globals_table.add_row("Throughput", f"{batches_rate:.2f} batches/s")
                 layout["globals"].update(
-                    Panel(globals_table, title="[bold]Node Pipeline  (Rank 0 view)[/bold]")
+                    Panel(globals_table, title="[bold]Node Pipeline  (Rank 0 view)[/bold]"),
                 )
 
                 ranks_table = Table(expand=True, show_lines=False)
@@ -166,7 +165,7 @@ def run_monitor(job_id: str) -> None:
                     )
 
                 layout["ranks"].update(
-                    Panel(ranks_table, title="[bold]Per-GPU Workers[/bold]")
+                    Panel(ranks_table, title="[bold]Per-GPU Workers[/bold]"),
                 )
 
                 live.update(layout)

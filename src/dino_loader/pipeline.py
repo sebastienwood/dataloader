@@ -42,18 +42,16 @@ from dino_loader.augmentation import (
     LeJEPAAugSpec,
     UserAugSpec,
 )
-from dino_loader.config import DINOAugConfig
-from dino_datasets import DatasetSpec
 
 if TYPE_CHECKING:
-    pass
+    from dino_datasets import DatasetSpec
+
+    from dino_loader.config import DINOAugConfig
 
 log = logging.getLogger(__name__)
 
 try:
-    import nvidia.dali.fn    as fn
-    import nvidia.dali.types as types
-    from nvidia.dali import pipeline_def
+    from nvidia.dali import fn, pipeline_def, types
     HAS_DALI = True
 except ImportError:
     HAS_DALI = False
@@ -151,11 +149,12 @@ def build_pipeline(
     Raises:
         RuntimeError: If nvidia-dali is not installed.
         TypeError: If ``aug_spec`` is an unknown type.
+
     """
     if not HAS_DALI:
         raise RuntimeError(
             "nvidia-dali is not installed.  "
-            "Install with: pip install nvidia-dali-cuda120"
+            "Install with: pip install nvidia-dali-cuda120",
         )
 
     common_kwargs: dict[str, Any] = dict(
@@ -366,7 +365,7 @@ def _augment_view_dinov2(
         except AttributeError:
             log.warning(
                 "DALI FLOAT8_E4M3 not available (requires DALI ≥ 1.36) — "
-                "falling back to FLOAT16 output."
+                "falling back to FLOAT16 output.",
             )
             output = normalised
     else:

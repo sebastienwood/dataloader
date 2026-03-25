@@ -1,5 +1,4 @@
-"""
-dino_loader.monitor.metrics
+"""dino_loader.monitor.metrics
 ===========================
 Shared-memory metrics publishing and collection for zero-impact monitoring.
 
@@ -149,7 +148,7 @@ class MetricsRegistry:
                 except FileNotFoundError:
                     pass
                 self.shm = shared_memory.SharedMemory(
-                    name=self.name, create=True, size=self.size
+                    name=self.name, create=True, size=self.size,
                 )
             else:
                 self.shm = shared_memory.SharedMemory(name=self.name)
@@ -182,6 +181,7 @@ class MetricsRegistry:
 
         Raises:
             TypeError: If called with SHARD_CACHE_UTIL_PCT (wrong type).
+
         """
         if self.data is None:
             return
@@ -189,7 +189,7 @@ class MetricsRegistry:
         if key in _FLOAT_FIELDS:
             raise TypeError(
                 f"MetricsRegistry.inc() cannot be used with float field {key!r}. "
-                "Use set_float() instead."
+                "Use set_float() instead.",
             )
         m = self.data.ranks[self.local_rank]
         setattr(m, key, getattr(m, key) + int(value))
@@ -206,6 +206,7 @@ class MetricsRegistry:
 
         Raises:
             TypeError: If called with a non-float field.
+
         """
         if self.data is None:
             return
@@ -213,7 +214,7 @@ class MetricsRegistry:
         if key not in _FLOAT_FIELDS:
             raise TypeError(
                 f"MetricsRegistry.set_float() can only be used with float fields. "
-                f"{key!r} is a c_int64 field — use inc() instead."
+                f"{key!r} is a c_int64 field — use inc() instead.",
             )
         setattr(self.data.ranks[self.local_rank], key, float(value))
 

@@ -1,5 +1,4 @@
-"""
-tests.fixtures
+"""tests.fixtures
 ==============
 Helpers for building synthetic WebDataset shards in memory and on disk.
 
@@ -49,7 +48,6 @@ from typing import List, Optional, Tuple
 
 from PIL import Image
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Synthetic image helpers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -57,7 +55,7 @@ from PIL import Image
 def make_jpeg_bytes(
     width:   int = 64,
     height:  int = 64,
-    color:   Tuple[int, int, int] = (128, 64, 32),
+    color:   tuple[int, int, int] = (128, 64, 32),
     quality: int = 85,
 ) -> bytes:
     """Return JPEG-encoded bytes for a solid-colour RGB image (requires Pillow)."""
@@ -68,8 +66,7 @@ def make_jpeg_bytes(
 
 
 def make_minimal_jpeg_bytes(size: int = 256) -> bytes:
-    """
-    Return a minimal JPEG-like byte sequence (SOI marker + padding + EOI marker).
+    """Return a minimal JPEG-like byte sequence (SOI marker + padding + EOI marker).
 
     Does NOT require Pillow.  Useful for low-level tests that only care about
     byte presence in a tar archive, not decodability.
@@ -84,12 +81,11 @@ def make_minimal_jpeg_bytes(size: int = 256) -> bytes:
 def make_shard_tar(
     n_samples:      int = 10,
     with_metadata:  bool = True,
-    quality_scores: Optional[List[float]] = None,
+    quality_scores: list[float] | None = None,
     img_width:      int = 64,
     img_height:     int = 64,
 ) -> bytes:
-    """
-    Build a WebDataset-compatible tar archive in memory (requires Pillow).
+    """Build a WebDataset-compatible tar archive in memory (requires Pillow).
 
     Each sample consists of:
 
@@ -112,6 +108,7 @@ def make_shard_tar(
     -------
     bytes
         Raw tar archive content.
+
     """
     if quality_scores is None:
         quality_scores = [1.0] * n_samples
@@ -144,8 +141,7 @@ def make_shard_tar(
 
 
 def make_minimal_tar_bytes(n_samples: int = 4) -> bytes:
-    """
-    Create an in-memory WebDataset-style tar with minimal JPEG-like entries.
+    """Create an in-memory WebDataset-style tar with minimal JPEG-like entries.
 
     Does NOT require Pillow — entries contain ``make_minimal_jpeg_bytes()``
     payloads.  Intended for low-level tests (mmap pool, async prefetch, …)
@@ -160,6 +156,7 @@ def make_minimal_tar_bytes(n_samples: int = 4) -> bytes:
     -------
     bytes
         Raw tar archive content.
+
     """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tf:
@@ -187,10 +184,9 @@ def write_shard(
     shard_idx:      int = 0,
     n_samples:      int = 10,
     with_metadata:  bool = True,
-    quality_scores: Optional[List[float]] = None,
-) -> Tuple[str, str]:
-    """
-    Write a synthetic ``.tar`` shard and its companion ``.idx`` file to
+    quality_scores: list[float] | None = None,
+) -> tuple[str, str]:
+    """Write a synthetic ``.tar`` shard and its companion ``.idx`` file to
     *directory*.
 
     The ``.idx`` file uses the ``wds2idx`` binary format: a flat sequence of
@@ -201,6 +197,7 @@ def write_shard(
     -------
     (tar_path, idx_path)
         Both as absolute string paths.
+
     """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -224,8 +221,7 @@ def write_shard(
 
 
 def write_shm_file(path: Path, data: bytes) -> None:
-    """
-    Write a /dev/shm-style shard file: a 16-byte header followed by *data*.
+    """Write a /dev/shm-style shard file: a 16-byte header followed by *data*.
 
     Header layout (two little-endian uint64)::
 
@@ -241,6 +237,7 @@ def write_shm_file(path: Path, data: bytes) -> None:
         Destination file path (parent directory must exist).
     data:
         Raw shard payload to embed after the header.
+
     """
     _HDR_FMT     = "<QQ"
     _READY_MAGIC = 0xDEAD_BEEF_CAFE_F00D
@@ -260,9 +257,8 @@ def scaffold_dataset_dir(
     n_shards:            int = 2,
     n_samples_per_shard: int = 8,
     with_metadata:       bool = True,
-) -> List[str]:
-    """
-    Create the full dataset directory hierarchy and populate it with synthetic
+) -> list[str]:
+    """Create the full dataset directory hierarchy and populate it with synthetic
     shards.  Returns the list of absolute ``.tar`` paths.
 
     Layout produced::
@@ -307,6 +303,7 @@ def scaffold_dataset_dir(
     -------
     list of str
         Absolute paths to the generated ``.tar`` files.
+
     """
     root         = Path(root)
     dataset_root = root / conf / modality / name
@@ -317,7 +314,7 @@ def scaffold_dataset_dir(
     split_dir = dataset_root / "outputs" / strategy / split
     split_dir.mkdir(parents=True, exist_ok=True)
 
-    tar_paths: List[str] = []
+    tar_paths: list[str] = []
     for i in range(n_shards):
         tar_path, _ = write_shard(
             directory           = split_dir,
@@ -335,8 +332,7 @@ def scaffold_dataset_dir(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def make_spec(name: str, tar_paths: list, weight: float = 1.0, **kwargs):
-    """
-    Convenience factory for ``DatasetSpec``.
+    """Convenience factory for ``DatasetSpec``.
 
     Imported by ``conftest.py`` and used directly in test modules.  Defined
     here (in ``fixtures``) rather than in ``conftest.py`` so that test modules
@@ -357,6 +353,7 @@ def make_spec(name: str, tar_paths: list, weight: float = 1.0, **kwargs):
     Returns
     -------
     DatasetSpec
+
     """
     # Import here to keep the rest of fixtures free of dino_loader deps.
     _src = str(Path(__file__).parent.parent / "src")

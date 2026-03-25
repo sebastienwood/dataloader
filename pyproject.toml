@@ -18,13 +18,12 @@ dependencies = [
     # ── Monitoring / CLI ──────────────────────────────────────────────────────
     "rich~=14.3",
     "psutil~=7.2",
-    # ── Config parsing ────────────────────────────────────────────────────────
-    "tomli~=2.4",
     # ── Pillow: CPU backend augmentation pipeline ─────────────────────────────
     "pillow~=11.0",
     "dino-datasets",
     "dino-env",
     "nvidia-dali-cuda120>=2.0.0",
+    "torchdata>=0.11.0",
 ]
 
 [dependency-groups]
@@ -81,6 +80,9 @@ markers = [
     "slow: long-running integration tests",
 ]
 timeout = 120
+# Default: exclude slow tests.  Run `pytest` with no -m flag to get the fast
+# suite.  Add `-m slow` or remove the addopts line to include slow tests.
+addopts = "-m 'not slow'"
 
 [tool.uv.sources]
 dino-datasets = { git = "https://github.com/piflepaf1-eng/dino_datasets" }
@@ -89,3 +91,48 @@ dino-env = { git = "https://github.com/sebastienwood/dino_env" }
 [build-system]
 requires      = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "ANN003",
+    "D100",
+    "D101",
+    "D103",
+    "D203",
+    "D213",
+    "INP001",
+    "D105",
+    "D400",
+    "FBT001",
+    "FBT002",
+    "D415",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"*test*.py" = [
+    "PLR2004",
+    "S101",
+    "ANN204",
+    "ANN201",
+    "ANN202",
+    "ERA001",
+    "D102",
+    "ANN001",
+    "PLC0415",
+    "SLF001",
+    "PT011",
+    "D205",
+    "ANN002",
+    "D104",
+    "PLR0913",
+    "BLE001",
+    "E402",
+    "TRY003",
+    "EM101",
+    "D401",
+]
+"*scripts/*.py" = ["ALL"]

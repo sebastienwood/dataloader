@@ -1,5 +1,4 @@
-"""
-dino_loader.mixing_source
+"""dino_loader.mixing_source
 =========================
 DALI ExternalSource callback and per-dataset shard cycling.
 
@@ -29,14 +28,14 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
+from dino_datasets import DatasetSpec
 
 from dino_loader.augmentation import SampleMeta, SamplePredicate
-from dino_datasets import DatasetSpec
 
 log = logging.getLogger(__name__)
 
 try:
-    from dino_loader.monitor.metrics import get_registry, MetricField
+    from dino_loader.monitor.metrics import MetricField, get_registry
     HAS_METRICS = True
 except ImportError:
     HAS_METRICS = False
@@ -48,7 +47,7 @@ except ImportError:
     HAS_WDS = False
     log.warning(
         "webdataset not installed — shard_sampling='resampled' will fall back "
-        "to 'epoch' mode. Install with: pip install webdataset"
+        "to 'epoch' mode. Install with: pip install webdataset",
     )
 
 
@@ -130,7 +129,7 @@ class ResolutionSource:
 class SampleRecord:
     """Decoded sample ready for the DALI pipeline."""
 
-    __slots__ = ("jpeg", "metadata", "key")
+    __slots__ = ("jpeg", "key", "metadata")
 
     def __init__(
         self,
@@ -145,6 +144,7 @@ class SampleRecord:
 
 class _Sentinel:
     """Passed through _io_queue to signal I/O thread shutdown."""
+
     __slots__ = ()
 
 
@@ -230,7 +230,7 @@ class ShardIterator:
                         urls          = self._all_shards,
                         seed          = seed + rank,
                         deterministic = True,
-                    )
+                    ),
                 )
             else:
                 log.warning(
@@ -446,7 +446,7 @@ class ShardIterator:
 
         # Per-worker RNG — no shared state between threads.
         worker_rng = np.random.default_rng(
-            self._seed + self._rank + threading.get_ident()
+            self._seed + self._rank + threading.get_ident(),
         )
 
         while not self._closed:
@@ -485,7 +485,7 @@ class ShardIterator:
                 )
 
     def _make_shard_cycle(
-        self, rng: np.random.Generator
+        self, rng: np.random.Generator,
     ) -> Generator[str, None, None]:
         """Generate shard paths in shuffled order, cycling on exhaustion."""
         if self._sampling == "resampled" and self._resampled_iter is not None:

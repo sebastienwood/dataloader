@@ -1,5 +1,4 @@
-"""
-tests/test_loader_cpu.py
+"""tests/test_loader_cpu.py
 ========================
 End-to-end integration tests for DINODataLoader using the CPU backend.
 
@@ -33,13 +32,14 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from tests.conftest import make_spec
+from dino_datasets import DatasetSpec
+
 from dino_loader.backends import get_backend
 from dino_loader.backends.cpu import CPUBackend
-from dino_loader.config import DatasetSpec, DINOAugConfig, LoaderConfig
+from dino_loader.config import DINOAugConfig, LoaderConfig
 from dino_loader.loader import DINODataLoader
 from dino_loader.memory import Batch
-
+from tests.conftest import make_spec
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -180,7 +180,7 @@ class TestLoaderBasic:
     def test_multiple_batches(self, tmp_dataset_dir, small_aug_cfg, small_loader_cfg):
         """Loader can produce more than one batch without error."""
         _, tar_paths = tmp_dataset_dir
-        # 2 shards × 8 samples = 16 samples; batch_size=4 → ≥ 4 batches possible
+        # 2 shards x 8 samples = 16 samples; batch_size=4 → ≥ 4 batches possible
         loader = _make_loader(
             tar_paths, aug_cfg=small_aug_cfg, loader_cfg=small_loader_cfg,
             batch_size=4,
@@ -260,8 +260,7 @@ class TestLoaderMultiDataset:
 class TestLoaderEpochControl:
 
     def test_set_epoch_required_before_iter(self, tmp_dataset_dir, small_aug_cfg, small_loader_cfg):
-        """
-        Iterating without set_epoch is not explicitly forbidden, but calling
+        """Iterating without set_epoch is not explicitly forbidden, but calling
         set_epoch between iterations must not raise.
         """
         _, tar_paths = tmp_dataset_dir
@@ -482,10 +481,9 @@ class TestLoaderCheckpoint:
 class TestLoaderQualityFilter:
 
     def test_min_sample_quality_filters_low_scores(
-        self, shard_with_low_quality, small_aug_cfg, small_loader_cfg
+        self, shard_with_low_quality, small_aug_cfg, small_loader_cfg,
     ):
-        """
-        With min_sample_quality=0.5, only samples with score ≥ 0.5 pass.
+        """With min_sample_quality=0.5, only samples with score ≥ 0.5 pass.
         The shard_with_low_quality fixture has alternating 0.1 / 0.9 scores.
         """
         tar_path, _, scores = shard_with_low_quality
@@ -532,7 +530,7 @@ class TestLoaderQualityFilter:
         assert isinstance(batch, Batch)
 
     def test_no_metadata_key_skips_sidecar(
-        self, shard_without_metadata, small_aug_cfg, small_loader_cfg
+        self, shard_without_metadata, small_aug_cfg, small_loader_cfg,
     ):
         tar_path, _ = shard_without_metadata
         spec = DatasetSpec(

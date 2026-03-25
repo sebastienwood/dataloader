@@ -1,5 +1,4 @@
-"""
-dino_loader.backends
+"""dino_loader.backends
 ====================
 Pluggable backend abstraction for dino_loader.
 
@@ -36,15 +35,13 @@ from __future__ import annotations
 
 from typing import Literal
 
-from dino_loader.backends.protocol import BackendProtocol  # noqa: F401
-
+from dino_loader.backends.protocol import BackendProtocol
 
 BackendName = Literal["dali", "cpu", "auto"]
 
 
 def get_backend(name: BackendName = "auto") -> BackendProtocol:
-    """
-    Return a concrete backend instance.
+    """Return a concrete backend instance.
 
     Parameters
     ----------
@@ -52,6 +49,7 @@ def get_backend(name: BackendName = "auto") -> BackendProtocol:
         * ``"auto"``  — use DALI if available, fall back to CPU silently.
         * ``"dali"``  — always use the DALI backend; raise if unavailable.
         * ``"cpu"``   — always use the CPU backend.
+
     """
     if name == "cpu":
         from dino_loader.backends.cpu import CPUBackend

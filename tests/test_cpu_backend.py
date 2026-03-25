@@ -1,5 +1,4 @@
-"""
-tests/test_cpu_backend.py
+"""tests/test_cpu_backend.py
 =========================
 Unit tests for CPU backend components.
 
@@ -32,7 +31,6 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from tests.fixtures import write_shard
 from dino_loader.backends.cpu import (
     CPUAugPipeline,
     CPUPipelineIterator,
@@ -44,7 +42,7 @@ from dino_loader.backends.cpu import (
     _augment_one,
 )
 from dino_loader.mixing_source import ResolutionSource
-
+from tests.fixtures import write_shard
 
 # ══════════════════════════════════════════════════════════════════════════════
 # InProcessShardCache
