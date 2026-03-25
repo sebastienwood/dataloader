@@ -203,9 +203,7 @@ class DALIBackend:
         local_world_size: int = 1,
         force_topology:   str | None = None,
     ) -> Any:
-        from dino_env import detect_topology
-
-        from dino_env import DistribEnv
+        from dino_env import detect_topology, DistribEnv
         topo = detect_topology(force=force_topology, gpu_index=local_rank)
         return DistribEnv(
             rank             = rank,
