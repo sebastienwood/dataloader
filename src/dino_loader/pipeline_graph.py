@@ -55,29 +55,12 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
+import torchdata.nodes as tn
+from torchdata.nodes import BaseNode
 
 from dino_loader.memory import Batch
 
 log = logging.getLogger(__name__)
-
-try:
-    import torchdata.nodes as tn
-    from torchdata.nodes import BaseNode
-
-    _HAS_TORCHDATA = True
-except ImportError:
-    _HAS_TORCHDATA = False
-    tn = None  # type: ignore[assignment]
-    BaseNode = object  # type: ignore[assignment,misc]
-
-
-def _require_torchdata() -> None:
-    if not _HAS_TORCHDATA:
-        msg = (
-            "torchdata is required for dino_loader.pipeline_graph.  "
-            "Install it with:  pip install torchdata"
-        )
-        raise ImportError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +88,6 @@ class BatchMapNode(BaseNode):  # type: ignore[misc]
         *,
         label:  str = "<map>",
     ) -> None:
-        _require_torchdata()
         super().__init__()
         self._source = source
         self._fn     = fn
@@ -147,7 +129,6 @@ class BatchFilterNode(BaseNode):  # type: ignore[misc]
         *,
         label:     str = "<filter>",
     ) -> None:
-        _require_torchdata()
         super().__init__()
         self._source    = source
         self._predicate = predicate
@@ -193,7 +174,6 @@ class _LimitNode(BaseNode):  # type: ignore[misc]
     """Yield at most ``max_steps`` batches per epoch, then raise StopIteration."""
 
     def __init__(self, source: BaseNode, max_steps: int) -> None:  # type: ignore[type-arg]
-        _require_torchdata()
         super().__init__()
         self._source    = source
         self._max_steps = max_steps
@@ -252,7 +232,6 @@ class NodePipeline:
         dino_loader: Any,
         max_steps:   int | None = None,
     ) -> None:
-        _require_torchdata()
         self._root      = root_node
         self._loader    = dino_loader
         self._max_steps = max_steps
@@ -418,7 +397,6 @@ class _DINOLoaderNode(BaseNode):  # type: ignore[misc]
     """
 
     def __init__(self, dino_loader: Any) -> None:
-        _require_torchdata()
         super().__init__()
         self._dino_loader  = dino_loader
         self._it: Iterator[Batch] | None = None
@@ -487,6 +465,5 @@ def wrap_loader(dino_loader: Any) -> NodePipeline:
             sd = pipeline.state_dict()
 
     """
-    _require_torchdata()
     root = _DINOLoaderNode(dino_loader)
     return NodePipeline(root_node=root, dino_loader=dino_loader)
