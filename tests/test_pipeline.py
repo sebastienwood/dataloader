@@ -6,7 +6,8 @@ Coverage
 --------
 NormSource [M2]
 - set_dataset_indices is a full copy-on-write replacement
-- __call__ returns independent numpy copies (not views into _lookup)
+- __call__ returns independent numpy copies — mutating the returned array
+  must NOT affect the internal lookup table or subsequent calls
 - Concurrent set + call does not corrupt or raise
 
 pipeline dispatch
@@ -58,18 +59,52 @@ class TestNormSourceSetIndices:
         assert len(means) == 3
         assert len(stds) == 3
 
+    def test_single_index_returns_length_one(self):
+        ns = _make_norm_source(2)
+        ns.set_dataset_indices([0])
+        means, stds = ns()
+        assert len(means) == 1
+        assert len(stds) == 1
+
 
 class TestNormSourceReturnsCopies:
 
-    def test_call_returns_independent_arrays(self):
-        """Modifying a returned array must not affect subsequent calls [M2]."""
+    def test_mutating_returned_array_does_not_affect_next_call(self):
+        """[M2] Copy-on-write guarantee: returned arrays are independent copies.
+
+        Mutating the first call's result must leave subsequent calls unaffected.
+        If NormSource returns views into its internal lookup table, writes to
+        those views would corrupt the lookup, and the second call would produce
+        the mutated values — which this test catches.
+        """
         ns = _make_norm_source(1)
         ns.set_dataset_indices([0])
-        means1, _ = ns()
-        means2, _ = ns()
-        means1[0][:] = 99.0
-        assert not np.allclose(means2[0], 99.0), (
-            "Returned arrays are views into _lookup — expected independent copies"
+
+        means_first, _ = ns()
+        # Corrupt the returned array in-place.
+        original_value = float(means_first[0][0])
+        means_first[0][:] = 99.0
+
+        means_second, _ = ns()
+        # The second call must produce the original (uncorrupted) values.
+        assert not np.allclose(means_second[0], 99.0), (
+            "NormSource returned a view into its internal lookup table. "
+            "Mutating the result corrupted the next call — copy-on-write is broken."
+        )
+        # Sanity: the second call should reproduce the original value.
+        assert np.isclose(means_second[0][0], original_value), (
+            f"Expected original value {original_value}, got {means_second[0][0]}."
+        )
+
+    def test_two_successive_calls_return_distinct_arrays(self):
+        """Each call must allocate fresh arrays, never the same object."""
+        ns = _make_norm_source(1)
+        ns.set_dataset_indices([0])
+        means_a, _ = ns()
+        means_b, _ = ns()
+        # Different objects (not just different values).
+        assert means_a[0] is not means_b[0], (
+            "NormSource returned the same array object in two consecutive calls."
         )
 
 
@@ -87,7 +122,11 @@ class TestNormSourceConcurrency:
         def _caller():
             for _ in range(200):
                 try:
-                    ns()
+                    means, stds = ns()
+                    # Basic sanity: every returned array must be float32 with 3 elements.
+                    for arr in means + stds:
+                        assert arr.dtype == np.float32
+                        assert arr.shape == (3,)
                 except Exception as exc:
                     errors.append(exc)
 
@@ -102,6 +141,40 @@ class TestNormSourceConcurrency:
 
         assert errors == [], f"Errors in concurrent NormSource access: {errors}"
 
+    def test_set_indices_is_atomic(self):
+        """set_dataset_indices must never leave _indices in a partially-updated state.
+
+        Two threads alternate between two index lists of different lengths.
+        The caller thread must always observe a complete, consistent list —
+        never a mix of elements from the two lists.
+        """
+        ns = _make_norm_source(4)
+        ns.set_dataset_indices([0])
+        errors: list[str] = []
+
+        def _alternating_setter():
+            for i in range(500):
+                ns.set_dataset_indices([0] if i % 2 == 0 else [1, 2])
+
+        def _length_checker():
+            for _ in range(500):
+                try:
+                    means, _ = ns()
+                    # Length must always be 1 or 2 — never anything else.
+                    if len(means) not in (1, 2):
+                        errors.append(f"Unexpected means length: {len(means)}")
+                except Exception as exc:
+                    errors.append(str(exc))
+
+        t1 = threading.Thread(target=_alternating_setter)
+        t2 = threading.Thread(target=_length_checker)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert errors == [], f"Atomicity violation: {errors}"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # build_pipeline dispatch
@@ -114,16 +187,39 @@ class TestBuildPipelineDispatch:
         """build_pipeline must surface a clear error when nvidia-dali is absent."""
         from unittest.mock import patch
 
-        # Patch HAS_DALI to False to simulate missing DALI
         with patch("dino_loader.pipeline.HAS_DALI", False):
             from dino_loader.augmentation import DinoV2AugSpec
             from dino_loader.pipeline import build_pipeline
             with pytest.raises(RuntimeError, match="nvidia-dali"):
                 build_pipeline(
-                    source=MagicMock(),
-                    aug_spec=DinoV2AugSpec(aug_cfg=DINOAugConfig()),
-                    batch_size=4,
-                    num_threads=1,
-                    device_id=0,
-                    resolution_src=MagicMock(),
+                    source         = MagicMock(),
+                    aug_spec       = DinoV2AugSpec(aug_cfg=DINOAugConfig()),
+                    batch_size     = 4,
+                    num_threads    = 1,
+                    device_id      = 0,
+                    resolution_src = MagicMock(),
+                )
+
+    def test_raises_type_error_on_unknown_aug_spec(self):
+        """An unrecognised AugmentationSpec subtype must raise TypeError."""
+        from unittest.mock import patch
+
+        # We need DALI to appear available so dispatch reaches the match statement.
+        with patch("dino_loader.pipeline.HAS_DALI", True):
+            from dino_loader.augmentation import AugmentationSpec
+            from dino_loader.pipeline import build_pipeline
+
+            class _UnknownSpec(AugmentationSpec):
+                @property
+                def output_map(self) -> list[str]:
+                    return ["view_0"]
+
+            with pytest.raises(TypeError, match="Unknown augmentation spec"):
+                build_pipeline(
+                    source         = MagicMock(),
+                    aug_spec       = _UnknownSpec(),
+                    batch_size     = 4,
+                    num_threads    = 1,
+                    device_id      = 0,
+                    resolution_src = MagicMock(),
                 )

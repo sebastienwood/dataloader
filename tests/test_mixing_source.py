@@ -19,6 +19,7 @@ Run the full suite::
 """
 
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -61,7 +62,6 @@ class TestResolutionSource:
 
     def test_thread_safety(self) -> None:
         """Two threads writing and reading concurrently must not produce torn reads."""
-        import threading
         rs     = ResolutionSource(32, 16)
         errors: list[tuple[int, int]] = []
 
@@ -96,6 +96,7 @@ class TestResolutionSource:
 
 
 class TestMixingWeights:
+    """MixingWeights(names, raw_weights) — constructor takes two separate args."""
 
     def test_normalises_on_init(self) -> None:
         mw = MixingWeights(["a", "b"], [3.0, 1.0])
@@ -119,6 +120,11 @@ class TestMixingWeights:
         w = mw.get()
         assert w[0] > w[1]
 
+    def test_set_by_name_unknown_raises(self) -> None:
+        mw = MixingWeights(["alpha", "beta"], [1.0, 1.0])
+        with pytest.raises(KeyError, match="not found"):
+            mw.set_by_name("gamma", 1.0)
+
     def test_zero_weights_raise(self) -> None:
         with pytest.raises(ValueError):
             MixingWeights(["a", "b"], [0.0, 0.0])
@@ -126,6 +132,115 @@ class TestMixingWeights:
     def test_names_property(self) -> None:
         mw = MixingWeights(["x", "y"], [1.0, 1.0])
         assert mw.names == ["x", "y"]
+
+    def test_get_returns_copy(self) -> None:
+        """Mutating the list returned by get() must not affect the internal state."""
+        mw = MixingWeights(["a", "b"], [1.0, 1.0])
+        w1 = mw.get()
+        w1[0] = 999.0
+        w2 = mw.get()
+        assert w2[0] != 999.0, "get() returned a direct reference to internal state"
+
+    def test_wrong_length_raises(self) -> None:
+        mw = MixingWeights(["a", "b"], [1.0, 1.0])
+        with pytest.raises(ValueError):
+            mw.set([1.0])  # wrong length
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ShardIterator._passes_predicate — fast (no I/O threads)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestPassesPredicate:
+    """Unit tests for ShardIterator._passes_predicate (called from extraction workers).
+
+    We test it directly without spinning up I/O threads by constructing a
+    ShardIterator and calling the private method on SampleRecord stubs.
+    """
+
+    def _make_iter(self, tmp_path: Path, **spec_kwargs) -> ShardIterator:
+        """Build a ShardIterator with minimal config (no threads started yet)."""
+        tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
+        spec  = DatasetSpec(name="ds", shards=tar_paths, weight=1.0, **spec_kwargs)
+        cache = InProcessShardCache(max_gb=0.5)
+        return ShardIterator(spec=spec, cache=cache, rank=0, world_size=1)
+
+    def test_passes_when_no_filters(self, tmp_path: Path) -> None:
+        it = self._make_iter(tmp_path)
+        rec = SampleRecord(jpeg=b"", metadata={"quality_score": 0.0}, key="k")
+        assert it._passes_predicate(rec, "shard.tar") is True
+
+    def test_fails_min_quality_below_threshold(self, tmp_path: Path) -> None:
+        it = self._make_iter(tmp_path, min_sample_quality=0.5)
+        rec = SampleRecord(jpeg=b"", metadata={"quality_score": 0.1}, key="k")
+        assert it._passes_predicate(rec, "shard.tar") is False
+
+    def test_passes_min_quality_above_threshold(self, tmp_path: Path) -> None:
+        it = self._make_iter(tmp_path, min_sample_quality=0.5)
+        rec = SampleRecord(jpeg=b"", metadata={"quality_score": 0.9}, key="k")
+        assert it._passes_predicate(rec, "shard.tar") is True
+
+    def test_passes_when_quality_score_missing_from_metadata(self, tmp_path: Path) -> None:
+        """When quality_score key is absent, the filter must pass the sample."""
+        it = self._make_iter(tmp_path, min_sample_quality=0.5)
+        rec = SampleRecord(jpeg=b"", metadata={"caption": "no score here"}, key="k")
+        assert it._passes_predicate(rec, "shard.tar") is True
+
+    def test_passes_when_metadata_is_none(self, tmp_path: Path) -> None:
+        """None metadata (no sidecar) must pass min_sample_quality filter."""
+        it = self._make_iter(tmp_path, min_sample_quality=0.5)
+        rec = SampleRecord(jpeg=b"", metadata=None, key="k")
+        assert it._passes_predicate(rec, "shard.tar") is True
+
+    def test_sample_predicate_called(self, tmp_path: Path) -> None:
+        """SamplePredicate must be invoked and its return value respected."""
+        from dino_loader.augmentation import SampleMeta
+
+        calls: list[SampleMeta] = []
+
+        def _pred(meta: SampleMeta) -> bool:
+            calls.append(meta)
+            return meta.key == "keep"
+
+        tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
+        spec  = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+        cache = InProcessShardCache(max_gb=0.5)
+        it    = ShardIterator(
+            spec=spec, cache=cache, rank=0, world_size=1,
+            sample_predicate=_pred,
+        )
+
+        rec_keep   = SampleRecord(jpeg=b"", metadata=None, key="keep")
+        rec_discard = SampleRecord(jpeg=b"", metadata=None, key="discard")
+
+        assert it._passes_predicate(rec_keep,    "shard.tar") is True
+        assert it._passes_predicate(rec_discard, "shard.tar") is False
+        assert len(calls) == 2
+        assert calls[0].key == "keep"
+        assert calls[1].key == "discard"
+
+    def test_sample_predicate_receives_shard_path(self, tmp_path: Path) -> None:
+        """The SampleMeta passed to the predicate must contain the correct shard_path."""
+        from dino_loader.augmentation import SampleMeta
+
+        received: list[str] = []
+
+        def _pred(meta: SampleMeta) -> bool:
+            received.append(meta.shard_path)
+            return True
+
+        tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
+        spec  = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+        cache = InProcessShardCache(max_gb=0.5)
+        it    = ShardIterator(
+            spec=spec, cache=cache, rank=0, world_size=1,
+            sample_predicate=_pred,
+        )
+        rec = SampleRecord(jpeg=b"", metadata=None, key="k")
+        it._passes_predicate(rec, "/lustre/data/shard-000001.tar")
+
+        assert received == ["/lustre/data/shard-000001.tar"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -147,6 +262,67 @@ class TestShardIteratorConstruction:
                 rank       = 2,   # rank 2 with 1 shard → empty assignment
                 world_size = 3,
             )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MixingSource.register_dataset_index_callback — fast
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRegisterDatasetIndexCallback:
+    """register_dataset_index_callback must fire on every __call__."""
+
+    @pytest.mark.slow
+    def test_callback_receives_indices_per_call(self, tmp_path: Path) -> None:
+        """The registered callback receives a list of per-sample dataset indices."""
+        tar_paths = scaffold_dataset_dir(
+            root=tmp_path, n_shards=2, n_samples_per_shard=8,
+        )
+        spec  = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+        cache = InProcessShardCache(max_gb=1.0)
+        ms    = MixingSource(
+            specs=[spec], batch_size=4, cache=cache,
+            rank=0, world_size=1,
+        )
+
+        received: list[list[int]] = []
+        ms.register_dataset_index_callback(lambda idxs: received.append(list(idxs)))
+
+        ms()  # one batch
+        assert len(received) == 1
+        assert len(received[0]) == 4           # one index per sample
+        assert all(i == 0 for i in received[0])  # only one dataset
+
+    @pytest.mark.slow
+    def test_multiple_callbacks_all_fired(self, tmp_path: Path) -> None:
+        """Multiple callbacks registered must each be called."""
+        tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2)
+        spec  = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+        cache = InProcessShardCache(max_gb=1.0)
+        ms    = MixingSource(
+            specs=[spec], batch_size=4, cache=cache,
+            rank=0, world_size=1,
+        )
+
+        calls_a: list[list[int]] = []
+        calls_b: list[list[int]] = []
+        ms.register_dataset_index_callback(lambda idxs: calls_a.append(list(idxs)))
+        ms.register_dataset_index_callback(lambda idxs: calls_b.append(list(idxs)))
+
+        ms()
+        assert len(calls_a) == 1
+        assert len(calls_b) == 1
+
+    def test_register_before_first_call_does_not_crash(self, tmp_path: Path) -> None:
+        """Registering a callback before any call must not raise."""
+        tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
+        spec  = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+        cache = InProcessShardCache(max_gb=1.0)
+        ms    = MixingSource(
+            specs=[spec], batch_size=4, cache=cache,
+            rank=0, world_size=1,
+        )
+        ms.register_dataset_index_callback(lambda _: None)  # must not raise
 
 
 # ══════════════════════════════════════════════════════════════════════════════

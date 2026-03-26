@@ -7,7 +7,6 @@ requires-python = ">=3.12"
 
 dependencies = [
     # ── Core ──────────────────────────────────────────────────────────────────
-    # ~= pins the minor version: allows bugfix releases, blocks major changes.
     "torch~=2.10",
     "torchvision~=0.25",
     "numpy~=2.0",
@@ -135,4 +134,11 @@ ignore = [
     "EM101",
     "D401",
 ]
-"*scripts/*.py" = ["ALL"]
+"scripts/*.py" = ["ALL"]
+"stubs/*.pyi"  = ["ALL"]
+
+# ── ty static type checker ────────────────────────────────────────────────────
+# stubPath tells ty where to find .pyi stubs for packages that don't ship
+# their own (dino_datasets and dino_env are reflected via scripts/gen_stubs.py).
+[tool.ty]
+stub-path = "stubs"

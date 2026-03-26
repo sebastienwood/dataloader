@@ -26,14 +26,14 @@ Filesystem layout produced by ``scaffold_dataset_dir``
           <name>/
             raw/
             pivot/
+            metadata/          ← matches dino_datasets._walk.DATASET_SKELETON_DIRS
+            subset_selection/
             outputs/
               <strategy>/
                 <split>/
                   shard-000000.tar
                   shard-000000.idx
                   ...
-            metadonnees/
-            subset_selection/
 """
 
 from __future__ import annotations
@@ -44,7 +44,6 @@ import struct
 import sys
 import tarfile
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 from PIL import Image
 
@@ -213,7 +212,7 @@ def write_shard(
 
     tar_path.write_bytes(tar_data)
 
-    # Binary idx: n_samples × little-endian int64 offsets
+    # Binary idx: n_samples × little-endian int64 offsets.
     idx_data = struct.pack(f"<{n_samples}q", *range(0, n_samples * 512, 512))
     idx_path.write_bytes(idx_data)
 
@@ -261,6 +260,10 @@ def scaffold_dataset_dir(
     """Create the full dataset directory hierarchy and populate it with synthetic
     shards.  Returns the list of absolute ``.tar`` paths.
 
+    The subdirectory names match ``dino_datasets._walk.DATASET_SKELETON_DIRS``
+    exactly: ``raw``, ``pivot``, ``metadata``, ``subset_selection``, ``outputs``.
+    Note: the previous ``metadonnees`` name was incorrect and has been removed.
+
     Layout produced::
 
         root/
@@ -269,14 +272,14 @@ def scaffold_dataset_dir(
               <name>/
                 raw/
                 pivot/
+                metadata/
+                subset_selection/
                 outputs/
                   <strategy>/
                     <split>/
                       shard-000000.tar
                       shard-000000.idx
                       ...
-                metadonnees/
-                subset_selection/
 
     Parameters
     ----------
@@ -308,7 +311,9 @@ def scaffold_dataset_dir(
     root         = Path(root)
     dataset_root = root / conf / modality / name
 
-    for subdir in ("raw", "pivot", "metadonnees", "subset_selection"):
+    # Skeleton dirs must match dino_datasets._walk.DATASET_SKELETON_DIRS.
+    # "outputs" is created implicitly via split_dir below.
+    for subdir in ("raw", "pivot", "metadata", "subset_selection"):
         (dataset_root / subdir).mkdir(parents=True, exist_ok=True)
 
     split_dir = dataset_root / "outputs" / strategy / split
@@ -317,10 +322,10 @@ def scaffold_dataset_dir(
     tar_paths: list[str] = []
     for i in range(n_shards):
         tar_path, _ = write_shard(
-            directory           = split_dir,
-            shard_idx           = i,
-            n_samples           = n_samples_per_shard,
-            with_metadata       = with_metadata,
+            directory     = split_dir,
+            shard_idx     = i,
+            n_samples     = n_samples_per_shard,
+            with_metadata = with_metadata,
         )
         tar_paths.append(tar_path)
 
@@ -355,7 +360,6 @@ def make_spec(name: str, tar_paths: list, weight: float = 1.0, **kwargs):
     DatasetSpec
 
     """
-    # Import here to keep the rest of fixtures free of dino_loader deps.
     _src = str(Path(__file__).parent.parent / "src")
     if _src not in sys.path:
         sys.path.insert(0, _src)
