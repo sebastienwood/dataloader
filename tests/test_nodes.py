@@ -2,9 +2,6 @@
 
 Unit tests for :mod:`dino_loader.nodes` (Phase 1 — torchdata integration).
 
-Tests require ``torchdata``; they are skipped automatically when it is
-not installed.
-
 Tests that spin up real ``MixingSource`` threads and perform shard I/O are
 decorated with ``@pytest.mark.slow`` and excluded from the default fast run::
 
@@ -49,16 +46,7 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-try:
-    import torchdata.nodes as tn  # noqa: F401
-    _HAS_TORCHDATA = True
-except ImportError:
-    _HAS_TORCHDATA = False
-
-pytestmark = pytest.mark.skipif(
-    not _HAS_TORCHDATA,
-    reason="torchdata is not installed",
-)
+import torchdata.nodes as tn
 
 import numpy as np  # noqa: E402
 from dino_datasets import DatasetSpec  # noqa: E402
@@ -386,26 +374,3 @@ class TestMaskMapNodeTransform:
         out    = fn(batch)
         assert torch.equal(out.global_crops[0], t)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Import guard
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-class TestNodesImportGuard:
-
-    def test_shardreadernode_raises_without_torchdata(self, monkeypatch) -> None:
-        import dino_loader.nodes as nodes_mod
-        monkeypatch.setattr(nodes_mod, "_HAS_TORCHDATA", False)
-        with pytest.raises(ImportError, match="torchdata"):
-            nodes_mod.ShardReaderNode(
-                specs=[], batch_size=4, cache=None, rank=0, world_size=1,
-            )
-
-    def test_build_reader_graph_raises_without_torchdata(self, monkeypatch) -> None:
-        import dino_loader.nodes as nodes_mod
-        monkeypatch.setattr(nodes_mod, "_HAS_TORCHDATA", False)
-        with pytest.raises(ImportError, match="torchdata"):
-            nodes_mod.build_reader_graph(
-                specs=[], batch_size=4, cache=None, rank=0, world_size=1,
-            )
