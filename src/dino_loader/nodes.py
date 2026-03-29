@@ -27,6 +27,7 @@ Public API
     from dino_loader.nodes import (
         ShardReaderNode,    # stages 1-2: shard I/O + sample mixing
         MetadataNode,       # pops per-sample JSON metadata from the reader
+        MaskMapNode,        # attaches iBOT patch masks to Batch objects
         build_reader_graph, # convenience factory → tn.Loader
     )
 
@@ -49,20 +50,18 @@ Standalone (no DALI)::
         # batch_meta:  list[dict | None]  — parsed JSON sidecars
         ...
 
-With a custom augmentation mapper::
+With ``wrap_loader`` and a custom masking transform::
 
-    from dino_loader.nodes import ShardReaderNode
-    import torchdata.nodes as tn
+    from dino_loader.nodes import MaskMapNode
+    from dino_loader.masking import MaskingGenerator
+    from dino_loader.pipeline_graph import wrap_loader
 
-    reader = ShardReaderNode(specs=specs, batch_size=512, ...)
-    augmented = tn.Mapper(reader, fn=my_aug_fn)
-    prefetched = tn.Prefetcher(augmented, prefetch_factor=4)
-    loader = tn.Loader(prefetched)
-
-    for epoch in range(100):
-        loader.state_dict()   # full graph state
-        for batch in loader:
-            ...
+    gen = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
+    pipeline = (
+        wrap_loader(DINODataLoader(...))
+        .map(MaskMapNode.as_transform(gen))
+        .with_epoch(steps_per_epoch)
+    )
 
 Notes
 -----
@@ -79,13 +78,13 @@ import logging
 from typing import Any
 
 import numpy as np
-import torch 
+import torch
 import torchdata.nodes as tn
 from torchdata.nodes import BaseNode
 from dino_datasets import DatasetSpec
 
+from dino_loader.memory import Batch
 from dino_loader.mixing_source import MixingSource, SamplePredicate
-from dino_loader.memory import Batch 
 
 log = logging.getLogger(__name__)
 
@@ -119,9 +118,8 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
     Args:
         specs: Dataset specifications (shards, weights, quality filters, …).
         batch_size: Number of samples per batch.
-        cache: Shard cache instance (``InProcessShardCache`` or
-            ``NodeSharedShardCache``).  Callers are responsible for
-            construction so that the cache lifecycle is managed externally.
+        cache: Shard cache instance.  Callers are responsible for construction
+            so that the cache lifecycle is managed externally.
         rank: Global rank of this process.
         world_size: Total number of processes.
         num_workers: Extraction thread-pool workers per dataset.
@@ -142,7 +140,6 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
 
     """
 
-    # Keys used in get_state / reset(initial_state=...)
     _KEY_EPOCH   = "epoch"
     _KEY_WEIGHTS = "mixing_weights"
     _KEY_NAMES   = "dataset_names"
@@ -162,6 +159,7 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
         debug_log_keys:      str | None             = None,
         sample_predicate:    SamplePredicate | None = None,
     ) -> None:
+        """Initialise a ShardReaderNode."""
         super().__init__()
 
         self._specs       = specs
@@ -176,7 +174,7 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
         self._debug_log   = debug_log_keys
         self._predicate   = sample_predicate
 
-        self._epoch: int             = 0
+        self._epoch: int                  = 0
         self._source: MixingSource | None = None
 
     # ------------------------------------------------------------------
@@ -184,10 +182,14 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
     # ------------------------------------------------------------------
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
-        """(Re-)initialise the MixingSource, optionally from a saved state."""
+        """(Re-)initialise the MixingSource, optionally from a saved state.
+
+        Args:
+            initial_state: Optional state dict from a prior :meth:`get_state` call.
+
+        """
         super().reset(initial_state)
 
-        # Close previous source if any (epoch boundary).
         if self._source is not None:
             self._source.close()
 
@@ -215,7 +217,12 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
         )
 
     def next(self) -> ReaderBatch:
-        """Return the next batch as (jpeg_list, metadata_list)."""
+        """Return the next batch as (jpeg_list, metadata_list).
+
+        Raises:
+            AssertionError: If called before :meth:`reset`.
+
+        """
         assert self._source is not None, "reset() must be called before next()"
         jpegs = self._source()
         meta  = self._source.pop_last_metadata()
@@ -239,20 +246,34 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
         """Advance to a new epoch (reshuffles shard order).
 
         Must be called before the first ``next()`` of each epoch when using
-        deterministic shuffling.  Safe to call concurrently with ``next()``
-        via ``MixingSource.set_epoch`` which is itself thread-safe.
+        deterministic shuffling.
+
+        Args:
+            epoch: New epoch number.
+
         """
         self._epoch = epoch
         if self._source is not None:
             self._source.set_epoch(epoch)
 
     def set_weights(self, weights: list[float]) -> None:
-        """Update dataset mixing weights (re-normalised automatically)."""
+        """Update dataset mixing weights (re-normalised automatically).
+
+        Args:
+            weights: New raw weights, one per dataset.
+
+        """
         if self._source is not None:
             self._source.set_weights(weights)
 
     def set_weight_by_name(self, name: str, weight: float) -> None:
-        """Update one dataset's weight by name."""
+        """Update one dataset's weight by name.
+
+        Args:
+            name: Dataset name to update.
+            weight: New raw weight.
+
+        """
         if self._source is not None:
             self._source.set_by_name(name, weight)
 
@@ -296,6 +317,7 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
             self._source.set_epoch(saved_epoch)
 
     def __del__(self) -> None:
+        """Close the underlying MixingSource on GC."""
         source = getattr(self, "_source", None)
         if source is not None:
             try:
@@ -310,48 +332,42 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
 
 
 class MetadataNode(BaseNode):  # type: ignore[misc]
-    """Splits a ``ReaderBatch`` stream into separate JPEG and metadata streams.
+    """Splits a ``ReaderBatch`` stream into JPEG and metadata components.
 
     Takes a source that yields ``(jpeg_list, meta_list)`` tuples and
-    re-emits just the ``(jpeg_list, meta_list)`` pair with the metadata
-    stored for retrieval via :meth:`pop_last_metadata`.
-
-    In practice this node is useful when you want to pass only the raw
-    JPEG bytes into a DALI or other augmentation node while retaining the
-    metadata on the side for loss computation or logging.
+    re-emits the same pair while storing metadata for retrieval via
+    :meth:`pop_last_metadata`.
 
     Args:
         source: Upstream node yielding ``ReaderBatch`` tuples.
 
-    Example::
-
-        reader   = ShardReaderNode(...)
-        splitter = MetadataNode(reader)
-        aug_node = tn.Mapper(splitter, fn=lambda jpegs_meta: augment(jpegs_meta[0]))
-        loader   = tn.Loader(aug_node)
-
-        for augmented_batch in loader:
-            meta = splitter.pop_last_metadata()
-            ...
-
     """
 
     def __init__(self, source: BaseNode) -> None:  # type: ignore[type-arg]
+        """Initialise a MetadataNode."""
         super().__init__()
         self._source            = source
         self._last_meta: list[dict[str, Any] | None] = []
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
+        """Reset the upstream source and clear buffered metadata.
+
+        Args:
+            initial_state: Forwarded to the upstream source.
+
+        """
         super().reset(initial_state)
         self._source.reset(initial_state)
         self._last_meta = []
 
     def next(self) -> tuple[list[np.ndarray], list[dict[str, Any] | None]]:
+        """Return the next batch, buffering metadata for later retrieval."""
         jpegs, meta     = self._source.next()
         self._last_meta = meta
         return jpegs, meta
 
     def get_state(self) -> dict[str, Any]:
+        """Delegate state to the upstream source."""
         return self._source.get_state()
 
     def pop_last_metadata(self) -> list[dict[str, Any] | None]:
@@ -360,17 +376,22 @@ class MetadataNode(BaseNode):  # type: ignore[misc]
         return meta
 
 
-class MaskMapNode:
+# ---------------------------------------------------------------------------
+# MaskMapNode
+# ---------------------------------------------------------------------------
+
+
+class MaskMapNode(BaseNode):  # type: ignore[misc]
     """torchdata BaseNode that attaches iBOT patch masks to every batch.
 
-    Sits between the augmentation stage and the training loop.  On each call to
-    ``next()`` it draws a fresh mask from ``MaskingGenerator`` and stores it on
-    ``Batch.masks``.
+    Sits between the augmentation stage and the training loop.  On each call
+    to ``next()`` it draws a fresh mask from ``MaskingGenerator`` and stores
+    it on ``Batch.masks``.
 
-    The mask shape is derived from ``img_size`` and ``patch_size`` at
-    construction time, so the grid dimensions never change during training
-    (even when ``set_resolution`` is called — resolution changes that affect
-    masking should reconstruct the node).
+    The mask shape is derived from the ``MaskingGenerator``'s ``get_shape()``
+    at construction time, so the grid dimensions never change during training
+    even when ``set_resolution`` is called — resolution changes that affect
+    masking should reconstruct this node.
 
     Args:
         source: Upstream node yielding ``Batch`` objects.
@@ -378,20 +399,23 @@ class MaskMapNode:
         num_masking_patches: Number of patches to mask per sample.  When
             ``None`` the generator's own default is used.
 
+    Raises:
+        ValueError: (from ``next()``) If the upstream batch has empty
+            ``global_crops``.  Masking requires a non-empty global crop list
+            to derive the batch dimension.
+
     Example::
 
         from dino_loader.masking import MaskingGenerator
         from dino_loader.nodes import MaskMapNode
         from dino_loader.pipeline_graph import wrap_loader
 
-        gen     = MaskingGenerator(input_size=(16, 16), num_masking_patches=60)
+        gen = MaskingGenerator(input_size=(16, 16), num_masking_patches=60)
         pipeline = wrap_loader(DINODataLoader(...)).map(
             MaskMapNode.as_transform(gen, num_masking_patches=60)
         )
 
     """
-
-    # Provided as a torchdata BaseNode subclass.
 
     def __init__(
         self,
@@ -399,31 +423,56 @@ class MaskMapNode:
         mask_generator,      # MaskingGenerator
         num_masking_patches: int | None = None,
     ) -> None:
-        """Initialise the node."""
+        """Initialise a MaskMapNode.
+
+        Args:
+            source: Upstream node yielding ``Batch`` objects.
+            mask_generator: Configured ``MaskingGenerator``.
+            num_masking_patches: Patches to mask per sample, or ``None`` to
+                use the generator's default.
+
+        """
         super().__init__()
         self._source = source
         self._gen    = mask_generator
         self._n_mask = num_masking_patches
 
-    def reset(self, initial_state=None) -> None:
-        """Reset the upstream source."""
+    def reset(self, initial_state: dict[str, Any] | None = None) -> None:
+        """Reset the upstream source.
+
+        Args:
+            initial_state: Forwarded to the upstream source.
+
+        """
         super().reset(initial_state)
         self._source.reset(initial_state)
 
-    def next(self):
-        """Return the next batch with ``Batch.masks`` populated."""
+    def next(self) -> Batch:
+        """Return the next batch with ``Batch.masks`` populated.
+
+        Raises:
+            ValueError: If the batch has no global crops.
+
+        """
         batch: Batch = self._source.next()
-        n_mask = self._n_mask if self._n_mask is not None else self._gen.num_masking_patches
-        mask   = self._gen(flat=True)                  # shape (H*W,)
-        masks  = torch.from_numpy(mask).unsqueeze(0)   # (1, H*W) bool
-        # Expand to batch dimension if global_crops is populated.
-        if batch.global_crops:
-            b = batch.global_crops[0].shape[0]
-            masks = masks.expand(b, -1)                # (B, H*W)
+        if not batch.global_crops:
+            msg = (
+                "MaskMapNode.next: batch.global_crops is empty. "
+                "MaskMapNode requires at least one global crop to derive the "
+                "batch dimension for mask expansion. "
+                "Ensure the augmentation spec produces global crops."
+            )
+            raise ValueError(msg)
+
+        mask  = self._gen(flat=True)                   # shape (H*W,), bool
+        masks = torch.from_numpy(mask).unsqueeze(0)    # (1, H*W)
+        b     = batch.global_crops[0].shape[0]
+        masks = masks.expand(b, -1)                    # (B, H*W)
+
         batch.masks = masks
         return batch
 
-    def get_state(self):
+    def get_state(self) -> dict[str, Any]:
         """Delegate state to the upstream source."""
         return self._source.get_state()
 
@@ -432,18 +481,23 @@ class MaskMapNode:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def as_transform(mask_generator, num_masking_patches: int | None = None):
+    def as_transform(
+        mask_generator,
+        num_masking_patches: int | None = None,
+    ) -> "Callable[[Batch], Batch]":  # noqa: F821
         """Return a ``Batch → Batch`` callable for use with ``.map()``.
 
-        Useful when you have a ``PostProcessPipeline`` or ``NodePipeline``
-        and want to add masking without building a full ``BaseNode``.
+        Useful when composing a ``NodePipeline`` with masking without building
+        a full ``BaseNode`` graph.
 
         Args:
             mask_generator: A configured ``MaskingGenerator``.
-            num_masking_patches: Patches to mask per sample.
+            num_masking_patches: Patches to mask per sample, or ``None`` to
+                use the generator's default.
 
         Returns:
-            A callable ``(Batch) -> Batch``.
+            A callable ``(Batch) -> Batch``.  Raises ``ValueError`` if the
+            batch has no global crops.
 
         Example::
 
@@ -452,19 +506,24 @@ class MaskMapNode:
             from dino_loader.nodes import MaskMapNode
 
             gen = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
-            pipeline = wrap_loader(loader).map(
-                MaskMapNode.as_transform(gen)
-            )
+            pipeline = wrap_loader(loader).map(MaskMapNode.as_transform(gen))
 
         """
 
-        def _apply(batch):
-            n_mask = num_masking_patches if num_masking_patches is not None else mask_generator.num_masking_patches
-            mask   = mask_generator(flat=True)
-            masks  = torch.from_numpy(mask).unsqueeze(0)
-            if batch.global_crops:
-                b = batch.global_crops[0].shape[0]
-                masks = masks.expand(b, -1)
+        def _apply(batch: Batch) -> Batch:
+            if not batch.global_crops:
+                msg = (
+                    "MaskMapNode.as_transform: batch.global_crops is empty. "
+                    "Masking requires at least one global crop to derive the "
+                    "batch dimension."
+                )
+                raise ValueError(msg)
+
+            mask  = mask_generator(flat=True)
+            masks = torch.from_numpy(mask).unsqueeze(0)
+            b     = batch.global_crops[0].shape[0]
+            masks = masks.expand(b, -1)
+
             return Batch(
                 global_crops = batch.global_crops,
                 local_crops  = batch.local_crops,
@@ -527,7 +586,6 @@ def build_reader_graph(
                 my_augment(jpegs)
 
     """
-
     reader: ShardReaderNode = ShardReaderNode(
         specs               = specs,
         batch_size          = batch_size,

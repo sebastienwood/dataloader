@@ -6,12 +6,13 @@ Used for unit tests, CI, and rapid iteration on laptops. All DALI-specific
 logic lives in DALIBackend; this backend replaces it with PIL + torchvision.
 
 [CPU-AUG-1] build_pipeline dispatches on AugmentationSpec subtype via
-            isinstance chains (replacing structural pattern matching which
-            requires __match_args__ and is less explicit).
+            isinstance chains.
 [CPU-AUG-2] EvalAugSpec → CPUEvalPipeline: deterministic resize + centre-crop.
 [CPU-AUG-3] LeJEPAAugSpec → CPULeJEPAPipeline: context + N target crops.
 [CPU-AUG-4] UserAugSpec → CPUUserAugPipeline: decodes JPEG with PIL,
             normalises, then calls aug_fn.
+[NORM]      All normalisation conversions go through NormStats.to_dali_scale()
+            or NormStats.to_numpy() — no ad-hoc ×255 multiplications.
 """
 
 import contextlib
@@ -35,7 +36,7 @@ from dino_loader.augmentation import (
     LeJEPAAugSpec,
     UserAugSpec,
 )
-from dino_loader.config import DINOAugConfig
+from dino_loader.config import DINOAugConfig, NormStats
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +55,17 @@ except ImportError:
 # Stage 1 — In-process shard cache
 
 class InProcessShardCache:
-    """Shard cache backed by an in-process LRU dict."""
+    """Shard cache backed by an in-process LRU dict.
+
+    Args:
+        job_id: Namespace identifier (unused for in-process cache).
+        node_master: Whether this process is the node master (unused).
+        max_gb: Maximum budget in GB.
+        prefetch_window: Prefetch concurrency (unused — no async I/O).
+        timeout_s: Shard read timeout (unused — reads are synchronous).
+        warn_threshold: Utilisation fraction for a warning (unused in tests).
+
+    """
 
     def __init__(
         self,
@@ -65,6 +76,7 @@ class InProcessShardCache:
         timeout_s:       float = 30.0,
         warn_threshold:  float = 0.85,
     ) -> None:
+        """Initialise the in-process shard cache."""
         self._max_bytes      = int(max_gb * (1 << 30))
         self._warn_threshold = warn_threshold
         self._lru:   OrderedDict[str, bytes] = OrderedDict()
@@ -72,9 +84,18 @@ class InProcessShardCache:
         self._lock   = threading.Lock()
 
     def prefetch(self, shard_path: str) -> None:
-        pass
+        """No-op — prefetching is not supported by the in-process cache."""
 
     def get(self, shard_path: str) -> bytes:
+        """Return the raw bytes of a shard, reading from disk if not cached.
+
+        Args:
+            shard_path: Absolute path to the .tar shard file.
+
+        Returns:
+            Raw shard bytes.
+
+        """
         with self._lock:
             if shard_path in self._lru:
                 self._lru.move_to_end(shard_path)
@@ -88,11 +109,21 @@ class InProcessShardCache:
 
     @contextlib.contextmanager
     def get_view(self, shard_path: str) -> Iterator[memoryview]:
+        """Yield a memoryview into the shard bytes.
+
+        Args:
+            shard_path: Absolute path to the .tar shard file.
+
+        Yields:
+            A ``memoryview`` of the raw shard bytes.
+
+        """
         data = self.get(shard_path)
         yield memoryview(data)
 
     @property
     def utilisation(self) -> float:
+        """Current cache utilisation as a fraction in [0, 1]."""
         if self._max_bytes == 0:
             return 0.0
         with self._lock:
@@ -100,10 +131,12 @@ class InProcessShardCache:
 
     @staticmethod
     def _read(path: str) -> bytes:
+        """Read a file synchronously."""
         with open(path, "rb") as f:
             return f.read()
 
     def _evict_for(self, incoming: int) -> None:
+        """Evict LRU entries until there is room for *incoming* bytes."""
         while self._lru and self._total + incoming > self._max_bytes:
             _, evicted = self._lru.popitem(last=False)
             self._total -= len(evicted)
@@ -117,6 +150,7 @@ def _random_resized_crop(
     scale: tuple[float, float],
     ratio: tuple[float, float] = (3 / 4, 4 / 3),
 ) -> Image.Image:
+    """Apply a random resized crop to *img*."""
     if HAS_TV:
         return TV.RandomResizedCrop(
             size          = size,
@@ -141,6 +175,7 @@ def _random_resized_crop(
 
 
 def _center_crop(img: Image.Image, size: int) -> Image.Image:
+    """Centre-crop *img* to *size* × *size*."""
     if HAS_TV:
         return TV.CenterCrop(size)(img)
     w, h = img.size
@@ -149,6 +184,7 @@ def _center_crop(img: Image.Image, size: int) -> Image.Image:
 
 
 def _resize_shorter(img: Image.Image, size: int) -> Image.Image:
+    """Resize *img* so its shorter side equals *size*."""
     if HAS_TV:
         return TV.Resize(size, interpolation=TV.InterpolationMode.BICUBIC)(img)
     w, h  = img.size
@@ -164,6 +200,7 @@ def _color_jitter(
     hue:        float,
     prob:       float,
 ) -> Image.Image:
+    """Randomly apply colour jitter with probability *prob*."""
     if random.random() > prob:
         return img
     if HAS_TV:
@@ -173,7 +210,7 @@ def _color_jitter(
             saturation=saturation,
             hue=hue,
         )(img)
-    from PIL import ImageEnhance
+    from PIL import ImageEnhance  # noqa: PLC0415
     ops = [
         (ImageEnhance.Brightness, brightness),
         (ImageEnhance.Contrast,   contrast),
@@ -191,6 +228,7 @@ def _gaussian_blur(
     sigma_max: float,
     prob:      float,
 ) -> Image.Image:
+    """Randomly apply Gaussian blur with probability *prob*."""
     if random.random() > prob:
         return img
     sigma = random.uniform(sigma_min, sigma_max)
@@ -201,15 +239,25 @@ def _gaussian_blur(
 
 
 def _to_tensor_normalized(
-    img:  Image.Image,
-    mean: tuple[float, float, float],
-    std:  tuple[float, float, float],
+    img:   Image.Image,
+    stats: NormStats,
 ) -> torch.Tensor:
+    """Convert *img* to a normalised float tensor using *stats*.
+
+    Args:
+        img: PIL image in RGB mode.
+        stats: Normalisation statistics in [0, 1] scale.
+
+    Returns:
+        Float tensor of shape (3, H, W), normalised to zero mean / unit std.
+
+    """
+    mean_arr, std_arr = stats.to_numpy()
     if HAS_TV:
         t = TF.to_tensor(img)
-        return TF.normalize(t, mean=list(mean), std=list(std))
+        return TF.normalize(t, mean=mean_arr.tolist(), std=std_arr.tolist())
     arr = np.asarray(img, dtype=np.float32) / 255.0
-    arr = (arr - np.array(mean)) / np.array(std)
+    arr = (arr - mean_arr) / std_arr
     return torch.from_numpy(arr.transpose(2, 0, 1))
 
 
@@ -221,7 +269,20 @@ def _augment_one(
     blur_prob:  float,
     sol_prob:   float,
 ) -> torch.Tensor:
-    """Apply DINOv2-style augmentation to a single JPEG."""
+    """Apply DINOv2-style augmentation to a single JPEG.
+
+    Args:
+        jpeg_bytes: Raw JPEG bytes.
+        aug_cfg: Augmentation configuration.
+        crop_size: Output crop size in pixels.
+        scale: RandomResizedCrop area scale range.
+        blur_prob: Gaussian blur probability.
+        sol_prob: Solarisation probability.
+
+    Returns:
+        Float tensor of shape (3, crop_size, crop_size).
+
+    """
     try:
         img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
     except Exception:
@@ -239,13 +300,22 @@ def _augment_one(
     img = _gaussian_blur(img, aug_cfg.blur_sigma_min, aug_cfg.blur_sigma_max, blur_prob)
     if sol_prob > 0 and random.random() < sol_prob and HAS_TV:
         img = TF.solarize(img, 128)
-    return _to_tensor_normalized(img, aug_cfg.mean, aug_cfg.std)
+    return _to_tensor_normalized(img, aug_cfg.norm_stats)
 
 
 # CPU pipeline implementations
 
 class CPUAugPipeline:
-    """DINOv2 multi-crop CPU augmentation pipeline."""
+    """DINOv2 multi-crop CPU augmentation pipeline.
+
+    Args:
+        source: MixingSource-compatible callable returning JPEG byte arrays.
+        aug_cfg: DINOv2 augmentation configuration.
+        batch_size: Samples per batch.
+        resolution_src: Thread-safe crop resolution holder.
+        seed: RNG seed for reproducibility.
+
+    """
 
     def __init__(
         self,
@@ -255,6 +325,7 @@ class CPUAugPipeline:
         resolution_src: Any,
         seed:           int = 0,
     ) -> None:
+        """Initialise the CPU augmentation pipeline."""
         self._source         = source
         self._aug_cfg        = aug_cfg
         self._batch_size     = batch_size
@@ -262,6 +333,13 @@ class CPUAugPipeline:
         random.seed(seed)
 
     def run_one_batch(self) -> dict[str, torch.Tensor]:
+        """Produce one augmented batch.
+
+        Returns:
+            Dict mapping view name (``"view_0"``, …) to stacked tensors of
+            shape ``(batch_size, 3, H, W)``.
+
+        """
         global_size_arr, local_size_arr = self._resolution_src()
         global_size = int(global_size_arr)
         local_size  = int(local_size_arr)
@@ -300,14 +378,29 @@ class CPUAugPipeline:
 
 
 class CPUEvalPipeline:
-    """Eval-mode CPU pipeline: deterministic resize + centre-crop, single view."""
+    """Eval-mode CPU pipeline: deterministic resize + centre-crop, single view.
+
+    Args:
+        source: MixingSource-compatible callable.
+        aug_spec: Evaluation augmentation specification.
+        batch_size: Samples per batch.
+
+    """
 
     def __init__(self, source: Any, aug_spec: EvalAugSpec, batch_size: int) -> None:
+        """Initialise the eval pipeline."""
         self._source     = source
         self._aug_spec   = aug_spec
         self._batch_size = batch_size
 
     def run_one_batch(self) -> dict[str, torch.Tensor]:
+        """Produce one deterministic eval batch.
+
+        Returns:
+            Dict with a single ``"view_0"`` entry of shape
+            ``(batch_size, 3, crop_size, crop_size)``.
+
+        """
         jpeg_batch: list[np.ndarray] = self._source()
         assert len(jpeg_batch) == self._batch_size
 
@@ -320,7 +413,7 @@ class CPUEvalPipeline:
                 img = Image.open(io.BytesIO(bytes(jpeg_arr))).convert("RGB")
                 img = _resize_shorter(img, resize_size)
                 img = _center_crop(img, spec.crop_size)
-                t   = _to_tensor_normalized(img, spec.mean, spec.std)
+                t   = _to_tensor_normalized(img, spec.norm_stats)
             except Exception:
                 t = torch.zeros(3, spec.crop_size, spec.crop_size)
             tensors.append(t)
@@ -329,14 +422,28 @@ class CPUEvalPipeline:
 
 
 class CPULeJEPAPipeline:
-    """LeJEPA CPU pipeline: context + N target crops."""
+    """LeJEPA CPU pipeline: context + N target crops.
+
+    Args:
+        source: MixingSource-compatible callable.
+        aug_spec: LeJEPA augmentation specification.
+        batch_size: Samples per batch.
+
+    """
 
     def __init__(self, source: Any, aug_spec: LeJEPAAugSpec, batch_size: int) -> None:
+        """Initialise the LeJEPA pipeline."""
         self._source     = source
         self._aug_spec   = aug_spec
         self._batch_size = batch_size
 
     def run_one_batch(self) -> dict[str, torch.Tensor]:
+        """Produce one LeJEPA batch.
+
+        Returns:
+            Dict with ``"context"`` and ``"target_N"`` entries.
+
+        """
         jpeg_batch: list[np.ndarray] = self._source()
         assert len(jpeg_batch) == self._batch_size
 
@@ -357,24 +464,39 @@ class CPULeJEPAPipeline:
             ctx = _color_jitter(ctx, 0.8, 0.8, 0.8, 0.2, 0.8)
             if random.random() < 0.5:
                 ctx = ctx.transpose(Image.FLIP_LEFT_RIGHT)
-            output["context"].append(_to_tensor_normalized(ctx, spec.mean, spec.std))
+            output["context"].append(_to_tensor_normalized(ctx, spec.norm_stats))
 
             for i in range(spec.n_target_views):
                 tgt = _random_resized_crop(img, spec.target_crop_size, spec.target_scale)
-                output[f"target_{i}"].append(_to_tensor_normalized(tgt, spec.mean, spec.std))
+                output[f"target_{i}"].append(_to_tensor_normalized(tgt, spec.norm_stats))
 
         return {k: torch.stack(v) for k, v in output.items()}
 
 
 class CPUUserAugPipeline:
-    """CPU pipeline for UserAugSpec: decode → normalise → user aug_fn."""
+    """CPU pipeline for UserAugSpec: decode → normalise → user aug_fn.
+
+    Args:
+        source: MixingSource-compatible callable.
+        aug_spec: User augmentation specification.
+        batch_size: Samples per batch.
+
+    """
 
     def __init__(self, source: Any, aug_spec: UserAugSpec, batch_size: int) -> None:
+        """Initialise the user augmentation pipeline."""
         self._source     = source
         self._aug_spec   = aug_spec
         self._batch_size = batch_size
 
     def run_one_batch(self) -> dict[str, torch.Tensor]:
+        """Produce one batch via the user aug_fn.
+
+        Returns:
+            Dict mapping view names (as defined in ``aug_spec.output_map``)
+            to batched tensors.
+
+        """
         jpeg_batch: list[np.ndarray] = self._source()
         assert len(jpeg_batch) == self._batch_size
 
@@ -385,7 +507,7 @@ class CPUUserAugPipeline:
             try:
                 img = Image.open(io.BytesIO(bytes(jpeg_arr))).convert("RGB")
                 img = _resize_shorter(img, spec.decode_size)
-                t   = _to_tensor_normalized(img, spec.mean, spec.std)
+                t   = _to_tensor_normalized(img, spec.norm_stats)
             except Exception:
                 t = torch.zeros(3, spec.decode_size, spec.decode_size)
             tensors.append(t)
@@ -395,17 +517,32 @@ class CPUUserAugPipeline:
 
 
 class CPUPipelineIterator:
-    """Wraps any CPU*Pipeline in the DALIGenericIterator API."""
+    """Wraps any CPU*Pipeline in the DALIGenericIterator API.
+
+    Args:
+        pipeline: Any CPU pipeline with a ``run_one_batch()`` method.
+        output_map: Ordered list of view names.
+        batch_size: Samples per batch.
+
+    """
 
     def __init__(self, pipeline: Any, output_map: list[str], batch_size: int) -> None:
+        """Initialise the iterator wrapper."""
         self._pipe       = pipeline
         self._output_map = output_map
         self._exhausted  = False
 
     def __iter__(self) -> "CPUPipelineIterator":
+        """Return self."""
         return self
 
     def __next__(self) -> list[dict[str, torch.Tensor]]:
+        """Return one batch in DALIGenericIterator-compatible format.
+
+        Raises:
+            StopIteration: When the underlying source is exhausted.
+
+        """
         if self._exhausted:
             raise StopIteration
         try:
@@ -415,32 +552,71 @@ class CPUPipelineIterator:
             raise
 
     def reset(self) -> None:
+        """Reset the exhausted flag (does not rewind the source)."""
         self._exhausted = False
 
 
 # Null H2D / FP8 stubs
 
 class NullH2DStream:
+    """No-op H2D stream for the CPU backend.
+
+    Args:
+        device: Target device (CPU).
+        topo: Cluster topology (accepted for API compatibility, not used).
+
+    """
+
     def __init__(self, device: torch.device, topo: Any) -> None:
+        """Initialise the null stream."""
         self._device = device
 
     @contextlib.contextmanager
     def transfer(
         self, cpu_batch: dict[str, list[torch.Tensor]],
     ) -> Iterator[dict[str, list[torch.Tensor]]]:
+        """Yield the batch unchanged (no-op H2D transfer).
+
+        Args:
+            cpu_batch: Dict of tensor lists.
+
+        Yields:
+            The same dict unchanged.
+
+        """
         yield cpu_batch
 
     def send(
         self, cpu_batch: dict[str, list[torch.Tensor]],
     ) -> dict[str, list[torch.Tensor]]:
+        """Return the batch unchanged.
+
+        Args:
+            cpu_batch: Dict of tensor lists.
+
+        Returns:
+            The same dict unchanged.
+
+        """
         return cpu_batch
 
     def wait(self) -> None:
-        pass
+        """No-op."""
 
 
 class NullFP8Formatter:
+    """Identity FP8 formatter for the CPU backend (TE not available)."""
+
     def quantise(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Return *tensor* unchanged.
+
+        Args:
+            tensor: Input tensor.
+
+        Returns:
+            The same tensor, unmodified.
+
+        """
         return tensor
 
 
@@ -448,6 +624,11 @@ class NullFP8Formatter:
 
 @dataclass
 class StubClusterTopology:
+    """Minimal cluster topology for the CPU backend (no GPU, no network).
+
+    All fields default to values appropriate for a CPU-only test environment.
+    """
+
     nvlink_gen:             int  = 0
     nvlink_lanes_per_gpu:   int  = 0
     gpus_per_nvlink_domain: int  = 1
@@ -460,15 +641,33 @@ class StubClusterTopology:
 
     @property
     def is_nvl72(self) -> bool:
+        """Always False for the CPU stub."""
+        return False
+
+    @property
+    def is_grace_blackwell(self) -> bool:
+        """Always False for the CPU stub."""
         return False
 
     @property
     def label(self) -> str:
+        """Human-readable topology label."""
         return "CPU-stub"
 
 
 @dataclass
 class StubDistribEnv:
+    """Minimal distributed environment for the CPU backend.
+
+    Args:
+        rank: Global rank (default 0).
+        world_size: Total number of ranks (default 1).
+        local_rank: Local rank (default 0).
+        local_world_size: Ranks per node (default 1).
+        topology: Cluster topology (defaults to ``StubClusterTopology``).
+
+    """
+
     rank:             int                        = 0
     world_size:       int                        = 1
     local_rank:       int                        = 0
@@ -476,6 +675,7 @@ class StubDistribEnv:
     topology:         StubClusterTopology | None = None
 
     def __post_init__(self) -> None:
+        """Set a default topology if none was provided."""
         if self.topology is None:
             self.topology = StubClusterTopology()
 
@@ -487,14 +687,17 @@ class CPUBackend:
 
     @property
     def name(self) -> str:
+        """Backend name."""
         return "cpu"
 
     @property
     def supports_fp8(self) -> bool:
+        """FP8 is not supported by the CPU backend."""
         return False
 
     @property
     def supports_gpu(self) -> bool:
+        """GPU is not used by the CPU backend."""
         return False
 
     def build_shard_cache(
@@ -507,6 +710,21 @@ class CPUBackend:
         warn_threshold:  float = 0.85,
         **kwargs: Any,
     ) -> InProcessShardCache:
+        """Build an in-process shard cache.
+
+        Args:
+            job_id: Cache namespace (unused).
+            node_master: Whether this is the node master (unused).
+            max_gb: Maximum cache size in GB.
+            prefetch_window: Prefetch concurrency (unused).
+            timeout_s: Read timeout (unused).
+            warn_threshold: Utilisation warning threshold (unused).
+            **kwargs: Additional arguments (ignored for compatibility).
+
+        Returns:
+            An ``InProcessShardCache`` instance.
+
+        """
         return InProcessShardCache(
             job_id          = job_id,
             node_master     = node_master,
@@ -533,7 +751,31 @@ class CPUBackend:
         fuse_normalization: bool        = False,
         dali_fp8_output:    bool        = False,
     ) -> Any:
-        """Dispatch to the appropriate CPU pipeline based on aug_spec type."""
+        """Dispatch to the appropriate CPU pipeline based on aug_spec type.
+
+        Args:
+            source: MixingSource-compatible callable.
+            aug_spec: Augmentation specification.
+            aug_cfg: Ignored — the CPU backend reads aug_cfg from aug_spec.
+            batch_size: Samples per batch.
+            num_threads: Ignored (single-threaded CPU augmentation).
+            device_id: Ignored (CPU-only).
+            resolution_src: ResolutionSource for dynamic crop sizes.
+            hw_decoder_load: Ignored (no HW decoder on CPU).
+            cpu_queue: Ignored.
+            gpu_queue: Ignored.
+            seed: RNG seed.
+            specs: Ignored.
+            fuse_normalization: Ignored (no DALI graph).
+            dali_fp8_output: Ignored (no FP8 on CPU).
+
+        Returns:
+            A CPU pipeline instance with a ``run_one_batch()`` method.
+
+        Raises:
+            TypeError: If *aug_spec* is an unrecognised type.
+
+        """
         if isinstance(aug_spec, DinoV2AugSpec):
             log.info("CPUBackend: DinoV2AugSpec pipeline (batch=%d)", batch_size)
             return CPUAugPipeline(
@@ -570,6 +812,18 @@ class CPUBackend:
         output_map: list[str],
         batch_size: int,
     ) -> CPUPipelineIterator:
+        """Wrap a CPU pipeline in the DALIGenericIterator-compatible API.
+
+        Args:
+            pipeline: A CPU pipeline with a ``run_one_batch()`` method.
+            aug_spec: Augmentation specification (used to derive output_map).
+            output_map: Ordered list of view names.
+            batch_size: Samples per batch.
+
+        Returns:
+            A ``CPUPipelineIterator`` instance.
+
+        """
         return CPUPipelineIterator(
             pipeline   = pipeline,
             output_map = output_map,
@@ -577,9 +831,25 @@ class CPUBackend:
         )
 
     def build_h2d_stream(self, device: torch.device, topo: Any) -> NullH2DStream:
+        """Build a no-op H2D stream.
+
+        Args:
+            device: Target device.
+            topo: Cluster topology (unused).
+
+        Returns:
+            A ``NullH2DStream`` instance.
+
+        """
         return NullH2DStream(device=device, topo=topo)
 
     def build_fp8_formatter(self) -> NullFP8Formatter:
+        """Build an identity FP8 formatter.
+
+        Returns:
+            A ``NullFP8Formatter`` instance.
+
+        """
         return NullFP8Formatter()
 
     def init_distributed(
@@ -590,6 +860,19 @@ class CPUBackend:
         local_world_size: int = 1,
         force_topology:   str | None = None,
     ) -> StubDistribEnv:
+        """Return a minimal distributed environment stub.
+
+        Args:
+            rank: Global rank.
+            world_size: Total number of ranks.
+            local_rank: Local rank.
+            local_world_size: Ranks per node.
+            force_topology: Ignored (no topology detection on CPU).
+
+        Returns:
+            A ``StubDistribEnv`` instance.
+
+        """
         return StubDistribEnv(
             rank             = rank,
             world_size       = world_size,

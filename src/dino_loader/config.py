@@ -14,6 +14,8 @@ Changes
 [CFG-B4]  use_fp8_output validates TE presence at construction time.
 [CFG-M4]  heartbeat_stale_s configurable (default 300 s).
 [CFG-ARCH3] prometheus_port — opt-in Prometheus metrics endpoint.
+[CFG-NORM] NormStats dataclass — canonical normalisation stats with
+           to_dali_scale() helper, eliminating ad-hoc ×255 conversions.
 
 Queue sizing note
 -----------------
@@ -29,6 +31,115 @@ dali_num_threads=8.
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# NormStats — canonical per-dataset normalisation statistics
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NormStats:
+    """Per-channel normalisation statistics in [0, 1] float32 scale.
+
+    All internal storage uses the [0, 1] convention (matching PyTorch
+    torchvision defaults).  Conversions to other scales (e.g. DALI's [0, 255]
+    convention) are performed explicitly via the helper methods below,
+    eliminating ad-hoc ``× 255`` multiplications scattered across the codebase.
+
+    Attributes:
+        mean: Per-channel mean in [0, 1].  Shape: (3,).
+        std: Per-channel std in [0, 1].  Positive values only.
+
+    Example::
+
+        stats = NormStats.imagenet()
+        mean_dali, std_dali = stats.to_dali_scale()
+        # → ([123.675, 116.28, 103.53], [58.395, 57.12, 57.375])
+
+    """
+
+    mean: tuple[float, float, float]
+    std:  tuple[float, float, float]
+
+    def __post_init__(self) -> None:
+        """Validate that std values are strictly positive."""
+        if any(s <= 0.0 for s in self.std):
+            msg = f"NormStats.std must be strictly positive, got {self.std}."
+            raise ValueError(msg)
+
+    def to_dali_scale(self) -> tuple[list[float], list[float]]:
+        """Return (mean, std) converted to [0, 255] scale for DALI pipelines.
+
+        DALI's ``fn.normalize`` and ``fn.crop_mirror_normalize`` operators
+        expect values in [0, 255] when the input is a decoded uint8 image.
+
+        Returns:
+            A pair ``(mean_255, std_255)`` where each element is a list of
+            three floats in [0, 255].
+
+        """
+        mean_arr = np.array(self.mean, dtype=np.float32) * 255.0
+        std_arr  = np.array(self.std,  dtype=np.float32) * 255.0
+        return mean_arr.tolist(), std_arr.tolist()
+
+    def to_numpy(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return (mean, std) as float32 numpy arrays in [0, 1] scale.
+
+        Returns:
+            A pair ``(mean_arr, std_arr)`` of shape ``(3,)`` float32 arrays.
+
+        """
+        return (
+            np.array(self.mean, dtype=np.float32),
+            np.array(self.std,  dtype=np.float32),
+        )
+
+    @classmethod
+    def imagenet(cls) -> "NormStats":
+        """Standard ImageNet normalisation statistics.
+
+        Returns:
+            ``NormStats`` with ImageNet mean/std (torchvision convention).
+
+        """
+        return cls(
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+        )
+
+    @classmethod
+    def from_config(
+        cls,
+        mean: tuple[float, float, float] | None,
+        std:  tuple[float, float, float] | None,
+        fallback: "NormStats | None" = None,
+    ) -> "NormStats":
+        """Build a ``NormStats`` from optional per-dataset overrides.
+
+        When both *mean* and *std* are ``None``, returns *fallback* (or
+        ``NormStats.imagenet()`` when *fallback* is also ``None``).
+
+        Args:
+            mean: Per-channel mean or ``None`` to use the fallback.
+            std: Per-channel std or ``None`` to use the fallback.
+            fallback: Stats to use when no per-dataset values are provided.
+
+        Returns:
+            A ``NormStats`` instance with the resolved values.
+
+        """
+        base = fallback if fallback is not None else cls.imagenet()
+        resolved_mean = mean if mean is not None else base.mean
+        resolved_std  = std  if std  is not None else base.std
+        return cls(mean=resolved_mean, std=resolved_std)
+
+
+# ---------------------------------------------------------------------------
+# DINOAugConfig
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -55,8 +166,8 @@ class DINOAugConfig:
             global_crop_size.
         max_local_crop_size: nvjpeg pre-allocation ceiling. Defaults to
             local_crop_size.
-        mean: Per-channel normalisation mean (ImageNet defaults).
-        std: Per-channel normalisation std (ImageNet defaults).
+        mean: Per-channel normalisation mean in [0, 1] (ImageNet defaults).
+        std: Per-channel normalisation std in [0, 1] (ImageNet defaults).
 
     """
 
@@ -93,6 +204,7 @@ class DINOAugConfig:
     std:  tuple[float, float, float] = (0.229, 0.224, 0.225)
 
     def __post_init__(self) -> None:
+        """Validate and normalise fields after construction."""
         if self.max_global_crop_size == 0:
             self.max_global_crop_size = self.global_crop_size
         if self.max_local_crop_size == 0:
@@ -113,8 +225,21 @@ class DINOAugConfig:
         """Total number of crops (global + local)."""
         return self.n_global_crops + self.n_local_crops
 
+    @property
+    def norm_stats(self) -> NormStats:
+        """Global normalisation statistics as a ``NormStats`` instance."""
+        return NormStats(mean=self.mean, std=self.std)
+
     def crop_size_at_epoch(self, epoch: int) -> int:
-        """Return the global crop size dictated by the resolution schedule."""
+        """Return the global crop size dictated by the resolution schedule.
+
+        Args:
+            epoch: Current training epoch (0-indexed).
+
+        Returns:
+            The global crop size in pixels for this epoch.
+
+        """
         if not self.resolution_schedule:
             return self.global_crop_size
         size = self.global_crop_size
@@ -122,6 +247,11 @@ class DINOAugConfig:
             if epoch >= sched_epoch:
                 size = sched_size
         return size
+
+
+# ---------------------------------------------------------------------------
+# LoaderConfig
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -151,10 +281,13 @@ class LoaderConfig:
         checkpoint_every_steps: Checkpoint frequency (rank 0 only).
         force_topology: Override topology detection: "pcie" | None.
         seed: Base random seed.
-        debug_log_keys: Path to per-sample key audit log (disable in production).
+        debug_log_keys: Path to per-sample key audit log (disable in production;
+            no size limit — use only for short one-shot debug sessions).
         stall_timeout_s: Seconds before raising on no batches. 0 = disabled.
         shm_warn_threshold: /dev/shm utilisation fraction that triggers a warning.
         prometheus_port: If set, start a prometheus_client HTTP server on this port.
+        adaptive_prefetch: Enable adaptive prefetch window PID controller.
+        adaptive_prefetch_target_util: Target /dev/shm utilisation (0, 1].
 
     """
 
@@ -190,7 +323,7 @@ class LoaderConfig:
     force_topology:           str | None = None
     seed:                     int   = 0
 
-    # Debug
+    # Debug — no file rotation; for short one-shot sessions only.
     debug_log_keys:           str | None = None
 
     # Watchdog
@@ -202,7 +335,12 @@ class LoaderConfig:
     # Prometheus metrics endpoint (opt-in)
     prometheus_port:          int | None = None
 
+    # Adaptive prefetch PID controller (opt-in)
+    adaptive_prefetch:              bool  = False
+    adaptive_prefetch_target_util:  float = 0.80
+
     def __post_init__(self) -> None:
+        """Validate all fields at construction time."""
         if self.use_fp8_output:
             try:
                 import transformer_engine.pytorch  # noqa: F401, PLC0415
@@ -253,6 +391,13 @@ class LoaderConfig:
             )
             raise ValueError(msg)
 
+        if self.adaptive_prefetch and not (0.0 < self.adaptive_prefetch_target_util <= 1.0):
+            msg = (
+                f"LoaderConfig: adaptive_prefetch_target_util must be in (0, 1], "
+                f"got {self.adaptive_prefetch_target_util}."
+            )
+            raise ValueError(msg)
+
         if self.prometheus_port is not None:
             if not (1 <= self.prometheus_port <= 65535):
                 msg = (
@@ -275,9 +420,22 @@ class LoaderConfig:
 
     @classmethod
     def from_dict(cls, d: dict) -> "LoaderConfig":
-        """Deserialise from a plain dict, ignoring unknown keys."""
+        """Deserialise from a plain dict, ignoring unknown keys.
+
+        Args:
+            d: Dictionary previously produced by ``to_dict()``.
+
+        Returns:
+            A ``LoaderConfig`` instance with the values from *d*.
+
+        """
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
+
+
+# ---------------------------------------------------------------------------
+# CheckpointState
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -292,7 +450,12 @@ class CheckpointState:
     local_crop_size:  int = 96
 
     def save(self, path: Path) -> None:
-        """Write atomically via a .tmp file with SHA-256 integrity envelope."""
+        """Write atomically via a .tmp file with SHA-256 integrity envelope.
+
+        Args:
+            path: Destination file path (must be on a POSIX-rename-atomic filesystem).
+
+        """
         import hashlib  # noqa: PLC0415
         payload      = asdict(self)
         payload_json = json.dumps(payload, indent=2)
@@ -315,14 +478,36 @@ class CheckpointState:
 
     @classmethod
     def from_dict(cls, d: dict) -> "CheckpointState":
-        """Deserialise from a plain dict, ignoring unknown keys."""
+        """Deserialise from a plain dict, ignoring unknown keys.
+
+        Args:
+            d: Dictionary previously produced by ``to_dict()``.
+
+        Returns:
+            A ``CheckpointState`` instance.
+
+        """
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
 
     @classmethod
     def load(cls, path: Path) -> "CheckpointState":
-        """Load and verify checkpoint, supporting both envelope and legacy formats."""
+        """Load and verify checkpoint, supporting both envelope and legacy formats.
+
+        Args:
+            path: Path to the JSON checkpoint file.
+
+        Returns:
+            A ``CheckpointState`` instance.
+
+        Raises:
+            ValueError: If the SHA-256 integrity check fails (envelope format only).
+
+        """
         import hashlib  # noqa: PLC0415
+        import logging  # noqa: PLC0415
+
+        log = logging.getLogger(__name__)
         raw = json.loads(path.read_text())
 
         if "payload" in raw and "sha256" in raw:
@@ -337,7 +522,12 @@ class CheckpointState:
                 raise ValueError(msg)
             data = raw["payload"]
         else:
-            # Legacy flat format — no checksum.
+            # Legacy flat format — no checksum.  Load with a warning.
+            log.warning(
+                "Checkpoint %s uses legacy flat format (no SHA-256 envelope). "
+                "Resave with the current code to upgrade the format.",
+                path,
+            )
             data = raw
 
         data.setdefault("global_crop_size", 224)

@@ -24,6 +24,10 @@ Changes in this version
 
 [M2-FIX]    NormSource thread safety hardened (retained from previous version).
 
+[NORM]      All normalisation stat conversions now go through
+            ``NormStats.to_dali_scale()``, eliminating ad-hoc ``× 255``
+            multiplications scattered across the codebase.
+
 [PL-1..5]   All previous improvements retained.
 """
 
@@ -42,6 +46,7 @@ from dino_loader.augmentation import (
     LeJEPAAugSpec,
     UserAugSpec,
 )
+from dino_loader.config import NormStats
 
 if TYPE_CHECKING:
     from dino_datasets import DatasetSpec
@@ -65,6 +70,9 @@ except ImportError:
 class NormSource:
     """DALI ExternalSource callback that emits per-sample (mean, std) tensors.
 
+    All stats are stored in [0, 1] scale internally and converted to [0, 255]
+    via ``NormStats.to_dali_scale()`` only when returned to the DALI graph.
+
     Thread safety — [M2-FIX]:
         set_dataset_indices() is called from MixingSource's ExternalSource
         callback thread.  DALI calls __call__() from its own prefetch thread.
@@ -79,30 +87,57 @@ class NormSource:
         aug_cfg:  DINOAugConfig,
         specs:    list[DatasetSpec],
     ) -> None:
-        global_mean = np.array(aug_cfg.mean, dtype=np.float32)
-        global_std  = np.array(aug_cfg.std,  dtype=np.float32)
-        self._lookup: list[tuple[np.ndarray, np.ndarray]] = []
+        """Build the per-dataset normalisation lookup table.
+
+        Args:
+            aug_cfg: Global augmentation config providing fallback mean/std.
+            specs: Dataset specifications (may carry per-dataset mean/std).
+
+        """
+        global_stats = aug_cfg.norm_stats  # NormStats in [0,1]
+
+        self._lookup: list[NormStats] = []
         for spec in specs:
-            m = np.array(spec.mean, dtype=np.float32) if spec.mean else global_mean.copy()
-            s = np.array(spec.std,  dtype=np.float32) if spec.std  else global_std.copy()
-            self._lookup.append((m, s))
+            self._lookup.append(
+                NormStats.from_config(
+                    mean     = spec.mean,
+                    std      = spec.std,
+                    fallback = global_stats,
+                )
+            )
 
         self._indices: list[int] = [0]
         self._lock = threading.Lock()
 
     def set_dataset_indices(self, indices: list[int]) -> None:
-        """Called by MixingSource before each batch.  [M2-FIX] Copy-on-write."""
+        """Called by MixingSource before each batch.  [M2-FIX] Copy-on-write.
+
+        Args:
+            indices: Per-sample dataset index for the upcoming batch.
+
+        """
         new_indices = list(indices)
         with self._lock:
             self._indices = new_indices
 
     def __call__(self) -> tuple[list[np.ndarray], list[np.ndarray]]:
-        """Return (means, stds) — one (3,) FLOAT32 array per sample.  [M2-FIX]"""
+        """Return (means, stds) in [0, 255] scale — one (3,) FLOAT32 array per sample.
+
+        Returns explicit numpy copies so the DALI pipeline cannot hold
+        references into the live lookup table.  [M2-FIX]
+        """
         with self._lock:
             indices = self._indices
 
-        means = [np.array(self._lookup[i][0], dtype=np.float32) for i in indices]
-        stds  = [np.array(self._lookup[i][1], dtype=np.float32) for i in indices]
+        means: list[np.ndarray] = []
+        stds:  list[np.ndarray] = []
+
+        for i in indices:
+            stats = self._lookup[i]
+            mean_255, std_255 = stats.to_dali_scale()
+            means.append(np.array(mean_255, dtype=np.float32))
+            stds.append(np.array(std_255,  dtype=np.float32))
+
         return means, stds
 
 
@@ -183,8 +218,6 @@ def build_pipeline(
         case LeJEPAAugSpec():
             return _build_lejpa_pipeline(aug_spec=aug_spec, **common_kwargs)
         case UserAugSpec():
-            # For user-defined augmentation, we build a decode-only pipeline;
-            # the user function is wired in by DALIBackend's iterator wrapper.
             return _build_decode_only_pipeline(aug_spec=aug_spec, **common_kwargs)
         case _:
             msg = (
@@ -195,7 +228,7 @@ def build_pipeline(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DINOv2 multi-crop pipeline (retained, refactored to accept DinoV2AugSpec)
+# DINOv2 multi-crop pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_dinov2_pipeline(
@@ -215,6 +248,8 @@ def _build_dinov2_pipeline(
 ) -> Any:
     """Build the original DINOv2 multi-crop DALI pipeline."""
     n_views = aug_cfg.n_views
+    # Fallback stats in [0,255] for when per-sample fused normalisation is off.
+    global_mean_255, global_std_255 = aug_cfg.norm_stats.to_dali_scale()
 
     @pipeline_def(
         batch_size      = batch_size,
@@ -264,18 +299,20 @@ def _build_dinov2_pipeline(
             )
             sol_prob   = aug_cfg.solarize_prob if (i == 1) else 0.0
             view = _augment_view_dinov2(
-                jpegs           = jpegs,
-                aug_cfg         = aug_cfg,
-                crop_size       = crop_size,
-                scale           = scale,
-                blur_prob       = blur_prob,
-                sol_prob        = sol_prob,
-                seed            = seed + i,
-                hw_decoder_load = hw_decoder_load,
-                means           = means,
-                stds            = stds,
-                dali_fp8_output = dali_fp8_output,
-                name            = f"view_{i}",
+                jpegs            = jpegs,
+                aug_cfg          = aug_cfg,
+                crop_size        = crop_size,
+                scale            = scale,
+                blur_prob        = blur_prob,
+                sol_prob         = sol_prob,
+                seed             = seed + i,
+                hw_decoder_load  = hw_decoder_load,
+                means            = means,
+                stds             = stds,
+                global_mean_255  = global_mean_255,
+                global_std_255   = global_std_255,
+                dali_fp8_output  = dali_fp8_output,
+                name             = f"view_{i}",
             )
             views.append(view)
 
@@ -297,10 +334,33 @@ def _augment_view_dinov2(
     hw_decoder_load: float,
     means,
     stds,
+    global_mean_255: list[float],
+    global_std_255:  list[float],
     dali_fp8_output: bool,
     name:            str,
 ) -> Any:
-    """Build one DINOv2 augmentation branch."""
+    """Build one DINOv2 augmentation branch.
+
+    Args:
+        jpegs: DALI tensor of raw JPEG bytes.
+        aug_cfg: Augmentation configuration.
+        crop_size: DALI scalar for the crop size.
+        scale: RandomResizedCrop area scale range.
+        blur_prob: Gaussian blur probability for this view.
+        sol_prob: Solarisation probability for this view.
+        seed: RNG seed offset for this view.
+        hw_decoder_load: Fraction of decode sent to nvjpeg HW.
+        means: Per-sample mean tensors from NormSource, or None.
+        stds: Per-sample std tensors from NormSource, or None.
+        global_mean_255: Fallback mean in [0, 255].
+        global_std_255: Fallback std in [0, 255].
+        dali_fp8_output: Whether to cast output to FP8.
+        name: Output tensor name.
+
+    Returns:
+        A DALI graph node for this view.
+
+    """
     decoded = fn.decoders.image(
         jpegs,
         device             = "mixed",
@@ -348,14 +408,14 @@ def _augment_view_dinov2(
     )
 
     if means is not None and stds is not None:
+        # Per-sample stats from NormSource (already in [0,255]).
         normalised = fn.normalize(augmented, mean=means, stddev=stds, dtype=types.FLOAT16)
     else:
-        mean_arr = np.array(aug_cfg.mean, dtype=np.float32) * 255.0
-        std_arr  = np.array(aug_cfg.std,  dtype=np.float32) * 255.0
+        # Global fallback stats (pre-converted to [0,255]).
         normalised = fn.normalize(
             augmented,
-            mean   = mean_arr.tolist(),
-            stddev = std_arr.tolist(),
+            mean   = global_mean_255,
+            stddev = global_std_255,
             dtype  = types.FLOAT16,
         )
 
@@ -379,22 +439,21 @@ def _augment_view_dinov2(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_eval_pipeline(
-    source:         Any,
-    aug_spec:       EvalAugSpec,
-    batch_size:     int,
-    num_threads:    int,
-    device_id:      int,
-    resolution_src: Any,  # ignored — eval uses fixed crop_size
+    source:          Any,
+    aug_spec:        EvalAugSpec,
+    batch_size:      int,
+    num_threads:     int,
+    device_id:       int,
+    resolution_src:  Any,  # ignored — eval uses fixed crop_size
     hw_decoder_load: float,
-    cpu_queue:      int,
-    gpu_queue:      int,
-    seed:           int,
+    cpu_queue:       int,
+    gpu_queue:       int,
+    seed:            int,
 ) -> Any:
     """Build the evaluation pipeline: resize-shorter-side + centre-crop."""
-    crop_size = aug_spec.crop_size
-    mean_arr  = (np.array(aug_spec.mean, dtype=np.float32) * 255.0).tolist()
-    std_arr   = (np.array(aug_spec.std,  dtype=np.float32) * 255.0).tolist()
-    interp    = types.INTERP_CUBIC if aug_spec.interpolation == "bicubic" else types.INTERP_LINEAR
+    crop_size          = aug_spec.crop_size
+    mean_255, std_255  = aug_spec.norm_stats.to_dali_scale()
+    interp             = types.INTERP_CUBIC if aug_spec.interpolation == "bicubic" else types.INTERP_LINEAR
 
     @pipeline_def(
         batch_size           = batch_size,
@@ -421,7 +480,6 @@ def _build_eval_pipeline(
             hw_decoder_load = hw_decoder_load,
         )
 
-        # Resize shorter side to crop_size * 256/224 ≈ 1.14× for a clean centre crop.
         resize_size = int(crop_size * 256 / 224)
         resized = fn.resize(
             decoded,
@@ -432,17 +490,17 @@ def _build_eval_pipeline(
 
         cropped = fn.crop(
             resized,
-            crop_h = crop_size,
-            crop_w = crop_size,
+            crop_h     = crop_size,
+            crop_w     = crop_size,
             crop_pos_x = 0.5,
             crop_pos_y = 0.5,
-            device = "gpu",
+            device     = "gpu",
         )
 
         normalised = fn.normalize(
             cropped,
-            mean   = mean_arr,
-            stddev = std_arr,
+            mean   = mean_255,
+            stddev = std_255,
             dtype  = types.FLOAT16,
         )
         return fn.transpose(normalised, perm=[2, 0, 1], name="view_0")
@@ -469,8 +527,7 @@ def _build_lejpa_pipeline(
     seed:            int,
 ) -> Any:
     """Build the LeJEPA pipeline: one context crop + N target crops."""
-    mean_arr = (np.array(aug_spec.mean, dtype=np.float32) * 255.0).tolist()
-    std_arr  = (np.array(aug_spec.std,  dtype=np.float32) * 255.0).tolist()
+    mean_255, std_255 = aug_spec.norm_stats.to_dali_scale()
 
     @pipeline_def(
         batch_size           = batch_size,
@@ -499,7 +556,6 @@ def _build_lejpa_pipeline(
 
         outputs = []
 
-        # Context: large crop with colour jitter (encoder input).
         context = fn.random_resized_crop(
             decoded,
             size        = aug_spec.context_crop_size,
@@ -514,11 +570,10 @@ def _build_lejpa_pipeline(
             hue        = fn.random.uniform(range=(-0.1, 0.1), seed=seed + 3),
         )
         context = fn.flip(context, horizontal=1, vertical=0)
-        context = fn.normalize(context, mean=mean_arr, stddev=std_arr, dtype=types.FLOAT16)
+        context = fn.normalize(context, mean=mean_255, stddev=std_255, dtype=types.FLOAT16)
         context = fn.transpose(context, perm=[2, 0, 1], name="context")
         outputs.append(context)
 
-        # Target crops: small crops, NO colour jitter (preserve reconstruction signal).
         for i in range(aug_spec.n_target_views):
             target = fn.random_resized_crop(
                 decoded,
@@ -527,7 +582,7 @@ def _build_lejpa_pipeline(
                 device      = "gpu",
                 seed        = seed + 10 + i,
             )
-            target = fn.normalize(target, mean=mean_arr, stddev=std_arr, dtype=types.FLOAT16)
+            target = fn.normalize(target, mean=mean_255, stddev=std_255, dtype=types.FLOAT16)
             target = fn.transpose(target, perm=[2, 0, 1], name=f"target_{i}")
             outputs.append(target)
 
@@ -559,8 +614,7 @@ def _build_decode_only_pipeline(
     DALI decodes the JPEG, resizes to ``aug_spec.decode_size``, and normalises.
     The user function is applied outside the DALI graph by the iterator wrapper.
     """
-    mean_arr = (np.array(aug_spec.mean, dtype=np.float32) * 255.0).tolist()
-    std_arr  = (np.array(aug_spec.std,  dtype=np.float32) * 255.0).tolist()
+    mean_255, std_255 = aug_spec.norm_stats.to_dali_scale()
 
     @pipeline_def(
         batch_size           = batch_size,
@@ -595,11 +649,10 @@ def _build_decode_only_pipeline(
 
         normalised = fn.normalize(
             resized,
-            mean   = mean_arr,
-            stddev = std_arr,
+            mean   = mean_255,
+            stddev = std_255,
             dtype  = types.FLOAT16,
         )
-        # Output named "decoded" — the iterator wrapper applies aug_fn on top.
         return fn.transpose(normalised, perm=[2, 0, 1], name="decoded")
 
     pipe = _pipeline_fn()

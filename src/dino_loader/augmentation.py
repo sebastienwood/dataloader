@@ -15,6 +15,13 @@ Early filtering
 ---------------
 ``SamplePredicate`` is called by ``ShardIterator`` before a sample enters
 the DALI pipeline, eliminating GPU decode cost for rejected samples.
+
+Normalisation
+-------------
+All ``AugmentationSpec`` subclasses expose a ``norm_stats`` property that
+returns a ``NormStats`` instance in [0, 1] scale.  Consumers (pipeline.py,
+cpu.py, dynamic_pipeline.py) call ``norm_stats.to_dali_scale()`` to get
+[0, 255] values — no ad-hoc ``× 255`` conversions elsewhere.
 """
 
 import logging
@@ -24,7 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-from dino_loader.config import DINOAugConfig
+from dino_loader.config import DINOAugConfig, NormStats
 
 log = logging.getLogger(__name__)
 
@@ -92,7 +99,14 @@ class AugmentationSpec(ABC):
     def output_map(self) -> list[str]: ...
 
     @property
+    @abstractmethod
+    def norm_stats(self) -> NormStats:
+        """Normalisation statistics for this spec in [0, 1] scale."""
+        ...
+
+    @property
     def n_views(self) -> int:
+        """Total number of output views."""
         return len(self.output_map)
 
     @property
@@ -101,6 +115,7 @@ class AugmentationSpec(ABC):
         return True
 
     def __repr__(self) -> str:
+        """Return a compact string representation."""
         return f"{type(self).__name__}(n_views={self.n_views})"
 
 
@@ -125,7 +140,13 @@ class DinoV2AugSpec(AugmentationSpec):
 
     @property
     def output_map(self) -> list[str]:
+        """Ordered view names produced by this spec."""
         return [f"view_{i}" for i in range(self.aug_cfg.n_views)]
+
+    @property
+    def norm_stats(self) -> NormStats:
+        """Global normalisation statistics from the augmentation config."""
+        return self.aug_cfg.norm_stats
 
 
 @dataclass
@@ -136,8 +157,8 @@ class EvalAugSpec(AugmentationSpec):
 
     Attributes:
         crop_size: Output spatial resolution in pixels.
-        mean: Per-channel normalisation mean.
-        std: Per-channel normalisation std.
+        mean: Per-channel normalisation mean in [0, 1].
+        std: Per-channel normalisation std in [0, 1].
         interpolation: Resize interpolation mode ("bicubic" or "bilinear").
 
     """
@@ -149,9 +170,16 @@ class EvalAugSpec(AugmentationSpec):
 
     @property
     def output_map(self) -> list[str]:
+        """Ordered view names produced by this spec."""
         return ["view_0"]
 
+    @property
+    def norm_stats(self) -> NormStats:
+        """Normalisation statistics for this spec."""
+        return NormStats(mean=self.mean, std=self.std)
+
     def __post_init__(self) -> None:
+        """Validate the interpolation mode."""
         valid = {"bicubic", "bilinear"}
         if self.interpolation not in valid:
             msg = (
@@ -179,8 +207,8 @@ class LeJEPAAugSpec(AugmentationSpec):
         n_target_views: Number of independent target crops per sample.
         context_scale: RandomResizedCrop scale range for the context view.
         target_scale: RandomResizedCrop scale range for target views.
-        mean: Per-channel normalisation mean.
-        std: Per-channel normalisation std.
+        mean: Per-channel normalisation mean in [0, 1].
+        std: Per-channel normalisation std in [0, 1].
 
     """
 
@@ -194,9 +222,16 @@ class LeJEPAAugSpec(AugmentationSpec):
 
     @property
     def output_map(self) -> list[str]:
+        """Ordered view names produced by this spec."""
         return ["context", *[f"target_{i}" for i in range(self.n_target_views)]]
 
+    @property
+    def norm_stats(self) -> NormStats:
+        """Normalisation statistics for this spec."""
+        return NormStats(mean=self.mean, std=self.std)
+
     def __post_init__(self) -> None:
+        """Validate crop scales and target count."""
         if self.n_target_views < 1:
             msg = f"LeJEPAAugSpec.n_target_views must be ≥ 1, got {self.n_target_views}."
             raise ValueError(msg)
@@ -230,28 +265,36 @@ class UserAugSpec(AugmentationSpec):
         output_map: Names of views returned by aug_fn.
         decode_size: Resolution at which DALI decodes before calling aug_fn.
             Should be the largest crop size your function may produce.
-        mean: Per-channel normalisation mean applied before calling aug_fn.
-        std: Per-channel normalisation std.
+        mean: Per-channel normalisation mean in [0, 1] applied before aug_fn.
+        std: Per-channel normalisation std in [0, 1].
         warn_not_dali: Emit a non-DALI performance warning (default True).
 
     """
 
-    aug_fn:       UserAugFn
-    output_map:   list[str]
-    decode_size:  int                         = 256
-    mean:         tuple[float, float, float]  = (0.485, 0.456, 0.406)
-    std:          tuple[float, float, float]  = (0.229, 0.224, 0.225)
-    warn_not_dali: bool                       = True
+    aug_fn:        UserAugFn
+    output_map:    list[str]
+    decode_size:   int                         = 256
+    mean:          tuple[float, float, float]  = (0.485, 0.456, 0.406)
+    std:           tuple[float, float, float]  = (0.229, 0.224, 0.225)
+    warn_not_dali: bool                        = True
 
     @property
     def uses_dali(self) -> bool:
+        """False — the user aug_fn runs outside the DALI graph."""
         return False
 
     @property
     def n_views(self) -> int:
+        """Total number of output views."""
         return len(self.output_map)
 
+    @property
+    def norm_stats(self) -> NormStats:
+        """Normalisation statistics for this spec."""
+        return NormStats(mean=self.mean, std=self.std)
+
     def __post_init__(self) -> None:
+        """Validate fields and emit performance warning."""
         if not callable(self.aug_fn):
             raise TypeError("UserAugSpec.aug_fn must be callable.")
         if not self.output_map:

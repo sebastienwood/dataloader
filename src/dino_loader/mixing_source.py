@@ -17,6 +17,10 @@ DALI ExternalSource callback and per-dataset shard cycling.
              a file opened for append never released the lock, silently
              breaking key logging in multi-rank jobs. Replaced with a
              threading.Lock around writes.
+[MW-API] MixingWeights now has a stable two-argument constructor
+         __init__(names, weights) and a from_specs() classmethod. This
+         separates the DatasetSpec dependency from the weights arithmetic,
+         making it easier to test and reuse.
 """
 
 import logging
@@ -52,13 +56,55 @@ except ImportError:
 
 
 class MixingWeights:
-    """Normalised, thread-safe weight vector for dataset mixing."""
+    """Normalised, thread-safe weight vector for dataset mixing.
 
-    def __init__(self, specs: list[DatasetSpec]) -> None:
-        self.names    = [s.name for s in specs]
-        raw           = [s.weight for s in specs]
+    The constructor accepts plain ``(names, weights)`` primitives. Use the
+    :meth:`from_specs` classmethod to build from a list of ``DatasetSpec``
+    objects.
+
+    Args:
+        names: Ordered list of dataset names.
+        weights: Corresponding raw (un-normalised) weights.  Must be positive
+            and the same length as *names*.
+
+    Example::
+
+        # From primitives
+        mw = MixingWeights(["laion", "imagenet"], [0.7, 0.3])
+
+        # From DatasetSpec objects
+        mw = MixingWeights.from_specs(specs)
+
+    """
+
+    def __init__(self, names: list[str], weights: Sequence[float]) -> None:
+        """Initialise with explicit names and raw weights."""
+        if len(names) != len(weights):
+            msg = (
+                f"MixingWeights: names and weights must have the same length, "
+                f"got {len(names)} names and {len(weights)} weights."
+            )
+            raise ValueError(msg)
+        self.names    = list(names)
         self._lock    = threading.Lock()
-        self._weights = self._normalise(raw)
+        self._weights = self._normalise(list(weights))
+
+    @classmethod
+    def from_specs(cls, specs: list[DatasetSpec]) -> "MixingWeights":
+        """Build a ``MixingWeights`` from a list of ``DatasetSpec`` objects.
+
+        Uses each spec's ``weight`` attribute.
+
+        Args:
+            specs: Dataset specifications; each must have a positive ``weight``.
+
+        Returns:
+            A normalised ``MixingWeights`` instance.
+
+        """
+        names   = [s.name   for s in specs]
+        weights = [s.weight for s in specs]
+        return cls(names, weights)
 
     def get(self) -> list[float]:
         """Return a copy of the current normalised weight vector."""
@@ -66,7 +112,15 @@ class MixingWeights:
             return list(self._weights)
 
     def set(self, weights: Sequence[float]) -> None:
-        """Replace the weight vector (re-normalised automatically)."""
+        """Replace the weight vector (re-normalised automatically).
+
+        Args:
+            weights: New raw weights.  Must match the length of ``names``.
+
+        Raises:
+            ValueError: If *weights* has the wrong length or sums to zero.
+
+        """
         if len(weights) != len(self.names):
             msg = (
                 f"MixingWeights.set: expected {len(self.names)} weights, "
@@ -77,7 +131,16 @@ class MixingWeights:
             self._weights = self._normalise(list(weights))
 
     def set_by_name(self, name: str, weight: float) -> None:
-        """Update one dataset's weight by name (re-normalised automatically)."""
+        """Update one dataset's weight by name (re-normalised automatically).
+
+        Args:
+            name: Name of the dataset to update.
+            weight: New raw weight (will be re-normalised with the others).
+
+        Raises:
+            KeyError: If *name* is not in the weight vector.
+
+        """
         try:
             idx = self.names.index(name)
         except ValueError:
@@ -92,6 +155,7 @@ class MixingWeights:
 
     @staticmethod
     def _normalise(weights: list[float]) -> list[float]:
+        """Normalise a weight vector to sum to 1.0."""
         total = sum(weights)
         if total <= 0:
             msg = f"Weights must sum to a positive number, got {weights}."
@@ -107,12 +171,25 @@ class ResolutionSource:
     """
 
     def __init__(self, global_size: int, local_size: int) -> None:
+        """Initialise with starting crop sizes.
+
+        Args:
+            global_size: Initial global crop size in pixels.
+            local_size: Initial local crop size in pixels.
+
+        """
         self._global = global_size
         self._local  = local_size
         self._lock   = threading.Lock()
 
     def set(self, global_size: int, local_size: int) -> None:
-        """Update both dimensions atomically."""
+        """Update both dimensions atomically.
+
+        Args:
+            global_size: New global crop size in pixels.
+            local_size: New local crop size in pixels.
+
+        """
         with self._lock:
             self._global = global_size
             self._local  = local_size
@@ -137,6 +214,14 @@ class SampleRecord:
         metadata: dict | None = None,
         key:      str         = "",
     ) -> None:
+        """Initialise a sample record.
+
+        Args:
+            jpeg: Raw JPEG bytes.
+            metadata: Parsed JSON sidecar dict, or None if absent.
+            key: WebDataset sample key (e.g. ``"000042"``).
+
+        """
         self.jpeg     = jpeg
         self.metadata = metadata
         self.key      = key
@@ -187,6 +272,25 @@ class ShardIterator:
         min_sample_quality:   float | None = None,
         sample_predicate:     SamplePredicate | None = None,
     ) -> None:
+        """Initialise a ShardIterator.
+
+        Args:
+            spec: Dataset specification providing shards and quality config.
+            cache: Shard cache (``InProcessShardCache`` or ``NodeSharedShardCache``).
+            rank: Global rank of this process.
+            world_size: Total number of ranks.
+            prefetch_ahead: Number of shards to prefetch ahead in the I/O thread.
+            num_workers: Number of extraction worker threads.
+            seed: Base RNG seed.
+            device_id: Local GPU index (unused, reserved for future use).
+            shuffle_buffer_size: In-memory shuffle reservoir depth.
+            min_sample_quality: Hard quality floor; overrides spec value when set.
+            sample_predicate: Optional early filter evaluated before JPEG decode.
+
+        Raises:
+            RuntimeError: If no shards are assigned to this rank.
+
+        """
         self._name             = spec.name
         self._cache            = cache
         self._seed             = seed
@@ -259,19 +363,19 @@ class ShardIterator:
         self._io_rng = np.random.default_rng(seed + rank)
         self._shard_cycle = self._make_shard_cycle(self._io_rng)
 
+        # Start threads only after all state is initialised to avoid races.
         self._io_thread = threading.Thread(
             target=self._io_loop,
             name=f"shard-io-{self._name}",
             daemon=True,
         )
-        self._io_thread.start()
-
         self._executor = ThreadPoolExecutor(
             max_workers        = self._num_workers,
             thread_name_prefix = f"shard-extract-{self._name}",
         )
         self._extract_futures: deque = deque()
 
+        self._io_thread.start()
         for _ in range(self._num_workers):
             self._submit_extract()
 
@@ -290,6 +394,10 @@ class ShardIterator:
 
         [FIX-CYCLE] Signals the I/O thread to stop its current cycle, waits
         for acknowledgement, then atomically replaces the generator.
+
+        Args:
+            epoch: New epoch number (used to derive a deterministic RNG seed).
+
         """
         # Signal the I/O thread to pause.
         self._stop_io_event.set()
@@ -357,8 +465,9 @@ class ShardIterator:
     # Stage A: I/O loop
 
     def _io_loop(self) -> None:
+        """Entry point for the I/O daemon thread."""
         try:
-            import contextvars
+            import contextvars  # noqa: PLC0415
             ctx = contextvars.copy_context()
             ctx.run(self._io_loop_inner)
         except Exception as exc:
@@ -368,6 +477,7 @@ class ShardIterator:
             )
 
     def _io_loop_inner(self) -> None:
+        """Inner loop body, executed inside a copied context."""
         while not self._closed:
             # [FIX-CYCLE] Acknowledge stop request before yielding from generator.
             if self._stop_io_event.is_set():
@@ -425,12 +535,14 @@ class ShardIterator:
         path: str,
         gen: Generator,
     ) -> Generator[str, None, None]:
+        """Yield *path* first, then all items from *gen*."""
         yield path
         yield from gen
 
     # Stage B: extraction workers
 
     def _submit_extract(self) -> None:
+        """Submit a new extraction task to the thread pool."""
         if self._closed:
             return
         fut = self._executor.submit(self._extract_worker)
@@ -442,7 +554,7 @@ class ShardIterator:
         [FIX-RNG] Each worker uses an independent RNG seeded from the thread
         identity, avoiding shared mutable state across worker threads.
         """
-        from dino_loader.datasets.utils import _extract_jpegs_with_meta
+        from dino_loader.datasets.utils import _extract_jpegs_with_meta  # noqa: PLC0415
 
         # Per-worker RNG — no shared state between threads.
         worker_rng = np.random.default_rng(
@@ -537,18 +649,34 @@ class MixingSource:
         debug_log_keys:      str | None = None,
         sample_predicate:    SamplePredicate | None = None,
     ) -> None:
+        """Initialise MixingSource.
+
+        Args:
+            specs: Ordered list of dataset specifications.
+            batch_size: Samples per batch.
+            cache: Shard cache shared across all datasets.
+            rank: Global rank of this process.
+            world_size: Total number of ranks.
+            num_workers: Extraction workers per dataset.
+            seed: Base RNG seed.
+            device_id: Local GPU index (forwarded to ShardIterator).
+            shuffle_buffer_size: Per-shard reservoir depth.
+            debug_log_keys: Path to per-sample key audit log (no rotation —
+                for short debug sessions only).
+            sample_predicate: Optional early filter applied before decode.
+
+        """
         self._batch_size  = batch_size
         self._debug_log   = debug_log_keys
         self._lock        = threading.Lock()
 
-        # [FIX-RNG] Separate lock for the RNG to avoid conflating it with the
-        # metadata lock, minimising contention on the hot path.
+        # [FIX-RNG] Separate lock for the RNG to minimise hot-path contention.
         self._rng      = np.random.default_rng(seed + rank * 1000 + 7)
         self._rng_lock = threading.Lock()
 
         self._ds_index_callbacks: list[Callable[[list[int]], None]] = []
 
-        self._weights = MixingWeights(specs)
+        self._weights = MixingWeights.from_specs(specs)
         self.names    = self._weights.names
 
         self._iters: list[ShardIterator] = []
@@ -619,8 +747,6 @@ class MixingSource:
         if HAS_METRICS:
             reg = get_registry()
             if reg is not None:
-                # MIXING_QUEUE_DEPTH is an absolute gauge (current queue depth),
-                # not a cumulative counter. Reset to 0 then add the current value.
                 m = reg.metrics
                 if m is not None:
                     total_depth = sum(it.reservoir_size for it in self._iters)
@@ -639,28 +765,52 @@ class MixingSource:
         self,
         cb: Callable[[list[int]], None],
     ) -> None:
-        """Register a callback that receives per-sample dataset indices."""
+        """Register a callback that receives per-sample dataset indices.
+
+        Args:
+            cb: Callable invoked after every batch with a list of dataset
+                indices, one per sample.
+
+        """
         self._ds_index_callbacks.append(cb)
 
     def set_epoch(self, epoch: int) -> None:
-        """Reset all ShardIterators for a new epoch."""
+        """Reset all ShardIterators for a new epoch.
+
+        Args:
+            epoch: New epoch number.
+
+        """
         for it in self._iters:
             it.reset_epoch(epoch)
 
     def set_weights(self, weights: Sequence[float]) -> None:
-        """Update mixing weights (re-normalised automatically)."""
+        """Update mixing weights (re-normalised automatically).
+
+        Args:
+            weights: New raw weights, one per dataset.
+
+        """
         self._weights.set(weights)
 
     def set_by_name(self, name: str, weight: float) -> None:
-        """Update one dataset's weight by name."""
+        """Update one dataset's weight by name.
+
+        Args:
+            name: Dataset name to update.
+            weight: New raw weight.
+
+        """
         self._weights.set_by_name(name, weight)
 
     @property
     def current_weights(self) -> list[float]:
+        """Current normalised mixing weights."""
         return self._weights.get()
 
     @property
     def dataset_names(self) -> list[str]:
+        """Ordered list of dataset names."""
         return list(self.names)
 
     def close(self) -> None:
