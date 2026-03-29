@@ -19,7 +19,7 @@ from   := "dino_loader"
 # Preview or apply a package rename.
 # NEW is the target snake_case name (e.g. my_datasets).
 # Pass --apply as extra to execute; dry-run otherwise.
-# Pass --from <old> to override the current package name (default: dino_datasets).
+# Pass --from <old> to override the current package name (default: dino_loader).
 #
 # Examples:
 #   just rename my_datasets
@@ -30,9 +30,21 @@ rename new *extra:
 
 # ── Development ───────────────────────────────────────────────────────────────
 
-# Install the package in editable mode with dev extras.
+# Install the package in editable mode with dev extras, then regenerate stubs.
+# Always run this instead of bare `uv sync` so stubs stay in sync with the
+# installed versions of dino_datasets and dino_env.
 install:
     uv sync --all-groups
+    just gen-stubs
+
+# Regenerate typed stubs for dino_datasets and dino_env from the installed
+# packages.  Run after `uv sync` whenever those packages change.
+gen-stubs:
+    uv run python scripts/gen_stubs.py
+
+# Check that committed stubs match the installed packages (used in CI).
+check-stubs:
+    uv run python scripts/gen_stubs.py --check
 
 # Run the full test suite.
 test:

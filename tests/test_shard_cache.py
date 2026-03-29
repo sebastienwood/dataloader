@@ -18,12 +18,17 @@ NodeSharedShardCache._write
 NodeSharedShardCache eviction
 - _evict_for_locked raises after max retries when all slots are referenced [B2]
 
+_HeartbeatWriter
+- File content is "pid:job_id" format [FIX-HB]
+- Stale detection uses both PID liveness and job_id
+
 Heartbeat stale_s
 - Configurable via LoaderConfig and forwarded to NodeSharedShardCache [M4]
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -36,6 +41,7 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+# write_shm_file is defined in the dino_loader test fixtures.
 from tests.fixtures import write_shm_file
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -188,6 +194,76 @@ class TestNodeSharedShardCacheWrite:
             NodeSharedShardCache._write(shm, b"data")
 
         assert not shm.with_suffix(".tmp").exists(), ".tmp must be cleaned up on failure"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _HeartbeatWriter — "pid:job_id" format [FIX-HB]
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestHeartbeatWriterFormat:
+    """Verify the heartbeat file uses "pid:job_id" to prevent PID-recycling false negatives."""
+
+    def test_heartbeat_file_contains_pid_and_job_id(self, tmp_path):
+        from dino_loader.shard_cache import _HeartbeatWriter
+        hb_path = tmp_path / "heartbeat"
+        writer  = _HeartbeatWriter(hb_path, job_id="test_job_123")
+        try:
+            # Give the writer a moment to write the file.
+            time.sleep(0.05)
+            assert hb_path.exists(), "Heartbeat file was not created"
+            content = hb_path.read_text().strip()
+            assert ":" in content, (
+                f"Heartbeat content {content!r} does not contain ':' separator. "
+                "Expected 'pid:job_id' format [FIX-HB]."
+            )
+            pid_str, job_id = content.split(":", 1)
+            assert pid_str.isdigit(), f"PID part {pid_str!r} is not numeric"
+            assert int(pid_str) == os.getpid(), "PID does not match current process"
+            assert job_id == "test_job_123", f"Job ID {job_id!r} does not match"
+        finally:
+            writer.stop()
+
+    def test_heartbeat_pid_matches_current_process(self, tmp_path):
+        from dino_loader.shard_cache import _HeartbeatWriter
+        hb_path = tmp_path / "hb"
+        writer  = _HeartbeatWriter(hb_path, job_id="myjob")
+        try:
+            time.sleep(0.05)
+            content = hb_path.read_text().strip()
+            pid_str = content.split(":")[0]
+            assert int(pid_str) == os.getpid()
+        finally:
+            writer.stop()
+
+    def test_heartbeat_stop_removes_file(self, tmp_path):
+        from dino_loader.shard_cache import _HeartbeatWriter
+        hb_path = tmp_path / "hb_stop"
+        writer  = _HeartbeatWriter(hb_path, job_id="stoptest")
+        time.sleep(0.05)
+        assert hb_path.exists()
+        writer.stop()
+        assert not hb_path.exists(), "Heartbeat file should be removed after stop()"
+
+    def test_purge_skips_alive_process_with_matching_job_id(self, tmp_path):
+        """A live PID with the same job_id must NOT be purged.
+
+        This guards against the scenario where the heartbeat belongs to a
+        sibling process of the same job that happens to be alive.
+        """
+        from dino_loader.shard_cache import _purge_orphaned_shm
+
+        fake_shm = tmp_path / "fake_job"
+        fake_shm.mkdir()
+        hb = fake_shm / "heartbeat"
+        # Write "our PID : our job_id" — alive process, same job.
+        hb.write_text(f"{os.getpid()}:fake_job")
+
+        # _purge_orphaned_shm should skip this directory because the job_id matches.
+        _purge_orphaned_shm("fake_job", hb_stale_s=0.0)
+        assert fake_shm.exists(), (
+            "Sibling process with matching job_id was wrongly purged."
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
