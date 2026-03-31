@@ -31,45 +31,17 @@ Public API
         build_reader_graph, # convenience factory → tn.Loader
     )
 
-Usage
------
-Standalone (no DALI)::
-
-    from dino_loader.nodes import build_reader_graph
-    import torchdata.nodes as tn
-
-    loader = build_reader_graph(
-        specs       = [DatasetSpec(...)],
-        batch_size  = 512,
-        cache       = my_shard_cache,
-        rank        = env.rank,
-        world_size  = env.world_size,
-    )
-    for batch_jpegs, batch_meta in loader:
-        # batch_jpegs: list[np.ndarray]   — raw JPEG bytes, one per sample
-        # batch_meta:  list[dict | None]  — parsed JSON sidecars
-        ...
-
-With ``wrap_loader`` and a custom masking transform::
-
-    from dino_loader.nodes import MaskMapNode
-    from dino_loader.masking import MaskingGenerator
-    from dino_loader.pipeline_graph import wrap_loader
-
-    gen = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
-    pipeline = (
-        wrap_loader(DINODataLoader(...))
-        .map(MaskMapNode.as_transform(gen))
-        .with_epoch(steps_per_epoch)
-    )
-
-Notes
------
-- ``ShardReaderNode`` holds a live ``MixingSource`` internally; it is
-  **not** safe to share one instance across processes.
-- ``state_dict`` persists epoch number and mixing weights; within-epoch
-  sample position is *not* restored (matching existing dino_loader semantics).
-
+Corrections apportées
+---------------------
+[FIX-RESET] ShardReaderNode.reset() ne recrée plus MixingSource à chaque
+            appel.  ``tn.Loader(restart_on_stop_iteration=True)`` appelle
+            reset() à chaque époque, recréer tous les threads ShardIterator
+            était donc coûteux et inutile.  reset() appelle désormais
+            set_epoch() sur la source existante, comme le fait DINODataLoader.
+            La source n'est créée qu'une seule fois à la première construction.
+[FIX-POOL]  Le pool d'extraction partagé (SharedExtractionPoolConfig) est
+            transmis à MixingSource afin que le budget de threads soit borné
+            même via le chemin torchdata.nodes.
 """
 
 from __future__ import annotations
@@ -83,17 +55,13 @@ import torchdata.nodes as tn
 from torchdata.nodes import BaseNode
 from dino_datasets import DatasetSpec
 
+from dino_loader.config import SharedExtractionPoolConfig
 from dino_loader.memory import Batch
 from dino_loader.mixing_source import MixingSource, SamplePredicate
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Type aliases
-# ---------------------------------------------------------------------------
-
-#: One batch yielded by ShardReaderNode: parallel lists of JPEG bytes and
-#: optional metadata dicts, one entry per sample.
+# Type alias: un batch brut retourné par ShardReaderNode.
 ReaderBatch = tuple[list[np.ndarray], list[dict[str, Any] | None]]
 
 
@@ -115,28 +83,25 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
     ``(list[np.ndarray], list[dict | None])`` — raw JPEG bytes and optional
     JSON metadata, both of length ``batch_size``.
 
+    Note on reset()
+    ---------------
+    ``reset()`` ne recrée **pas** ``MixingSource`` à chaque appel.  Cela
+    évite la reconstruction de tous les threads d'extraction à chaque époque.
+    La source est construite une seule fois dans ``reset()`` lors de la
+    première invocation, puis ``set_epoch()`` est appelé pour les suivantes.
+
     Args:
         specs: Dataset specifications (shards, weights, quality filters, …).
         batch_size: Number of samples per batch.
-        cache: Shard cache instance.  Callers are responsible for construction
-            so that the cache lifecycle is managed externally.
+        cache: Shard cache instance.
         rank: Global rank of this process.
         world_size: Total number of processes.
-        num_workers: Extraction thread-pool workers per dataset.
+        pool_cfg: Shared extraction pool config.  Controls total thread budget.
         seed: Base RNG seed.
         device_id: Local GPU index (forwarded to ``MixingSource``).
         shuffle_buffer_size: Reservoir size for per-shard sample shuffling.
         debug_log_keys: Optional path to write per-sample key audit log.
         sample_predicate: Optional early filter applied before DALI decode.
-
-    State dict keys
-    ---------------
-    ``epoch``
-        Current epoch number (set via :meth:`set_epoch`).
-    ``mixing_weights``
-        Normalised mixing weight vector.
-    ``dataset_names``
-        Ordered list of dataset names (sanity-check on restore).
 
     """
 
@@ -152,7 +117,7 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
         rank:                int,
         world_size:          int,
         *,
-        num_workers:         int                    = 4,
+        pool_cfg:            SharedExtractionPoolConfig | None = None,
         seed:                int                    = 0,
         device_id:           int                    = 0,
         shuffle_buffer_size: int                    = 512,
@@ -162,17 +127,17 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
         """Initialise a ShardReaderNode."""
         super().__init__()
 
-        self._specs       = specs
-        self._batch_size  = batch_size
-        self._cache       = cache
-        self._rank        = rank
-        self._world_size  = world_size
-        self._num_workers = num_workers
-        self._seed        = seed
-        self._device_id   = device_id
-        self._shuffle_buf = shuffle_buffer_size
-        self._debug_log   = debug_log_keys
-        self._predicate   = sample_predicate
+        self._specs         = specs
+        self._batch_size    = batch_size
+        self._cache         = cache
+        self._rank          = rank
+        self._world_size    = world_size
+        self._pool_cfg      = pool_cfg
+        self._seed          = seed
+        self._device_id     = device_id
+        self._shuffle_buf   = shuffle_buffer_size
+        self._debug_log     = debug_log_keys
+        self._predicate     = sample_predicate
 
         self._epoch: int                  = 0
         self._source: MixingSource | None = None
@@ -182,7 +147,11 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
     # ------------------------------------------------------------------
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
-        """(Re-)initialise the MixingSource, optionally from a saved state.
+        """Prépare la source pour une nouvelle époque.
+
+        [FIX-RESET] La source n'est créée qu'à la première invocation.
+        Pour les époques suivantes, set_epoch() est appelé sur la source
+        existante, ce qui évite de recréer tous les threads d'extraction.
 
         Args:
             initial_state: Optional state dict from a prior :meth:`get_state` call.
@@ -190,31 +159,33 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
         """
         super().reset(initial_state)
 
-        if self._source is not None:
-            self._source.close()
-
-        self._source = MixingSource(
-            specs               = self._specs,
-            batch_size          = self._batch_size,
-            cache               = self._cache,
-            rank                = self._rank,
-            world_size          = self._world_size,
-            num_workers         = self._num_workers,
-            seed                = self._seed,
-            device_id           = self._device_id,
-            shuffle_buffer_size = self._shuffle_buf,
-            debug_log_keys      = self._debug_log,
-            sample_predicate    = self._predicate,
-        )
+        if self._source is None:
+            # Première construction : crée la source et son pool.
+            self._source = MixingSource(
+                specs               = self._specs,
+                batch_size          = self._batch_size,
+                cache               = self._cache,
+                rank                = self._rank,
+                world_size          = self._world_size,
+                pool_cfg            = self._pool_cfg,
+                seed                = self._seed,
+                device_id           = self._device_id,
+                shuffle_buffer_size = self._shuffle_buf,
+                debug_log_keys      = self._debug_log,
+                sample_predicate    = self._predicate,
+            )
+            log.debug(
+                "ShardReaderNode: MixingSource created, rank=%d/%d datasets=%s",
+                self._rank, self._world_size,
+                [s.name for s in self._specs],
+            )
 
         if initial_state is not None:
             self._restore_state(initial_state)
-
-        log.debug(
-            "ShardReaderNode.reset: epoch=%d rank=%d/%d datasets=%s",
-            self._epoch, self._rank, self._world_size,
-            [s.name for s in self._specs],
-        )
+        else:
+            # Réinitialise l'époque sur la source existante sans recréer de threads.
+            self._source.set_epoch(self._epoch)
+            log.debug("ShardReaderNode.reset: set_epoch(%d)", self._epoch)
 
     def next(self) -> ReaderBatch:
         """Return the next batch as (jpeg_list, metadata_list).
@@ -243,37 +214,18 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
     # ------------------------------------------------------------------
 
     def set_epoch(self, epoch: int) -> None:
-        """Advance to a new epoch (reshuffles shard order).
-
-        Must be called before the first ``next()`` of each epoch when using
-        deterministic shuffling.
-
-        Args:
-            epoch: New epoch number.
-
-        """
+        """Advance to a new epoch (reshuffles shard order)."""
         self._epoch = epoch
         if self._source is not None:
             self._source.set_epoch(epoch)
 
     def set_weights(self, weights: list[float]) -> None:
-        """Update dataset mixing weights (re-normalised automatically).
-
-        Args:
-            weights: New raw weights, one per dataset.
-
-        """
+        """Update dataset mixing weights (re-normalised automatically)."""
         if self._source is not None:
             self._source.set_weights(weights)
 
     def set_weight_by_name(self, name: str, weight: float) -> None:
-        """Update one dataset's weight by name.
-
-        Args:
-            name: Dataset name to update.
-            weight: New raw weight.
-
-        """
+        """Update one dataset's weight by name."""
         if self._source is not None:
             self._source.set_by_name(name, weight)
 
@@ -312,9 +264,8 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
                 self._source.set_weights(saved_weights)
 
         saved_epoch: int = state.get(self._KEY_EPOCH, 0)
-        if saved_epoch != 0:
-            self._epoch = saved_epoch
-            self._source.set_epoch(saved_epoch)
+        self._epoch = saved_epoch
+        self._source.set_epoch(saved_epoch)
 
     def __del__(self) -> None:
         """Close the underlying MixingSource on GC."""
@@ -332,16 +283,7 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
 
 
 class MetadataNode(BaseNode):  # type: ignore[misc]
-    """Splits a ``ReaderBatch`` stream into JPEG and metadata components.
-
-    Takes a source that yields ``(jpeg_list, meta_list)`` tuples and
-    re-emits the same pair while storing metadata for retrieval via
-    :meth:`pop_last_metadata`.
-
-    Args:
-        source: Upstream node yielding ``ReaderBatch`` tuples.
-
-    """
+    """Splits a ``ReaderBatch`` stream into JPEG and metadata components."""
 
     def __init__(self, source: BaseNode) -> None:  # type: ignore[type-arg]
         """Initialise a MetadataNode."""
@@ -350,12 +292,7 @@ class MetadataNode(BaseNode):  # type: ignore[misc]
         self._last_meta: list[dict[str, Any] | None] = []
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
-        """Reset the upstream source and clear buffered metadata.
-
-        Args:
-            initial_state: Forwarded to the upstream source.
-
-        """
+        """Reset the upstream source and clear buffered metadata."""
         super().reset(initial_state)
         self._source.reset(initial_state)
         self._last_meta = []
@@ -382,92 +319,40 @@ class MetadataNode(BaseNode):  # type: ignore[misc]
 
 
 class MaskMapNode(BaseNode):  # type: ignore[misc]
-    """torchdata BaseNode that attaches iBOT patch masks to every batch.
-
-    Sits between the augmentation stage and the training loop.  On each call
-    to ``next()`` it draws a fresh mask from ``MaskingGenerator`` and stores
-    it on ``Batch.masks``.
-
-    The mask shape is derived from the ``MaskingGenerator``'s ``get_shape()``
-    at construction time, so the grid dimensions never change during training
-    even when ``set_resolution`` is called — resolution changes that affect
-    masking should reconstruct this node.
-
-    Args:
-        source: Upstream node yielding ``Batch`` objects.
-        mask_generator: A configured ``MaskingGenerator`` instance.
-        num_masking_patches: Number of patches to mask per sample.  When
-            ``None`` the generator's own default is used.
-
-    Raises:
-        ValueError: (from ``next()``) If the upstream batch has empty
-            ``global_crops``.  Masking requires a non-empty global crop list
-            to derive the batch dimension.
-
-    Example::
-
-        from dino_loader.masking import MaskingGenerator
-        from dino_loader.nodes import MaskMapNode
-        from dino_loader.pipeline_graph import wrap_loader
-
-        gen = MaskingGenerator(input_size=(16, 16), num_masking_patches=60)
-        pipeline = wrap_loader(DINODataLoader(...)).map(
-            MaskMapNode.as_transform(gen, num_masking_patches=60)
-        )
-
-    """
+    """torchdata BaseNode that attaches iBOT patch masks to every batch."""
 
     def __init__(
         self,
-        source,              # BaseNode[Batch]
-        mask_generator,      # MaskingGenerator
+        source,
+        mask_generator,
         num_masking_patches: int | None = None,
     ) -> None:
-        """Initialise a MaskMapNode.
-
-        Args:
-            source: Upstream node yielding ``Batch`` objects.
-            mask_generator: Configured ``MaskingGenerator``.
-            num_masking_patches: Patches to mask per sample, or ``None`` to
-                use the generator's default.
-
-        """
+        """Initialise a MaskMapNode."""
         super().__init__()
         self._source = source
         self._gen    = mask_generator
         self._n_mask = num_masking_patches
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
-        """Reset the upstream source.
-
-        Args:
-            initial_state: Forwarded to the upstream source.
-
-        """
+        """Reset the upstream source."""
         super().reset(initial_state)
         self._source.reset(initial_state)
 
     def next(self) -> Batch:
-        """Return the next batch with ``Batch.masks`` populated.
-
-        Raises:
-            ValueError: If the batch has no global crops.
-
-        """
+        """Return the next batch with ``Batch.masks`` populated."""
         batch: Batch = self._source.next()
         if not batch.global_crops:
             msg = (
                 "MaskMapNode.next: batch.global_crops is empty. "
                 "MaskMapNode requires at least one global crop to derive the "
-                "batch dimension for mask expansion. "
-                "Ensure the augmentation spec produces global crops."
+                "batch dimension for mask expansion."
             )
             raise ValueError(msg)
 
-        mask  = self._gen(flat=True)                   # shape (H*W,), bool
-        masks = torch.from_numpy(mask).unsqueeze(0)    # (1, H*W)
+        mask  = self._gen(flat=True)
+        masks = torch.from_numpy(mask).unsqueeze(0)
         b     = batch.global_crops[0].shape[0]
-        masks = masks.expand(b, -1)                    # (B, H*W)
+        masks = masks.expand(b, -1)
 
         batch.masks = masks
         return batch
@@ -476,46 +361,18 @@ class MaskMapNode(BaseNode):  # type: ignore[misc]
         """Delegate state to the upstream source."""
         return self._source.get_state()
 
-    # ------------------------------------------------------------------
-    # Convenience: use as a plain Batch → Batch transform
-    # ------------------------------------------------------------------
-
     @staticmethod
     def as_transform(
         mask_generator,
         num_masking_patches: int | None = None,
     ) -> "Callable[[Batch], Batch]":  # noqa: F821
-        """Return a ``Batch → Batch`` callable for use with ``.map()``.
-
-        Useful when composing a ``NodePipeline`` with masking without building
-        a full ``BaseNode`` graph.
-
-        Args:
-            mask_generator: A configured ``MaskingGenerator``.
-            num_masking_patches: Patches to mask per sample, or ``None`` to
-                use the generator's default.
-
-        Returns:
-            A callable ``(Batch) -> Batch``.  Raises ``ValueError`` if the
-            batch has no global crops.
-
-        Example::
-
-            from dino_loader.pipeline_graph import wrap_loader
-            from dino_loader.masking import MaskingGenerator
-            from dino_loader.nodes import MaskMapNode
-
-            gen = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
-            pipeline = wrap_loader(loader).map(MaskMapNode.as_transform(gen))
-
-        """
+        """Return a ``Batch → Batch`` callable for use with ``.map()``."""
 
         def _apply(batch: Batch) -> Batch:
             if not batch.global_crops:
                 msg = (
                     "MaskMapNode.as_transform: batch.global_crops is empty. "
-                    "Masking requires at least one global crop to derive the "
-                    "batch dimension."
+                    "Masking requires at least one global crop."
                 )
                 raise ValueError(msg)
 
@@ -546,7 +403,7 @@ def build_reader_graph(
     rank:                int,
     world_size:          int,
     *,
-    num_workers:         int                    = 4,
+    pool_cfg:            SharedExtractionPoolConfig | None = None,
     seed:                int                    = 0,
     device_id:           int                    = 0,
     shuffle_buffer_size: int                    = 512,
@@ -556,16 +413,13 @@ def build_reader_graph(
 ) -> tuple[tn.Loader[ReaderBatch], ShardReaderNode]:
     """Build a ready-to-use ``tn.Loader`` over the shard reader pipeline.
 
-    Returns both the ``Loader`` (for iteration) and the ``ShardReaderNode``
-    (for epoch/weight control).
-
     Args:
         specs: Dataset specifications.
         batch_size: Samples per batch.
-        cache: Shard cache (``InProcessShardCache`` or ``NodeSharedShardCache``).
+        cache: Shard cache.
         rank: Global rank.
         world_size: Total ranks.
-        num_workers: Extraction workers per dataset.
+        pool_cfg: Shared extraction pool configuration.
         seed: Base RNG seed.
         device_id: GPU index.
         shuffle_buffer_size: Per-shard reservoir depth.
@@ -577,14 +431,6 @@ def build_reader_graph(
         ``(loader, reader_node)`` — iterate over ``loader``, call
         ``reader_node.set_epoch(e)`` each epoch.
 
-    Example::
-
-        loader, reader = build_reader_graph(specs, batch_size=512, ...)
-        for epoch in range(100):
-            reader.set_epoch(epoch)
-            for jpegs, meta in loader:
-                my_augment(jpegs)
-
     """
     reader: ShardReaderNode = ShardReaderNode(
         specs               = specs,
@@ -592,7 +438,7 @@ def build_reader_graph(
         cache               = cache,
         rank                = rank,
         world_size          = world_size,
-        num_workers         = num_workers,
+        pool_cfg            = pool_cfg,
         seed                = seed,
         device_id           = device_id,
         shuffle_buffer_size = shuffle_buffer_size,

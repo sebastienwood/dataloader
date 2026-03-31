@@ -5,16 +5,25 @@ In-memory data structures and GPU transfer utilities.
 [MEM-1] Batch dataclass with metadata and masks.
 [MEM-4] FP8Formatter: no-op guard for dali_fp8_output=True path.
 
-AsyncPrefetchIterator has been removed: DALI's internal cpu_queue / gpu_queue
-pipeline (prefetch_queue_depth) already provides equivalent double-buffering
-natively — no application-level thread is needed.  Increasing dali_cpu_queue
-to ≥ 16 (see LoaderConfig) fully hides Lustre / extraction latency behind GPU
-compute, which is what AsyncPrefetchIterator was manually replicating.
+AsyncPrefetchIterator a été supprimé : les queues internes DALI
+(prefetch_queue_depth) fournissent un double-buffering natif équivalent.
 
 Note: Grace-Blackwell / NVL72 managed-memory paths have been removed.
       This loader targets B200, H200, H100 with standard PCIe topology.
-      allocate_buffers() is retained as a utility but simplified to a single
-      pinned-memory path.
+
+allocate_buffers — correction [FIX-BUF]
+----------------------------------------
+La version précédente retournait une liste de deux tenseurs par type de crop
+(double-buffer).  Après la suppression d'AsyncPrefetchIterator, ce double
+n'avait plus d'utilisateur et consommait de la mémoire paginée inutilement.
+allocate_buffers retourne désormais un seul tenseur paginé par type.
+
+FP8Formatter.quantise — correction [FIX-FP8]
+----------------------------------------------
+La garde sur les tenseurs déjà FP8 est remplacée par un assert : ce cas ne
+peut pas se produire légitimement (le loader contrôle ce qui entre dans
+quantise).  Un assert échoue tôt et clairement plutôt que de logger un
+warning silencieux qui serait ignoré en production.
 """
 
 import contextlib
@@ -47,8 +56,6 @@ class Batch:
         local_crops: List of local-crop tensors.
         metadata: Per-sample sidecar dicts. None when absent.
         masks: iBOT token mask tensor (bool, shape batch×n_tokens) or None.
-            Generated on CPU post-DALI; cannot be fused into DALI because
-            masking operates on ViT patch indices, not pixel values.
 
     """
 
@@ -68,15 +75,15 @@ def allocate_buffers(
     topo:       ClusterTopology,
     device:     torch.device,
     dtype:      torch.dtype = torch.bfloat16,
-) -> dict[str, list[torch.Tensor]]:
+) -> dict[str, torch.Tensor]:
     """Allocate pinned host buffers sized to max crop dimensions.
+
+    [FIX-BUF] Retourne un seul tenseur paginé par type de crop (global/local)
+    au lieu d'une liste de deux.  Le double-buffer de l'ancienne version était
+    un vestige d'AsyncPrefetchIterator, supprimé car sans utilisateur.
 
     Uses max_global_crop_size / max_local_crop_size so no re-allocation
     occurs when set_resolution() is called mid-training.
-
-    Pinned host memory is used for efficient non-blocking DMA to GPU via
-    the H2DStream. The topo parameter is accepted for API compatibility
-    but all supported hardware (B200, H200, H100) uses the same PCIe path.
 
     Args:
         batch_size: Per-GPU batch size.
@@ -86,14 +93,11 @@ def allocate_buffers(
         dtype: Tensor dtype (default bfloat16).
 
     Returns:
-        Dict with 'global' and 'local' keys, each a list of pinned tensors.
+        Dict with 'global' and 'local' keys, each a single pinned tensor.
 
     """
-    def _buf(size: int) -> list[torch.Tensor]:
-        return [
-            torch.zeros(batch_size, 3, size, size, dtype=dtype).pin_memory()
-            for _ in range(2)
-        ]
+    def _buf(size: int) -> torch.Tensor:
+        return torch.zeros(batch_size, 3, size, size, dtype=dtype).pin_memory()
 
     return {
         "global": _buf(aug_cfg.max_global_crop_size),
@@ -105,6 +109,7 @@ class H2DStream:
     """Async host-to-device transfer on a dedicated CUDA stream."""
 
     def __init__(self, device: torch.device, topo: ClusterTopology) -> None:
+        """Initialise the H2D stream."""
         self._device = device
         self._stream = torch.cuda.Stream(device=device)
         log.info("H2DStream: PCIe path, dedicated CUDA stream on %s", device)
@@ -113,13 +118,7 @@ class H2DStream:
     def transfer(
         self, cpu_batch: dict[str, list[torch.Tensor]],
     ) -> Iterator[dict[str, list[torch.Tensor]]]:
-        """Async H2D transfer context manager.
-
-        Usage::
-
-            with h2d.transfer({"global": [...], "local": [...]}) as gpu:
-                loss = model(gpu["global"], gpu["local"])
-        """
+        """Async H2D transfer context manager."""
         with torch.cuda.stream(self._stream):
             gpu_batch = {
                 key: [t.to(self._device, non_blocking=True) for t in tensors]
@@ -157,6 +156,7 @@ class FP8Formatter:
     _AMAX_WINDOW = 16
 
     def __init__(self) -> None:
+        """Initialise FP8Formatter."""
         if HAS_TE:
             self._meta = te.fp8.FP8TensorMeta()
             self._meta.scale     = torch.ones(1)
@@ -168,14 +168,24 @@ class FP8Formatter:
             log.info("FP8Formatter: TE not installed — identity (no-op)")
 
     def quantise(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Quantise *tensor* to FP8 E4M3, or return it unchanged if already FP8."""
-        if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            log.warning(
-                "FP8Formatter.quantise called on already-FP8 tensor (dtype=%s) — "
-                "returning unchanged. Check dali_fp8_output config.",
-                tensor.dtype,
-            )
-            return tensor
+        """Quantise *tensor* to FP8 E4M3, or return it unchanged if TE absent.
+
+        [FIX-FP8] Le cas tensor.dtype already FP8 est remplacé par un assert.
+        Ce cas ne peut pas se produire légitimement : le loader contrôle ce
+        qui entre dans quantise() et ne l'appelle jamais sur un tenseur déjà
+        quantifié.  Un assert échoue tôt et clairement.
+
+        Args:
+            tensor: BF16 (or FP32) tensor to quantise.
+
+        Returns:
+            FP8 E4M3 tensor, or *tensor* unchanged if TE is not installed.
+
+        """
+        assert tensor.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2), (
+            f"FP8Formatter.quantise called on already-FP8 tensor (dtype={tensor.dtype}). "
+            "This indicates a bug in the loader — check dali_fp8_output config."
+        )
         if not HAS_TE or self._meta is None:
             return tensor
         return te.fp8.cast_to_fp8(tensor, self._meta, 0, te.fp8.Float8Tensor)

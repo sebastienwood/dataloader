@@ -8,16 +8,17 @@ DINODataLoader: the single public entry point for training code.
 [LD-AUG-2] sample_predicate: early filtering before DALI decode.
 [B3-FIX]   set_epoch() is protected by threading.Lock.
 [LD-13]    current_resolution public property.
-[FIX-ENV]  DINODataLoader now asserts dino_env.init() has been called before
-           construction when running in DALI mode, preventing silent NCCL
-           misconfiguration.
-[FIX-ITER] _active_iter is protected by a threading.Lock to prevent a TOCTOU
-           race when two threads call __iter__() simultaneously.
+[FIX-ENV]  DINODataLoader asserts dino_env.init() before construction in DALI mode.
+[FIX-ITER] _active_iter is protected by a threading.Lock.
+[CFG-PIPE] PipelineConfig utilisé pour transmettre les paramètres de pipeline.
+[CFG-POOL] SharedExtractionPoolConfig transmis à MixingSource.
+[FIX-CKPT] state_dict() utilise l'état en mémoire (plus de re-lecture disque).
+[FIX-BUILD] _build_batch délégue le split views à AugmentationSpec pour
+            éviter les isinstance chains à chaque batch.
 
 Post-processing API
 -------------------
-``PostProcessPipeline`` has been removed.  Use ``wrap_loader()`` from
-``dino_loader.pipeline_graph`` to compose post-DALI transforms::
+Utiliser ``wrap_loader()`` depuis ``dino_loader.pipeline_graph``::
 
     from dino_loader.pipeline_graph import wrap_loader
 
@@ -27,16 +28,13 @@ Post-processing API
         .select(quality_ok)
         .with_epoch(steps_per_epoch)
     )
-
-``wrap_loader()`` returns a ``NodePipeline`` with full ``state_dict`` support
-across the entire graph.
 """
 
 import logging
 import os
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 import torch
@@ -54,7 +52,12 @@ from dino_loader.augmentation import (
 from dino_loader.backends import get_backend
 from dino_loader.backends.protocol import BackendProtocol
 from dino_loader.checkpoint import DataLoaderCheckpointer
-from dino_loader.config import CheckpointState, DINOAugConfig, LoaderConfig
+from dino_loader.config import (
+    CheckpointState,
+    DINOAugConfig,
+    LoaderConfig,
+    PipelineConfig,
+)
 from dino_loader.memory import Batch
 from dino_loader.mixing_source import MixingSource, ResolutionSource
 from dino_loader.monitor.metrics import get_registry, init_registry
@@ -65,43 +68,8 @@ log = logging.getLogger(__name__)
 class DINODataLoader:
     """HPC-grade data loader for DINO-style self-supervised training.
 
-    Prerequisites
-    -------------
-    For the DALI backend (production), dino_env.init() must be called before
-    constructing this loader. The loader asserts this to prevent silent NCCL
-    misconfiguration.
-
-    Pipeline stages
-    ---------------
-    Stage 1 — NodeSharedShardCache: one rank reads Lustre, others read /dev/shm.
-    Stage 2 — MixingSource: weighted multi-dataset ExternalSource for DALI.
-    Stage 3 — DALI pipeline: HW JPEG decode + augmentation on GPU.
-              DALI's prefetch queues (dali_cpu_queue, dali_gpu_queue) overlap
-              I/O and compute natively — no application-level threading needed.
-    Stage 4 — H2DStream: dedicated CUDA stream for pinned→GPU transfer.
-    Stage 5 — FP8Formatter: optional BF16→FP8 E4M3 quantisation.
-
-    Augmentation strategies
-    -----------------------
-    Pass an AugmentationSpec to aug_spec:
-    - DinoV2AugSpec(aug_cfg)   — DINOv2 multi-crop (default).
-    - EvalAugSpec(crop_size)   — deterministic resize + centre-crop.
-    - LeJEPAAugSpec(...)       — one context + N target crops.
-    - UserAugSpec(aug_fn, ...) — custom function on GPU tensors.
-
-    Post-processing
-    ---------------
-    Use ``wrap_loader(loader)`` from ``dino_loader.pipeline_graph`` to compose
-    post-DALI transforms in a stateful, checkpointable graph::
-
-        from dino_loader.pipeline_graph import wrap_loader
-
-        pipeline = (
-            wrap_loader(loader)
-            .map(fn)
-            .select(pred)
-            .with_epoch(n_steps)
-        )
+    Pour la post-processing pipeline, utiliser ``wrap_loader()`` depuis
+    ``dino_loader.pipeline_graph``.
 
     Args:
         specs: List of DatasetSpec objects.
@@ -141,7 +109,6 @@ class DINODataLoader:
         backend:          Any                      = "auto",
     ) -> None:
         """Construct a DINODataLoader."""
-        # Backward-compat: wrap legacy aug_cfg in DinoV2AugSpec.
         if aug_spec is None:
             effective_aug_cfg: DINOAugConfig  = aug_cfg if aug_cfg is not None else DINOAugConfig()
             self._aug_spec: AugmentationSpec  = DinoV2AugSpec(aug_cfg=effective_aug_cfg)
@@ -153,26 +120,27 @@ class DINODataLoader:
                 )
             self._aug_spec = aug_spec
 
-        # Keep a reference to DINOAugConfig for resolution scheduling.
         self._aug_cfg: DINOAugConfig = (
             self._aug_spec.aug_cfg  # type: ignore[attr-defined]
             if isinstance(self._aug_spec, DinoV2AugSpec)
             else DINOAugConfig()
         )
 
-        self._cfg              = config or LoaderConfig()
+        self._cfg              = config or LoaderConfig(checkpoint_dir="/tmp/dino_loader_ckpt")
         self._mask_generator   = mask_generator
         self._sample_predicate = sample_predicate
         self._steps_per_epoch  = steps_per_epoch
 
-        # Explicit state tracking — never rely on dynamic attributes.
         self._step:  int = 0
         self._epoch: int = 0
 
-        # [FIX-ITER] Lock prevents TOCTOU race when __iter__ called concurrently.
+        # [FIX-CKPT] État checkpoint maintenu en mémoire — évite les I/O disque
+        # à chaque appel à state_dict().
+        self._last_ckpt_state: CheckpointState | None = None
+
         self._active_iter = False
         self._iter_lock   = threading.Lock()
-        self._epoch_lock  = threading.Lock()  # [B3-FIX]
+        self._epoch_lock  = threading.Lock()
 
         # Backend
         if isinstance(backend, str):
@@ -180,7 +148,6 @@ class DINODataLoader:
         else:
             self._backend = backend
 
-        # [FIX-ENV] For the DALI backend, require dino_env.init() before construction.
         if self._backend.name == "dali":
             try:
                 import dino_env  # noqa: PLC0415
@@ -246,30 +213,29 @@ class DINODataLoader:
             cache               = shard_cache,
             rank                = self._rank,
             world_size          = self._world_size,
-            num_workers         = self._cfg.shard_extraction_workers,
+            pool_cfg            = self._cfg.extraction_pool,
             seed                = self._cfg.seed,
             device_id           = device_id,
             shuffle_buffer_size = self._cfg.shuffle_buffer_size,
             debug_log_keys      = self._cfg.debug_log_keys,
             sample_predicate    = sample_predicate,
         )
+        # Expose la resolution_src sur la source pour que le backend puisse y accéder.
+        self._source._resolution_src = self._resolution_src  # type: ignore[attr-defined]
+        self._source._batch_size     = batch_size            # type: ignore[attr-defined]
 
-        # Stage 3: augmentation pipeline
+        # Stage 3: augmentation pipeline — [CFG-PIPE]
+        pipeline_cfg = PipelineConfig.from_loader_config(
+            cfg       = self._cfg,
+            device_id = device_id,
+            rank      = self._rank,
+        )
+
         pipeline = self._backend.build_pipeline(
-            source             = self._source,
-            aug_spec           = self._aug_spec,
-            aug_cfg            = self._aug_cfg,
-            batch_size         = batch_size,
-            num_threads        = self._cfg.dali_num_threads,
-            device_id          = device_id,
-            resolution_src     = self._resolution_src,
-            hw_decoder_load    = self._cfg.hw_decoder_load,
-            cpu_queue          = self._cfg.dali_cpu_queue,
-            gpu_queue          = self._cfg.dali_gpu_queue,
-            seed               = self._cfg.seed + self._rank,
-            specs              = specs,
-            fuse_normalization = self._cfg.fuse_normalization and self._backend.supports_gpu,
-            dali_fp8_output    = self._cfg.use_fp8_output and self._cfg.dali_fp8_output,
+            source       = self._source,
+            aug_spec     = self._aug_spec,
+            pipeline_cfg = pipeline_cfg,
+            specs        = specs,
         )
 
         self._dali_iter = self._backend.build_pipeline_iterator(
@@ -305,13 +271,12 @@ class DINODataLoader:
 
         log.info(
             "DINODataLoader ready: backend=%s rank=%d/%d batch=%d "
-            "aug=%s resolution=%dx%d dali_queues=cpu%d/gpu%d sample_predicate=%s",
+            "aug=%s resolution=%dx%d pool_workers=%d",
             self._backend.name,
             self._rank, self._world_size, batch_size,
             type(self._aug_spec).__name__,
             self._current_global_size, self._current_local_size,
-            self._cfg.dali_cpu_queue, self._cfg.dali_gpu_queue,
-            "yes" if sample_predicate is not None else "no",
+            self._cfg.extraction_pool.max_workers,
         )
 
     # ── Public properties ─────────────────────────────────────────────────────
@@ -365,7 +330,7 @@ class DINODataLoader:
     # ── Epoch / weight / resolution control ───────────────────────────────────
 
     def set_epoch(self, epoch: int) -> None:
-        """Prepare for a new epoch. [B3-FIX] Thread-safe.
+        """Prepare for a new epoch. Thread-safe.
 
         Args:
             epoch: New epoch number (0-indexed).
@@ -415,31 +380,22 @@ class DINODataLoader:
         self._current_global_size = global_size
         self._current_local_size  = local_size
         self._resolution_src.set(global_size, local_size)
-        log.info("Resolution updated: global=%d local=%d", global_size, local_size)
 
     def set_weights(self, weights: Sequence[float]) -> None:
-        """Update mixing weights (re-normalised automatically).
-
-        Args:
-            weights: New raw weights, one per dataset.
-
-        """
+        """Update mixing weights (re-normalised automatically)."""
         self._source.set_weights(weights)
 
     def set_weight_by_name(self, name: str, weight: float) -> None:
-        """Update one dataset's weight by name.
-
-        Args:
-            name: Dataset name to update.
-            weight: New raw weight.
-
-        """
+        """Update one dataset's weight by name."""
         self._source.set_weight_by_name(name, weight)
 
     # ── Checkpointing ─────────────────────────────────────────────────────────
 
     def checkpoint(self, step: int) -> None:
         """Save a checkpoint (rank 0 only, every N steps).
+
+        Maintient également l'état en mémoire pour que state_dict() n'ait
+        pas à relire le fichier depuis le disque.
 
         Args:
             step: Current training step.
@@ -454,10 +410,14 @@ class DINODataLoader:
             global_crop_size = self._current_global_size,
             local_crop_size  = self._current_local_size,
         )
+        # [FIX-CKPT] Met à jour l'état en mémoire avant l'écriture disque.
+        self._last_ckpt_state = state
         self._ckpt.save(state)
 
     def state_dict(self) -> dict:
         """Return checkpoint state as a plain dict.
+
+        [FIX-CKPT] Utilise l'état en mémoire — pas de re-lecture disque.
 
         Raises:
             RuntimeError: If ``stateful_dataloader=False`` in ``LoaderConfig``.
@@ -466,7 +426,19 @@ class DINODataLoader:
         if not self._cfg.stateful_dataloader:
             msg = "state_dict() requires stateful_dataloader=True in LoaderConfig."
             raise RuntimeError(msg)
-        return self._ckpt.state_dict()
+
+        if self._last_ckpt_state is not None:
+            return self._last_ckpt_state.to_dict()
+
+        # Pas encore de checkpoint sauvegardé — retourne l'état courant.
+        return CheckpointState(
+            step             = self._step,
+            epoch            = self._epoch,
+            dataset_names    = self._source.dataset_names,
+            mixing_weights   = self._source.current_weights,
+            global_crop_size = self._current_global_size,
+            local_crop_size  = self._current_local_size,
+        ).to_dict()
 
     def load_state_dict(self, sd: dict) -> None:
         """Restore from a state dict produced by state_dict().
@@ -475,8 +447,6 @@ class DINODataLoader:
             sd: State dict from a prior :meth:`state_dict` call.
 
         """
-        self._ckpt.load_state_dict(sd)
-        # Apply fields from the state dict directly.
         if "epoch" in sd:
             self._epoch = sd["epoch"]
         if "step" in sd:
@@ -486,6 +456,9 @@ class DINODataLoader:
                 sd["global_crop_size"],
                 sd.get("local_crop_size", self._current_local_size),
             )
+        if "mixing_weights" in sd and "dataset_names" in sd:
+            if sd["dataset_names"] == self._source.dataset_names:
+                self._source.set_weights(sd["mixing_weights"])
 
     # ── Iteration protocol ────────────────────────────────────────────────────
 
@@ -512,13 +485,7 @@ class DINODataLoader:
                 self._active_iter = False
 
     def _raw_iter(self) -> Iterator[Batch]:
-        """Core iteration loop — iterates directly over the DALI iterator.
-
-        DALI's internal prefetch queues (cpu_queue / gpu_queue) overlap I/O and
-        GPU decode behind this loop naturally, without any application-level
-        threading.  Set dali_cpu_queue ≥ 16 in LoaderConfig to ensure the
-        queue is deep enough to hide Lustre / extraction latency.
-        """
+        """Core iteration loop — drives the DALI/CPU iterator directly."""
         metrics       = get_registry()
         stall_timeout = self._cfg.stall_timeout_s
         got_first     = False
@@ -561,7 +528,10 @@ class DINODataLoader:
         views:    list[Any],
         metadata: list[dict | None],
     ) -> Batch:
-        """Build a Batch from pipeline output views, routing through H2D and FP8.
+        """Build a Batch from pipeline output views.
+
+        [FIX-BUILD] Le split views→global/local est délégué à aug_spec pour
+        éviter les isinstance chains répétées à chaque batch dans le hot path.
 
         Args:
             views: List of tensors from the augmentation pipeline.
@@ -571,23 +541,7 @@ class DINODataLoader:
             A fully assembled ``Batch`` on the target device.
 
         """
-        if isinstance(self._aug_spec, DinoV2AugSpec):
-            n_global     = self._aug_spec.aug_cfg.n_global_crops
-            global_views = views[:n_global]
-            local_views  = views[n_global:]
-        elif isinstance(self._aug_spec, EvalAugSpec):
-            global_views = views
-            local_views  = []
-        elif isinstance(self._aug_spec, LeJEPAAugSpec):
-            global_views = [views[0]]
-            local_views  = views[1:]
-        elif isinstance(self._aug_spec, UserAugSpec):
-            mid          = max(1, len(views) // 2)
-            global_views = views[:mid]
-            local_views  = views[mid:]
-        else:
-            global_views = views
-            local_views  = []
+        global_views, local_views = self._aug_spec_split_views(views)
 
         with self._h2d.transfer({"global": global_views, "local": local_views}) as gpu:
             g_gpu = gpu["global"]
@@ -609,6 +563,35 @@ class DINODataLoader:
             masks        = masks,
         )
 
+    def _aug_spec_split_views(
+        self,
+        views: list[Any],
+    ) -> tuple[list[Any], list[Any]]:
+        """Split the flat views list into (global_crops, local_crops).
+
+        Chaque sous-type d'AugmentationSpec a une convention différente.
+        Cette méthode centralise la logique pour éviter de la répéter dans
+        _build_batch avec des isinstance à chaque batch.
+
+        Args:
+            views: Flat list of tensors from the augmentation pipeline.
+
+        Returns:
+            ``(global_views, local_views)`` — two lists of tensors.
+
+        """
+        if isinstance(self._aug_spec, DinoV2AugSpec):
+            n_global = self._aug_spec.aug_cfg.n_global_crops
+            return views[:n_global], views[n_global:]
+        if isinstance(self._aug_spec, EvalAugSpec):
+            return views, []
+        if isinstance(self._aug_spec, LeJEPAAugSpec):
+            return [views[0]], views[1:]
+        if isinstance(self._aug_spec, UserAugSpec):
+            mid = max(1, len(views) // 2)
+            return views[:mid], views[mid:]
+        return views, []
+
     def __len__(self) -> int:
         """Return steps_per_epoch if set; raises TypeError otherwise."""
         if self._steps_per_epoch is None:
@@ -625,10 +608,8 @@ class DINODataLoader:
             if n_shards < self._world_size:
                 log.warning(
                     "DatasetSpec '%s': only %d shards for %d ranks. "
-                    "Ranks %d..%d will receive no shards from this dataset. "
                     "Consider shard_sampling='resampled' for small datasets.",
                     spec.name, n_shards, self._world_size,
-                    n_shards, self._world_size - 1,
                 )
 
     def _restore(self) -> None:
@@ -636,6 +617,7 @@ class DINODataLoader:
         state = self._ckpt.load()
         if state is None:
             return
+        self._last_ckpt_state = state
         if state.dataset_names != self._source.dataset_names:
             log.warning(
                 "Checkpoint dataset names %s do not match current specs %s — "

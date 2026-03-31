@@ -5,9 +5,14 @@ Abstract interface (Protocol) that every backend must satisfy.
 Each backend implements the same call signatures. Backend-specific concerns
 (e.g. NormSource for DALI, no-op stubs for CPU) are fully encapsulated inside
 the backend. loader.py is backend-agnostic.
+
+[CFG-PIPE] build_pipeline accepte désormais un PipelineConfig au lieu de 8+
+           paramètres individuels, respectant la limite de 5 arguments.
 """
 
 from typing import Any, Protocol, runtime_checkable
+
+from dino_loader.config import PipelineConfig
 
 
 @runtime_checkable
@@ -36,20 +41,10 @@ class BackendProtocol(Protocol):
 
     def build_pipeline(
         self,
-        source:             Any,
-        aug_spec:           Any,
-        aug_cfg:            Any         = None,
-        batch_size:         int         = 1,
-        num_threads:        int         = 8,
-        device_id:          int         = 0,
-        resolution_src:     Any         = None,
-        hw_decoder_load:    float       = 0.90,
-        cpu_queue:          int         = 8,
-        gpu_queue:          int         = 6,
-        seed:               int         = 42,
-        specs:              list | None = None,
-        fuse_normalization: bool        = False,
-        dali_fp8_output:    bool        = False,
+        source:     Any,
+        aug_spec:   Any,
+        pipeline_cfg: PipelineConfig,
+        specs:      list | None = None,
     ) -> Any: ...
 
     def build_pipeline_iterator(

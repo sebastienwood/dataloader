@@ -1,33 +1,22 @@
 """dino_loader.pipeline_graph
 ============================
-``torchdata.nodes``-based post-processing pipeline that replaces the ad-hoc
-``PostProcessPipeline`` for the Batch → Batch transformation stage.
+``torchdata.nodes``-based post-processing pipeline.
 
-Background
-----------
-The original ``PostProcessPipeline`` in ``loader.py`` is a hand-rolled lazy
-iterator with ``.map()``, ``.select()``, and ``.with_epoch()`` methods.  It
-works, but lacks:
+[FIX-RESET] _DINOLoaderNode.reset() : la restauration de ``_num_yielded``
+depuis initial_state était trompeuse car l'itérateur repart toujours de
+zéro (état DALI non sérialisable).  Le commentaire et la doc sont maintenant
+explicites sur ce point, et la restauration de position intra-époque est
+retirée pour éviter une fausse impression de résumabilité fine.
 
-- Proper ``state_dict`` across the full graph (only the underlying loader was
-  checkpointed, not pipeline position).
-- Backpressure between transforms.
-- Composability with ecosystem tools (e.g. ``tn.PinMemory``).
+Le chemin recommandé pour le post-processing est celui-ci. DINODataLoader
+n'expose plus .map()/.select()/.with_epoch() directement.
 
-This module re-implements the same API on top of ``torchdata.nodes``.  The
-original ``PostProcessPipeline`` is preserved in ``loader.py`` for backward
-compatibility; users who want the improved version can opt in via
-:func:`wrap_loader`.
+Usage::
 
-Public API
-----------
-::
+    from dino_loader.pipeline_graph import wrap_loader
 
-    from dino_loader.pipeline_graph import wrap_loader, BatchFilterNode, BatchMapNode
-
-    loader, reader = build_reader_graph(...)
     pipeline = (
-        wrap_loader(base_dino_loader)
+        wrap_loader(DINODataLoader(...))
         .map(apply_ibot_masks)
         .select(quality_ok)
         .with_epoch(steps_per_epoch)
@@ -35,17 +24,9 @@ Public API
 
     for epoch in range(100):
         pipeline.set_epoch(epoch)
-        sd = pipeline.state_dict()          # full graph state
+        sd = pipeline.state_dict()
         for batch in pipeline:
             train_step(batch)
-
-Notes
------
-- ``BatchFilterNode`` is the ``select()`` equivalent; it does *not* rebatch —
-  rejected batches are simply skipped.
-- ``state_dict`` / ``load_state_dict`` are delegated to the underlying
-  ``tn.Loader`` which recursively serialises the whole node graph.
-
 """
 
 from __future__ import annotations
@@ -53,6 +34,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
+
 import torchdata.nodes as tn
 from torchdata.nodes import BaseNode
 
@@ -67,17 +49,7 @@ log = logging.getLogger(__name__)
 
 
 class BatchMapNode(BaseNode):  # type: ignore[misc]
-    """Apply a ``Batch → Batch`` function to every element of a node stream.
-
-    Equivalent to ``tn.Mapper`` but typed for ``Batch`` objects and with a
-    more descriptive name in node graphs.
-
-    Args:
-        source: Upstream node yielding ``Batch`` objects.
-        fn: Transform function ``(Batch) -> Batch``.
-        label: Human-readable label shown in logs/repr.
-
-    """
+    """Apply a ``Batch → Batch`` function to every element of a node stream."""
 
     def __init__(
         self,
@@ -86,39 +58,32 @@ class BatchMapNode(BaseNode):  # type: ignore[misc]
         *,
         label:  str = "<map>",
     ) -> None:
+        """Initialise a BatchMapNode."""
         super().__init__()
         self._source = source
         self._fn     = fn
         self._label  = label
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
+        """Reset upstream source."""
         super().reset(initial_state)
         self._source.reset(initial_state)
 
     def next(self) -> Batch:
+        """Apply fn to the next batch from source."""
         return self._fn(self._source.next())
 
     def get_state(self) -> dict[str, Any]:
+        """Delegate to source."""
         return self._source.get_state()
 
     def __repr__(self) -> str:
+        """Return a compact string representation."""
         return f"BatchMapNode({self._label!r})"
 
 
 class BatchFilterNode(BaseNode):  # type: ignore[misc]
-    """Skip ``Batch`` objects for which a predicate returns ``False``.
-
-    Unlike ``select()`` in the original ``PostProcessPipeline``, this node
-    keeps pulling from ``source`` until it finds an accepted batch — so it
-    never yields ``None``.  Rejected batches are counted via the metrics
-    registry if available.
-
-    Args:
-        source: Upstream node yielding ``Batch`` objects.
-        predicate: ``(Batch) -> bool`` — return ``True`` to keep, ``False`` to skip.
-        label: Human-readable label for logs.
-
-    """
+    """Skip ``Batch`` objects for which a predicate returns ``False``."""
 
     def __init__(
         self,
@@ -127,6 +92,7 @@ class BatchFilterNode(BaseNode):  # type: ignore[misc]
         *,
         label:     str = "<filter>",
     ) -> None:
+        """Initialise a BatchFilterNode."""
         super().__init__()
         self._source    = source
         self._predicate = predicate
@@ -134,11 +100,13 @@ class BatchFilterNode(BaseNode):  # type: ignore[misc]
         self._n_skipped = 0
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
+        """Reset upstream source and clear skip counter."""
         super().reset(initial_state)
         self._source.reset(initial_state)
         self._n_skipped = 0
 
     def next(self) -> Batch:
+        """Return the next batch accepted by the predicate."""
         while True:
             batch = self._source.next()
             if self._predicate(batch):
@@ -147,6 +115,7 @@ class BatchFilterNode(BaseNode):  # type: ignore[misc]
             self._record_filtered()
 
     def get_state(self) -> dict[str, Any]:
+        """Delegate to source."""
         return self._source.get_state()
 
     @property
@@ -155,10 +124,12 @@ class BatchFilterNode(BaseNode):  # type: ignore[misc]
         return self._n_skipped
 
     def __repr__(self) -> str:
+        """Return a compact string representation."""
         return f"BatchFilterNode({self._label!r}, skipped={self._n_skipped})"
 
     @staticmethod
     def _record_filtered() -> None:
+        """Increment the batches_filtered metric if the registry is available."""
         try:
             from dino_loader.monitor.metrics import get_registry  # noqa: PLC0415
             reg = get_registry()
@@ -172,17 +143,20 @@ class _LimitNode(BaseNode):  # type: ignore[misc]
     """Yield at most ``max_steps`` batches per epoch, then raise StopIteration."""
 
     def __init__(self, source: BaseNode, max_steps: int) -> None:  # type: ignore[type-arg]
+        """Initialise a _LimitNode."""
         super().__init__()
         self._source    = source
         self._max_steps = max_steps
         self._yielded   = 0
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
+        """Reset upstream and clear yield counter."""
         super().reset(initial_state)
         self._source.reset(initial_state)
-        self._yielded = initial_state.get("_yielded", 0) if initial_state else 0
+        self._yielded = 0
 
     def next(self) -> Batch:
+        """Return next batch or raise StopIteration when limit is reached."""
         if self._yielded >= self._max_steps:
             raise StopIteration
         batch = self._source.next()
@@ -190,38 +164,19 @@ class _LimitNode(BaseNode):  # type: ignore[misc]
         return batch
 
     def get_state(self) -> dict[str, Any]:
-        return {**self._source.get_state(), "_yielded": self._yielded}
+        """Return source state (limit counter not persisted)."""
+        return self._source.get_state()
 
 
 # ---------------------------------------------------------------------------
-# NodePipeline — the composable wrapper
+# NodePipeline
 # ---------------------------------------------------------------------------
 
 
 class NodePipeline:
     """Composable, stateful post-processing pipeline built on ``torchdata.nodes``.
 
-    Mirrors the ``PostProcessPipeline`` API in ``loader.py`` but delegates
-    state management to ``tn.Loader``, which recursively serialises the
-    entire node graph.
-
     Do not instantiate directly; use :func:`wrap_loader` instead.
-
-    Methods
-    -------
-    map(fn) → NodePipeline
-        Append a ``Batch → Batch`` transform.
-    select(pred) → NodePipeline
-        Drop batches for which ``pred(batch)`` is ``False``.
-    with_epoch(n) → NodePipeline
-        Limit iteration to ``n`` steps per epoch.
-    set_epoch(e)
-        Delegate to the underlying ``DINODataLoader``.
-    checkpoint(step)
-        Delegate to the underlying ``DINODataLoader``.
-    state_dict() / load_state_dict(sd)
-        Full graph state via ``tn.Loader``.
-
     """
 
     def __init__(
@@ -230,26 +185,14 @@ class NodePipeline:
         dino_loader: Any,
         max_steps:   int | None = None,
     ) -> None:
+        """Initialise a NodePipeline."""
         self._root      = root_node
         self._loader    = dino_loader
         self._max_steps = max_steps
-        self._tn_loader: tn.Loader | None = None  # built lazily
-
-    # ------------------------------------------------------------------
-    # Fluent composition API
-    # ------------------------------------------------------------------
+        self._tn_loader: tn.Loader | None = None
 
     def map(self, fn: Callable[[Batch], Batch], *, label: str = "<map>") -> NodePipeline:
-        """Append a ``Batch → Batch`` transform.
-
-        Args:
-            fn: Transform applied to every batch.
-            label: Optional label for debugging.
-
-        Returns:
-            A new ``NodePipeline`` with ``fn`` appended.
-
-        """
+        """Append a ``Batch → Batch`` transform."""
         return NodePipeline(
             root_node   = BatchMapNode(self._root, fn, label=label),
             dino_loader = self._loader,
@@ -262,16 +205,7 @@ class NodePipeline:
         *,
         label: str = "<filter>",
     ) -> NodePipeline:
-        """Drop batches for which ``predicate(batch)`` is ``False``.
-
-        Args:
-            predicate: Return ``True`` to keep a batch, ``False`` to skip it.
-            label: Optional label for debugging.
-
-        Returns:
-            A new ``NodePipeline`` with the filter appended.
-
-        """
+        """Drop batches for which ``predicate(batch)`` is ``False``."""
         return NodePipeline(
             root_node   = BatchFilterNode(self._root, predicate, label=label),
             dino_loader = self._loader,
@@ -279,73 +213,56 @@ class NodePipeline:
         )
 
     def with_epoch(self, n_steps: int) -> NodePipeline:
-        """Limit iteration to ``n_steps`` batches per epoch.
-
-        Args:
-            n_steps: Maximum number of batches yielded before ``StopIteration``.
-
-        Returns:
-            A new ``NodePipeline`` bounded to ``n_steps``.
-
-        """
+        """Limit iteration to ``n_steps`` batches per epoch."""
         return NodePipeline(
             root_node   = self._root,
             dino_loader = self._loader,
             max_steps   = n_steps,
         )
 
-    # ------------------------------------------------------------------
-    # Iteration
-    # ------------------------------------------------------------------
-
     def _build_tn_loader(self) -> tn.Loader:
+        """Build the underlying tn.Loader, adding a _LimitNode if needed."""
         root = self._root
         if self._max_steps is not None:
             root = _LimitNode(root, self._max_steps)
         return tn.Loader(root, restart_on_stop_iteration=True)
 
     def __iter__(self) -> Iterator[Batch]:
+        """Iterate over batches."""
         if self._tn_loader is None:
             self._tn_loader = self._build_tn_loader()
         return iter(self._tn_loader)
 
     def __len__(self) -> int:
+        """Return max_steps if set, else delegate to the underlying loader."""
         if self._max_steps is not None:
             return self._max_steps
         return len(self._loader)
 
-    # ------------------------------------------------------------------
-    # State management (full graph via tn.Loader)
-    # ------------------------------------------------------------------
-
     def state_dict(self) -> dict[str, Any]:
         """Return the full graph state dict.
 
-        Includes the underlying ``DINODataLoader`` state *and* the
-        ``torchdata`` node graph position.
+        Note on intra-epoch resumption
+        --------------------------------
+        The DINODataLoader state (epoch, mixing weights, resolution) is fully
+        persisted.  Within-epoch position is **not** resumable: DALI pipeline
+        state is not serialisable, and the torchdata node graph position only
+        records how many batches were yielded (``_num_yielded``), not the
+        underlying shard position.  On restore, iteration restarts from the
+        beginning of the epoch with the correct epoch seed.
         """
         loader_sd = self._loader.state_dict()
+        tn_sd: dict[str, Any] = {}
         if self._tn_loader is not None:
             tn_sd = self._tn_loader.state_dict()
-        else:
-            tn_sd = {}
         return {"loader": loader_sd, "tn_graph": tn_sd}
 
     def load_state_dict(self, sd: dict[str, Any]) -> None:
-        """Restore the full graph state.
-
-        Args:
-            sd: State dict previously produced by :meth:`state_dict`.
-
-        """
+        """Restore the full graph state."""
         if "loader" in sd:
             self._loader.load_state_dict(sd["loader"])
         if "tn_graph" in sd and self._tn_loader is not None:
             self._tn_loader.load_state_dict(sd["tn_graph"])
-
-    # ------------------------------------------------------------------
-    # DINODataLoader delegation
-    # ------------------------------------------------------------------
 
     def set_epoch(self, epoch: int) -> None:
         """Delegate to the underlying ``DINODataLoader``."""
@@ -374,53 +291,52 @@ class NodePipeline:
 
 
 # ---------------------------------------------------------------------------
-# IterableWrapperNode — bridges DINODataLoader into the node graph
+# _DINOLoaderNode — bridges DINODataLoader into the node graph
 # ---------------------------------------------------------------------------
 
 
 class _DINOLoaderNode(BaseNode):  # type: ignore[misc]
     """Wraps a ``DINODataLoader`` as a ``torchdata.nodes.BaseNode``.
 
-    This is an internal bridge node; end users access it via :func:`wrap_loader`.
-
-    The ``DINODataLoader`` already manages its own async stages internally.
-    This node simply drives its ``__iter__`` and forwards ``set_epoch``
-    calls via the ``NodePipeline`` control API.
-
-    State dict key
-    --------------
-    ``_num_yielded`` — number of batches yielded in the current epoch, used
-    to detect within-epoch position on restore (best-effort; DALI state is
-    not fully serialisable).
+    Restauration de position intra-époque
+    ---------------------------------------
+    ``get_state()`` persiste ``_num_yielded`` pour information, mais
+    ``reset()`` ne tente **pas** de sauter des batches pour retrouver la
+    position.  La raison : DALI pipeline state is not serialisable.  Sur
+    restore, l'itération repart du début de l'époque avec le bon seed.
+    Cela est cohérent avec le comportement de DINODataLoader sans torchdata.
     """
 
     def __init__(self, dino_loader: Any) -> None:
+        """Initialise a _DINOLoaderNode."""
         super().__init__()
         self._dino_loader  = dino_loader
         self._it: Iterator[Batch] | None = None
         self._num_yielded  = 0
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
+        """Re-enter the loader iterator for a new epoch.
+
+        La position intra-époque n'est pas restaurée (voir docstring classe).
+        """
         super().reset(initial_state)
-        # Re-enter the loader iterator (triggers set_epoch internally via
-        # the caller's set_epoch → loader.set_epoch chain).
         self._it          = iter(self._dino_loader)
         self._num_yielded = 0
-        if initial_state:
-            self._num_yielded = initial_state.get("_num_yielded", 0)
 
     def next(self) -> Batch:
+        """Return the next Batch from the loader."""
         assert self._it is not None, "reset() must be called before next()"
         batch = next(self._it)
         self._num_yielded += 1
         return batch
 
     def get_state(self) -> dict[str, Any]:
+        """Return loader state dict plus the number of batches yielded this epoch."""
         loader_sd: dict[str, Any] = {}
         try:
             loader_sd = self._dino_loader.state_dict()
         except RuntimeError:
-            # stateful_dataloader=False — skip gracefully
+            # stateful_dataloader=False — skip gracefully.
             pass
         return {**loader_sd, "_num_yielded": self._num_yielded}
 
@@ -432,10 +348,6 @@ class _DINOLoaderNode(BaseNode):  # type: ignore[misc]
 
 def wrap_loader(dino_loader: Any) -> NodePipeline:
     """Wrap a ``DINODataLoader`` in a composable ``NodePipeline``.
-
-    This is the recommended entry point for Phase-3 usage.  The returned
-    ``NodePipeline`` supports the same fluent API as ``PostProcessPipeline``
-    but with full ``state_dict`` support across the entire graph.
 
     Args:
         dino_loader: A ``DINODataLoader`` instance.
@@ -459,7 +371,6 @@ def wrap_loader(dino_loader: Any) -> NodePipeline:
             pipeline.set_epoch(epoch)
             for batch in pipeline:
                 train_step(batch)
-            # Save full graph state
             sd = pipeline.state_dict()
 
     """

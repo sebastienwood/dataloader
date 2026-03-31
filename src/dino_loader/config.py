@@ -16,6 +16,10 @@ Changes
 [CFG-ARCH3] prometheus_port — opt-in Prometheus metrics endpoint.
 [CFG-NORM] NormStats dataclass — canonical normalisation stats with
            to_dali_scale() helper, eliminating ad-hoc ×255 conversions.
+[CFG-POOL] SharedExtractionPoolConfig — budget de threads borné par MixingSource.
+[CFG-PIPE] PipelineConfig — regroupe les paramètres de build_pipeline pour
+           respecter la limite de 5 arguments de BackendProtocol.
+[CFG-CKPT] checkpoint_dir valide à la construction quand stateful_dataloader=True.
 
 Queue sizing note
 -----------------
@@ -26,6 +30,12 @@ for the removed application-level buffer, keeping the GPU compute pipeline
 fully saturated on NVL72 / B200 hardware where Lustre latency is variable.
 A value of 16 corresponds to ~2 full batches in-flight per worker thread at
 dali_num_threads=8.
+
+allocate_buffers note
+---------------------
+Returns a single pinned tensor per crop type (not a list of two).
+The previous double-buffer was a leftover from AsyncPrefetchIterator and
+served no purpose after its removal.
 """
 
 import json
@@ -73,9 +83,6 @@ class NormStats:
     def to_dali_scale(self) -> tuple[list[float], list[float]]:
         """Return (mean, std) converted to [0, 255] scale for DALI pipelines.
 
-        DALI's ``fn.normalize`` and ``fn.crop_mirror_normalize`` operators
-        expect values in [0, 255] when the input is a decoded uint8 image.
-
         Returns:
             A pair ``(mean_255, std_255)`` where each element is a list of
             three floats in [0, 255].
@@ -99,12 +106,7 @@ class NormStats:
 
     @classmethod
     def imagenet(cls) -> "NormStats":
-        """Standard ImageNet normalisation statistics.
-
-        Returns:
-            ``NormStats`` with ImageNet mean/std (torchvision convention).
-
-        """
+        """Standard ImageNet normalisation statistics."""
         return cls(
             mean=(0.485, 0.456, 0.406),
             std=(0.229, 0.224, 0.225),
@@ -119,9 +121,6 @@ class NormStats:
     ) -> "NormStats":
         """Build a ``NormStats`` from optional per-dataset overrides.
 
-        When both *mean* and *std* are ``None``, returns *fallback* (or
-        ``NormStats.imagenet()`` when *fallback* is also ``None``).
-
         Args:
             mean: Per-channel mean or ``None`` to use the fallback.
             std: Per-channel std or ``None`` to use the fallback.
@@ -135,6 +134,104 @@ class NormStats:
         resolved_mean = mean if mean is not None else base.mean
         resolved_std  = std  if std  is not None else base.std
         return cls(mean=resolved_mean, std=resolved_std)
+
+
+# ---------------------------------------------------------------------------
+# SharedExtractionPoolConfig — budget de threads borné [CFG-POOL]
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SharedExtractionPoolConfig:
+    """Configuration du pool d'extraction partagé entre les ShardIterators.
+
+    Plutôt que de créer N×W threads (N datasets × W workers), MixingSource
+    instancie un seul ``ThreadPoolExecutor`` qu'elle passe à tous ses
+    ``ShardIterator``.  Cela borne le budget total à ``max_workers`` quelle
+    que soit la cardinalité du mix de datasets.
+
+    Attributes:
+        max_workers: Nombre maximum de threads d'extraction simultanés.
+            Valeur recommandée : 4 × nombre de CPUs alloués par GPU.
+            Sur B200 PCIe (16 CPUs/GPU) : 16.  Sur NVL72 (4 CPUs/GPU) : 8.
+        queue_depth_per_shard: Profondeur de la file de samples par shard.
+            Augmenter si les workers d'extraction sont plus rapides que DALI.
+
+    """
+
+    max_workers:          int = 16
+    queue_depth_per_shard: int = 256
+
+    def __post_init__(self) -> None:
+        """Validate pool configuration."""
+        if self.max_workers < 1:
+            msg = f"SharedExtractionPoolConfig.max_workers must be ≥ 1, got {self.max_workers}."
+            raise ValueError(msg)
+        if self.queue_depth_per_shard < 1:
+            msg = (
+                f"SharedExtractionPoolConfig.queue_depth_per_shard must be ≥ 1, "
+                f"got {self.queue_depth_per_shard}."
+            )
+            raise ValueError(msg)
+
+
+# ---------------------------------------------------------------------------
+# PipelineConfig — paramètres de construction du pipeline DALI [CFG-PIPE]
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    """Paramètres de construction du pipeline d'augmentation.
+
+    Regroupe tous les knobs spécifiques au pipeline DALI (ou CPU) pour
+    respecter la limite de 5 arguments de ``BackendProtocol.build_pipeline``
+    et éviter la propagation de paramètres dans toute la hiérarchie d'appels.
+
+    Attributes:
+        num_threads: DALI CPU worker threads for pre-decode operations.
+        device_id: Target CUDA device index.
+        hw_decoder_load: Fraction of JPEG decode routed to nvjpeg HW ASIC.
+        cpu_queue: DALI CPU-side prefetch queue depth.
+        gpu_queue: DALI GPU-side prefetch queue depth.
+        seed: Pipeline RNG seed (rank offset applied by the caller).
+        fuse_normalization: Fuse per-dataset mean/std into the DALI kernel.
+        dali_fp8_output: Fuse FP8 cast into the DALI graph (no TE metadata).
+
+    """
+
+    num_threads:        int   = 8
+    device_id:          int   = 0
+    hw_decoder_load:    float = 0.90
+    cpu_queue:          int   = 16
+    gpu_queue:          int   = 6
+    seed:               int   = 0
+    fuse_normalization: bool  = True
+    dali_fp8_output:    bool  = False
+
+    @classmethod
+    def from_loader_config(cls, cfg: "LoaderConfig", device_id: int, rank: int) -> "PipelineConfig":
+        """Build a ``PipelineConfig`` from a ``LoaderConfig`` and runtime values.
+
+        Args:
+            cfg: Loader-level configuration.
+            device_id: Local GPU index.
+            rank: Global rank (used to derive the per-rank seed offset).
+
+        Returns:
+            A ``PipelineConfig`` ready to pass to ``BackendProtocol.build_pipeline``.
+
+        """
+        return cls(
+            num_threads        = cfg.dali_num_threads,
+            device_id          = device_id,
+            hw_decoder_load    = cfg.hw_decoder_load,
+            cpu_queue          = cfg.dali_cpu_queue,
+            gpu_queue          = cfg.dali_gpu_queue,
+            seed               = cfg.seed + rank,
+            fuse_normalization = cfg.fuse_normalization,
+            dali_fp8_output    = cfg.use_fp8_output and cfg.dali_fp8_output,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -262,12 +359,14 @@ class LoaderConfig:
         node_shm_gb: /dev/shm budget per node in GB.
         shard_prefetch_window: Max concurrent Lustre → /dev/shm downloads.
         shard_timeout_s: Max seconds a non-master rank waits for a shard.
-        shard_extraction_workers: Thread-pool workers for tar → JPEG extraction.
+        shard_extraction_workers: Deprecated — use extraction_pool.max_workers.
+            Kept for backward compatibility; ignored when extraction_pool is set.
         heartbeat_stale_s: Seconds without heartbeat before a /dev/shm dir is
             considered orphaned.
+        extraction_pool: Shared extraction thread pool config [CFG-POOL].
+            Controls the total thread budget across all datasets.
         dali_cpu_queue: DALI CPU-side prefetch queue depth.
-            Default 16 (increased from 8 after AsyncPrefetchIterator removal —
-            DALI's own queues now provide all pipeline buffering).
+            Default 16 (increased from 8 after AsyncPrefetchIterator removal).
         dali_gpu_queue: DALI GPU-side prefetch queue depth.
         dali_num_threads: DALI CPU worker threads for pre-decode operations.
         hw_decoder_load: Fraction of JPEG decodes routed to nvjpeg HW ASIC.
@@ -277,12 +376,12 @@ class LoaderConfig:
         fuse_normalization: Fuse per-dataset normalisation into the DALI kernel.
         output_dtype: Intermediate dtype before optional FP8 cast.
         stateful_dataloader: Enable state_dict() / load_state_dict() interface.
-        checkpoint_dir: Where JSON checkpoint files are written.
+        checkpoint_dir: Where JSON checkpoint files are written.  Must be a
+            non-empty Lustre/NFS path when stateful_dataloader=True.
         checkpoint_every_steps: Checkpoint frequency (rank 0 only).
         force_topology: Override topology detection: "pcie" | None.
         seed: Base random seed.
-        debug_log_keys: Path to per-sample key audit log (disable in production;
-            no size limit — use only for short one-shot debug sessions).
+        debug_log_keys: Path to per-sample key audit log (disable in production).
         stall_timeout_s: Seconds before raising on no batches. 0 = disabled.
         shm_warn_threshold: /dev/shm utilisation fraction that triggers a warning.
         prometheus_port: If set, start a prometheus_client HTTP server on this port.
@@ -295,9 +394,15 @@ class LoaderConfig:
     node_shm_gb:              float = 128.0
     shard_prefetch_window:    int   = 64
     shard_timeout_s:          float = 300.0
+    # Kept for backward compat — use extraction_pool instead.
     shard_extraction_workers: int   = 4
 
     heartbeat_stale_s:        float = 300.0
+
+    # Shared extraction pool [CFG-POOL]
+    extraction_pool: SharedExtractionPoolConfig = field(
+        default_factory=SharedExtractionPoolConfig,
+    )
 
     # DALI — cpu_queue raised to 16 after AsyncPrefetchIterator removal.
     dali_cpu_queue:           int   = 16
@@ -314,9 +419,9 @@ class LoaderConfig:
     fuse_normalization:       bool  = True
     output_dtype:             str   = "bf16"
 
-    # Checkpointing
+    # Checkpointing [CFG-CKPT]
     stateful_dataloader:      bool  = True
-    checkpoint_dir:           str   = "/tmp/dino_loader_ckpt"
+    checkpoint_dir:           str   = ""
     checkpoint_every_steps:   int   = 500
 
     # Cluster
@@ -413,6 +518,15 @@ class LoaderConfig:
                     "prometheus_client.  Install with: pip install prometheus-client"
                 )
                 raise ValueError(msg) from None
+
+        # [CFG-CKPT] Valide checkpoint_dir si le stateful mode est activé.
+        if self.stateful_dataloader and not self.checkpoint_dir:
+            msg = (
+                "LoaderConfig: stateful_dataloader=True requires a non-empty "
+                "checkpoint_dir pointing to a shared filesystem (Lustre/NFS). "
+                "Example: checkpoint_dir='/lustre/ckpts/my_job/dl'"
+            )
+            raise ValueError(msg)
 
     def to_dict(self) -> dict:
         """Serialise to a plain dict."""
@@ -522,7 +636,6 @@ class CheckpointState:
                 raise ValueError(msg)
             data = raw["payload"]
         else:
-            # Legacy flat format — no checksum.  Load with a warning.
             log.warning(
                 "Checkpoint %s uses legacy flat format (no SHA-256 envelope). "
                 "Resave with the current code to upgrade the format.",

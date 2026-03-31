@@ -7,10 +7,13 @@ Concrete backend: NVIDIA DALI + CUDA production path.
 [DALI-AUG-2] UserAugSpec path: _UserAugIterator calls aug_fn on decoded GPU
              tensors after each DALI batch.
 [DALI-AUG-3] EvalAugSpec and LeJEPAAugSpec are fully native DALI pipelines.
+[CFG-PIPE]   build_pipeline accepte PipelineConfig au lieu de 8+ paramètres.
 """
 
 import logging
 from typing import Any
+
+from dino_loader.config import PipelineConfig
 
 log = logging.getLogger(__name__)
 
@@ -22,12 +25,7 @@ except ImportError:
 
 
 class _UserAugIterator:
-    """Wraps a DALI decode-only iterator and applies UserAugSpec.aug_fn.
-
-    DALI provides decoded, normalised Tensor[B, C, H, W] under the key
-    "decoded". aug_fn transforms this into a dict mapping view names to
-    tensors, returned in the same list-of-dict format as DALIGenericIterator.
-    """
+    """Wraps a DALI decode-only iterator and applies UserAugSpec.aug_fn."""
 
     def __init__(self, dali_iter: Any, aug_spec: Any) -> None:
         self._iter   = dali_iter
@@ -39,7 +37,7 @@ class _UserAugIterator:
         return self
 
     def __next__(self) -> list[dict[str, Any]]:
-        raw             = next(self._iter)  # list[{"decoded": Tensor[B,C,H,W]}]
+        raw             = next(self._iter)
         decoded_batch   = raw[0]["decoded"]
         augmented       = self._aug_fn(decoded_batch)
 
@@ -63,10 +61,12 @@ class DALIBackend:
 
     @property
     def name(self) -> str:
+        """Backend name."""
         return "dali"
 
     @property
     def supports_fp8(self) -> bool:
+        """True if transformer-engine is installed."""
         try:
             import transformer_engine.pytorch  # noqa: F401
             return True
@@ -75,6 +75,7 @@ class DALIBackend:
 
     @property
     def supports_gpu(self) -> bool:
+        """True if a CUDA device is available."""
         try:
             import torch
             return torch.cuda.is_available()
@@ -91,35 +92,40 @@ class DALIBackend:
         warn_threshold:  float,
         **kwargs: Any,
     ) -> Any:
+        """Build a NodeSharedShardCache."""
         from dino_loader.shard_cache import NodeSharedShardCache
         return NodeSharedShardCache(
-            node_master       = node_master,
-            job_id            = job_id,
-            max_shm_gb        = max_gb,
-            prefetch_window   = prefetch_window,
-            shard_timeout_s   = timeout_s,
+            node_master        = node_master,
+            job_id             = job_id,
+            max_shm_gb         = max_gb,
+            prefetch_window    = prefetch_window,
+            shard_timeout_s    = timeout_s,
             shm_warn_threshold = warn_threshold,
-            heartbeat_stale_s = kwargs.get("heartbeat_stale_s", 300.0),
+            heartbeat_stale_s  = kwargs.get("heartbeat_stale_s", 300.0),
         )
 
     def build_pipeline(
         self,
-        source:             Any,
-        aug_spec:           Any,
-        aug_cfg:            Any         = None,
-        batch_size:         int         = 1,
-        num_threads:        int         = 8,
-        device_id:          int         = 0,
-        resolution_src:     Any         = None,
-        hw_decoder_load:    float       = 0.90,
-        cpu_queue:          int         = 8,
-        gpu_queue:          int         = 6,
-        seed:               int         = 42,
-        specs:              list | None = None,
-        fuse_normalization: bool        = False,
-        dali_fp8_output:    bool        = False,
+        source:       Any,
+        aug_spec:     Any,
+        pipeline_cfg: PipelineConfig,
+        specs:        list | None = None,
     ) -> Any:
-        """Build and return a compiled DALI pipeline, dispatching on aug_spec type."""
+        """Build and return a compiled DALI pipeline, dispatching on aug_spec type.
+
+        Args:
+            source: MixingSource — DALI ExternalSource callback.
+            aug_spec: Augmentation specification.
+            pipeline_cfg: Regrouped pipeline construction parameters.
+            specs: Dataset specifications for per-dataset normalisation.
+
+        Returns:
+            A compiled DALI pipeline.
+
+        Raises:
+            RuntimeError: If nvidia-dali is not installed.
+
+        """
         try:
             import nvidia.dali  # noqa: F401
         except ImportError:
@@ -136,7 +142,7 @@ class DALIBackend:
         norm_source = None
         if (
             isinstance(aug_spec, DinoV2AugSpec)
-            and fuse_normalization
+            and pipeline_cfg.fuse_normalization
             and specs is not None
         ):
             norm_source = NormSource(aug_cfg=aug_spec.aug_cfg, specs=specs)
@@ -149,17 +155,17 @@ class DALIBackend:
         return build_pipeline(
             source             = source,
             aug_spec           = aug_spec,
-            batch_size         = batch_size,
-            num_threads        = num_threads,
-            device_id          = device_id,
-            resolution_src     = resolution_src,
-            hw_decoder_load    = hw_decoder_load,
-            cpu_queue          = cpu_queue,
-            gpu_queue          = gpu_queue,
-            seed               = seed,
+            batch_size         = _infer_batch_size(source),
+            num_threads        = pipeline_cfg.num_threads,
+            device_id          = pipeline_cfg.device_id,
+            resolution_src     = getattr(source, "_resolution_src", None),
+            hw_decoder_load    = pipeline_cfg.hw_decoder_load,
+            cpu_queue          = pipeline_cfg.cpu_queue,
+            gpu_queue          = pipeline_cfg.gpu_queue,
+            seed               = pipeline_cfg.seed,
             norm_source        = norm_source,
-            fuse_normalization = fuse_normalization,
-            dali_fp8_output    = dali_fp8_output,
+            fuse_normalization = pipeline_cfg.fuse_normalization,
+            dali_fp8_output    = pipeline_cfg.dali_fp8_output,
         )
 
     def build_pipeline_iterator(
@@ -188,10 +194,12 @@ class DALIBackend:
         return dali_iter
 
     def build_h2d_stream(self, device: Any, topo: Any) -> Any:
+        """Build an H2DStream on a dedicated CUDA stream."""
         from dino_loader.memory import H2DStream
         return H2DStream(device=device, topo=topo)
 
     def build_fp8_formatter(self) -> Any:
+        """Build an FP8Formatter backed by Transformer Engine."""
         from dino_loader.memory import FP8Formatter
         return FP8Formatter()
 
@@ -203,7 +211,8 @@ class DALIBackend:
         local_world_size: int = 1,
         force_topology:   str | None = None,
     ) -> Any:
-        from dino_env import detect_topology, DistribEnv
+        """Initialise the distributed environment via dino_env."""
+        from dino_env import DistribEnv, detect_topology
         topo = detect_topology(force=force_topology, gpu_index=local_rank)
         return DistribEnv(
             rank             = rank,
@@ -212,3 +221,8 @@ class DALIBackend:
             local_world_size = local_world_size,
             topology         = topo,
         )
+
+
+def _infer_batch_size(source: Any) -> int:
+    """Infer batch_size from the MixingSource. Falls back to 1."""
+    return getattr(source, "_batch_size", 1)
