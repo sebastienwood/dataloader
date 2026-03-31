@@ -6,100 +6,28 @@ Goals
 -----
 1. **Structured logging** — rank / epoch / step are propagated automatically
    through Python's ``contextvars`` so that every log line emitted from any
-   thread (extraction workers, H2D threads, …) carries the right labels
-   without explicit parameter threading.
+   thread carries the right labels without explicit parameter threading.
 
 2. **OpenTelemetry spans** — each of the 5 pipeline stages is wrapped in an
-   OTEL span so that wall-clock time and causal relationships are captured.
-   Traces can be exported to any OTEL-compatible backend (Jaeger, Tempo,
-   Prometheus OTLP, …).  When the ``opentelemetry-sdk`` package is absent the
-   entire layer degrades gracefully to a zero-cost no-op — not a single extra
-   branch on the critical path.
+   OTEL span. Traces can be exported to any OTEL-compatible backend.
+   When ``opentelemetry-sdk`` is absent the layer degrades gracefully to a
+   zero-cost no-op.
 
 3. **Chrome trace compatibility** — ``tracing.py`` is preserved for backward
-   compatibility, but ``StageTracer`` (below) also records to it when both
-   systems are active, so users need only one code path.
+   compatibility, but ``StageTracer`` also records to it when both systems
+   are active.
 
-Architecture
-------------
-::
-
-    ┌─────────────────────────────────────────────────────┐
-    │  LoaderContext (module-level ContextVar)             │
-    │  rank, epoch, step — propagated to all threads       │
-    └──────────┬──────────────────────────────────────────┘
-               │ read by
-    ┌──────────▼──────────────────────────────────────────┐
-    │  DINOLoggingFilter                                   │
-    │  Injects rank/epoch/step into every LogRecord        │
-    └──────────┬──────────────────────────────────────────┘
-               │ used by
-    ┌──────────▼──────────────────────────────────────────┐
-    │  StageTracer                                         │
-    │  Context manager — wraps a pipeline stage name       │
-    │  • Starts / ends an OTEL span                        │
-    │  • Records to tracing.py Chrome events               │
-    │  • Updates MetricField counters                       │
-    └─────────────────────────────────────────────────────┘
-
-Public API
-----------
-::
-
-    from dino_loader.monitor.otel import (
-        LoaderContext,           # ContextVar holder
-        set_loader_context,      # call once per epoch iteration
-        install_logging_filter,  # call once at loader init
-        StageTracer,             # context manager for pipeline stages
-        stage,                   # convenience: stage("lustre_io")
-    )
-
-Usage in loader.py
-------------------
-::
-
-    from dino_loader.monitor.otel import set_loader_context, stage
-
-    set_loader_context(rank=env.rank, epoch=0, step=0)
-
-    for step, dali_out in enumerate(self._dali_iter):
-        set_loader_context(rank=env.rank, epoch=self._epoch, step=step)
-
-        with stage("h2d_transfer"):
-            batch = self._h2d.transfer(views)
-
-        with stage("fp8_quant"):
-            batch = self._fp8.quantise(batch)
-
-        yield batch
-
-OTEL exporter configuration
-----------------------------
-Set the standard OTEL env vars — dino_loader passes them through unchanged:
-
-    OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
-    OTEL_SERVICE_NAME=dino_loader
-    OTEL_RESOURCE_ATTRIBUTES=slurm_job_id=123456,node=node01
-
-If these vars are absent the tracer runs in "noop" mode (no network I/O).
-
-Implementation notes
---------------------
-* ``contextvars.ContextVar`` propagation is automatic across
-  ``ThreadPoolExecutor`` threads in Python ≥ 3.7 — extraction workers
-  inherit the context of the thread that submitted them, so no explicit
-  passing is needed.
-* ``contextvars.copy_context()`` is used when spawning long-lived threads
-  that must track context changes made after the thread starts (e.g. the
-  epoch counter updated by ``set_epoch``).
-* All public functions are safe to call before ``init_registry()`` —
-  metrics updates are silently skipped if the registry is unavailable.
+Corrections
+-----------
+[FIX-OTEL-LOCK] _TRACER et _TRACER_INITIALISED sont maintenant protégés par
+    un threading.Lock pour éviter la double-initialisation si deux threads
+    appellent init_otel() simultanément.
+[FIX-FUTURE] from __future__ import annotations supprimé (Python ≥ 3.12 natif).
 """
-
-from __future__ import annotations
 
 import contextvars
 import logging
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -120,8 +48,6 @@ class _LoaderCtx:
     step:  int = 0
 
 
-# Module-level ContextVar.  Frozen dataclasses are set atomically (replace the
-# whole object), so there is no risk of a reader observing a half-updated state.
 _ctx_var: contextvars.ContextVar[_LoaderCtx] = contextvars.ContextVar(
     "dino_loader_context",
     default=_LoaderCtx(),
@@ -132,8 +58,7 @@ class LoaderContext:
     """Read-only view of the current rank / epoch / step.
 
     Thread-safe by construction: ``ContextVar`` reads are always consistent
-    within a given execution context, and writes from one thread do not
-    bleed into another thread's context unless explicitly copied.
+    within a given execution context.
 
     Example::
 
@@ -148,11 +73,7 @@ class LoaderContext:
 
     @staticmethod
     def set(rank: int, epoch: int, step: int) -> contextvars.Token:
-        """Update the context in the current thread / coroutine.
-
-        Returns a ``Token`` that can be passed to ``reset()`` to undo the
-        change (useful in tests that need deterministic isolation).
-        """
+        """Update the context in the current thread / coroutine."""
         return _ctx_var.set(_LoaderCtx(rank=rank, epoch=epoch, step=step))
 
     @staticmethod
@@ -162,19 +83,7 @@ class LoaderContext:
 
 
 def set_loader_context(rank: int, epoch: int, step: int) -> None:
-    """Convenience wrapper — update the loader context from the training loop.
-
-    Call this at the start of each step (inside ``_raw_iter``) so that every
-    log line emitted anywhere in that step's call graph carries the correct
-    rank / epoch / step labels — including lines from background threads that
-    inherited this context when their futures were submitted.
-
-    Example::
-
-        for step, batch in enumerate(loader):
-            set_loader_context(rank=env.rank, epoch=epoch, step=step)
-            train_step(batch)
-    """
+    """Convenience wrapper — update the loader context from the training loop."""
     LoaderContext.set(rank=rank, epoch=epoch, step=step)
 
 
@@ -187,26 +96,16 @@ class DINOLoggingFilter(logging.Filter):
     ``LogRecord`` produced by a logger that has this filter installed.
 
     After installing, use ``%(rank)s``, ``%(epoch)s``, ``%(step)s`` in your
-    format string::
-
-        %(asctime)s %(levelname)-8s [rank=%(rank)s ep=%(epoch)s st=%(step)s] %(name)s %(message)s
-
-    Thread safety
-    -------------
-    Reading from a ContextVar is always consistent within the current
-    execution context — no locking required.
-
-    Installation
-    ------------
-    Use ``install_logging_filter()`` rather than instantiating directly.
+    format string.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        """Inject context fields into the log record."""
         ctx = LoaderContext.get()
         record.rank  = ctx.rank
         record.epoch = ctx.epoch
         record.step  = ctx.step
-        return True  # always pass the record through
+        return True
 
 
 def install_logging_filter(
@@ -219,30 +118,17 @@ def install_logging_filter(
 ) -> logging.Filter:
     """Attach a :class:`DINOLoggingFilter` to *logger* (default: root logger).
 
-    Also replaces the first ``StreamHandler`` found on the logger with one
-    using *fmt* so that the rank/epoch/step fields are visible immediately.
-    Existing non-stream handlers (file, syslog, …) are left untouched.
-
     Parameters
     ----------
     logger
-        Logger to patch.  Defaults to the root logger so that all loggers in
-        the process tree benefit automatically.
+        Logger to patch.  Defaults to the root logger.
     fmt
-        Log format string.  Must contain ``%(rank)s``, ``%(epoch)s``,
-        ``%(step)s`` to show the injected fields.
+        Log format string.
 
     Returns
     -------
     DINOLoggingFilter
         The installed filter instance (useful for testing / removal).
-
-    Example::
-
-        install_logging_filter()
-        logging.basicConfig(level=logging.INFO)
-        log.info("starting")
-        # → 14:32:01 INFO     [rank=0 ep=3 st=512] dino_loader.loader starting
 
     """
     if logger is None:
@@ -251,7 +137,6 @@ def install_logging_filter(
     f = DINOLoggingFilter()
     logger.addFilter(f)
 
-    # Patch the first StreamHandler we find so that the new fields show up.
     for handler in logger.handlers:
         if isinstance(handler, logging.StreamHandler):
             handler.setFormatter(logging.Formatter(fmt=fmt, datefmt="%H:%M:%S"))
@@ -286,18 +171,7 @@ except ImportError:
 
 
 def _build_tracer(service_name: str = "dino_loader") -> object:
-    """Build and register an OTEL ``TracerProvider`` from environment variables.
-
-    Priority
-    --------
-    1. ``OTEL_EXPORTER_OTLP_ENDPOINT`` → gRPC OTLP exporter (Jaeger / Tempo).
-    2. ``OTEL_CONSOLE_EXPORTER=1``      → stdout JSON (debugging).
-    3. No env vars set               → SDK noop tracer (zero overhead).
-
-    The provider is registered as the global OTEL provider so that any
-    downstream code using ``opentelemetry.trace.get_tracer()`` participates
-    in the same trace automatically.
-    """
+    """Build and register an OTEL ``TracerProvider`` from environment variables."""
     if not _HAS_OTEL:
         return None
 
@@ -319,43 +193,48 @@ def _build_tracer(service_name: str = "dino_loader") -> object:
     return _otel_trace.get_tracer(service_name)
 
 
-# Lazy singleton — created on first call to ``init_otel()`` or ``stage()``.
+# [FIX-OTEL-LOCK] Lock protégeant le singleton OTEL contre la double-init.
+# Sans ce lock, deux threads appelant init_otel() simultanément pourraient
+# créer deux TracerProvider distincts, dont seul le second serait enregistré.
+_TRACER_LOCK: threading.Lock = threading.Lock()
 _TRACER: object = None
-_TRACER_INITIALISED = False
+_TRACER_INITIALISED: bool = False
 
 
 def init_otel(service_name: str = "dino_loader") -> None:
     """Initialise the OTEL tracer.  Safe to call multiple times (idempotent).
 
-    Call once at loader construction time, before the first batch.  If
-    ``opentelemetry-sdk`` is not installed, this is a silent no-op.
+    Thread-safe: utilise un lock pour éviter la double-initialisation si
+    deux threads appellent init_otel() simultanément (ex. ranks différents
+    dans un job multi-GPU partagé).
 
     Parameters
     ----------
     service_name
-        OTEL ``service.name`` resource attribute (overrides the default
-        ``"dino_loader"`` value).
+        OTEL ``service.name`` resource attribute.
 
     """
-    global _TRACER, _TRACER_INITIALISED
+    global _TRACER, _TRACER_INITIALISED  # noqa: PLW0603
+    # Double-checked locking pour minimiser le coût sur le chemin rapide.
     if _TRACER_INITIALISED:
         return
-    _TRACER = _build_tracer(service_name)
-    _TRACER_INITIALISED = True
+    with _TRACER_LOCK:
+        if _TRACER_INITIALISED:
+            return
+        _TRACER = _build_tracer(service_name)
+        _TRACER_INITIALISED = True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. StageTracer — unified span + Chrome trace + metrics
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Map of stage name → MetricField to increment (ms elapsed).
-# Imported lazily to avoid a hard dependency cycle at module level.
 _STAGE_METRIC: dict[str, str] = {
     "lustre_io":       "lustre_read_time_ms",
     "shard_wait":      "shard_cache_wait_time_ms",
     "dali_pipeline":   "pipeline_yield_time_ms",
     "h2d_transfer":    "h2d_transfer_time_ms",
-    "fp8_quant":       "pipeline_yield_time_ms",   # folded into pipeline time
+    "fp8_quant":       "pipeline_yield_time_ms",
     "network_stall":   "network_stall_time_ms",
     "multinode_stall": "multinode_stall_time_ms",
 }
@@ -371,45 +250,21 @@ def stage(
 
     What it does (all in one call)
     -------------------------------
-    1. Starts an OTEL span with ``name`` and the current
-       ``rank`` / ``epoch`` / ``step`` as span attributes.
-    2. Records a Chrome trace event via ``tracing.py`` (zero-cost if tracing
-       is not started).
-    3. On exit, updates the corresponding ``MetricField`` counter with the
-       elapsed milliseconds.
-
-    Zero overhead guarantee
-    -----------------------
-    When OTEL is unavailable **and** Chrome tracing is not started, the entire
-    body reduces to::
-
-        t0 = time.perf_counter_ns()
-        yield
-        elapsed_ns = time.perf_counter_ns() - t0
-        # → 2 syscalls total, no allocation, no lock
+    1. Starts an OTEL span with ``name`` and the current context.
+    2. Records a Chrome trace event via ``tracing.py``.
+    3. On exit, updates the corresponding ``MetricField`` counter.
 
     Parameters
     ----------
     name
         Stage identifier.  Must be one of the keys in ``_STAGE_METRIC``
-        for metrics to be updated; unknown names are silently ignored for
-        metrics (but still traced).
+        for metrics to be updated.
     attributes
-        Optional dict of extra OTEL span attributes (e.g. ``{"shard": path}``).
-
-    Example::
-
-        with stage("h2d_transfer"):
-            gpu_batch = h2d.transfer(cpu_batch)
-
-        with stage("lustre_io", attributes={"shard": shard_path}):
-            data = lustre_read(shard_path)
+        Optional dict of extra OTEL span attributes.
 
     """
-    # ── Retrieve context ──────────────────────────────────────────────────────
     ctx = LoaderContext.get()
 
-    # ── OTEL span ─────────────────────────────────────────────────────────────
     otel_span = None
     if _HAS_OTEL and _TRACER is not None:
         span_attrs = {
@@ -421,10 +276,8 @@ def stage(
             span_attrs.update(attributes)
         otel_span = _TRACER.start_span(name, attributes=span_attrs)  # type: ignore[attr-defined]
 
-    # ── Chrome tracing ────────────────────────────────────────────────────────
-    # Import here to avoid module-level circular dependency.
     try:
-        from dino_loader.monitor import tracing as _tracing
+        from dino_loader.monitor import tracing as _tracing  # noqa: PLC0415
         _chrome_enabled = _tracing._GLOBAL_TRACER.enabled
     except Exception:
         _chrome_enabled = False
@@ -437,15 +290,13 @@ def stage(
         elapsed_ns = time.perf_counter_ns() - t_start_ns
         elapsed_ms = elapsed_ns // 1_000_000
 
-        # ── Finalise OTEL span ────────────────────────────────────────────────
         if otel_span is not None:
             try:
                 otel_span.set_attribute("elapsed_ms", elapsed_ms)
                 otel_span.end()
             except Exception:
-                pass  # never let observability crash the training loop
+                pass
 
-        # ── Chrome trace event ────────────────────────────────────────────────
         if _chrome_enabled:
             try:
                 _tracing._GLOBAL_TRACER.record(
@@ -457,11 +308,10 @@ def stage(
             except Exception:
                 pass
 
-        # ── Metrics update ────────────────────────────────────────────────────
         metric_field = _STAGE_METRIC.get(name)
         if metric_field:
             try:
-                from dino_loader.monitor.metrics import get_registry
+                from dino_loader.monitor.metrics import get_registry  # noqa: PLC0415
                 reg = get_registry()
                 if reg is not None:
                     reg.inc(metric_field, int(elapsed_ms))
@@ -470,7 +320,7 @@ def stage(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. Convenience: stage_timer — a non-context-manager version for async paths
+# 5. StageTimer — non-context-manager version for async paths
 # ══════════════════════════════════════════════════════════════════════════════
 
 class StageTimer:
@@ -482,7 +332,7 @@ class StageTimer:
         timer = StageTimer("shard_wait")
         timer.start()
         shard = await shard_cache.get_async(path)
-        elapsed_ms = timer.stop()   # records metrics + Chrome trace
+        elapsed_ms = timer.stop()
     """
 
     __slots__ = ("_attributes", "_name", "_t_start_ns")
@@ -492,16 +342,13 @@ class StageTimer:
         self._attributes = attributes
         self._t_start_ns: int | None = None
 
-    def start(self) -> StageTimer:
+    def start(self) -> "StageTimer":
+        """Start the timer."""
         self._t_start_ns = time.perf_counter_ns()
         return self
 
     def stop(self) -> int:
-        """Stop the timer, record metrics / traces, and return elapsed ms.
-
-        Calling ``stop()`` without a prior ``start()`` logs a warning and
-        returns 0 — it never raises.
-        """
+        """Stop the timer, record metrics / traces, and return elapsed ms."""
         if self._t_start_ns is None:
             log.warning("StageTimer('%s').stop() called without start()", self._name)
             return 0
@@ -512,9 +359,8 @@ class StageTimer:
 
         ctx = LoaderContext.get()
 
-        # Chrome trace
         try:
-            from dino_loader.monitor import tracing as _tracing
+            from dino_loader.monitor import tracing as _tracing  # noqa: PLC0415
             if _tracing._GLOBAL_TRACER.enabled:
                 _tracing._GLOBAL_TRACER.record(
                     name     = f"{self._name}[rank={ctx.rank}]",
@@ -525,11 +371,10 @@ class StageTimer:
         except Exception:
             pass
 
-        # Metrics
         metric_field = _STAGE_METRIC.get(self._name)
         if metric_field:
             try:
-                from dino_loader.monitor.metrics import get_registry
+                from dino_loader.monitor.metrics import get_registry  # noqa: PLC0415
                 reg = get_registry()
                 if reg is not None:
                     reg.inc(metric_field, int(elapsed_ms))
@@ -544,15 +389,11 @@ class StageTimer:
 # ══════════════════════════════════════════════════════════════════════════════
 
 __all__ = [
-    # Context
     "LoaderContext",
     "set_loader_context",
-    # Logging
     "DINOLoggingFilter",
     "install_logging_filter",
-    # OTEL lifecycle
     "init_otel",
-    # Tracing
     "stage",
     "StageTimer",
 ]

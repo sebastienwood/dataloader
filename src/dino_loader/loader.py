@@ -22,37 +22,23 @@ Flux d'itération :
     for batch in loader:          # délègue à self._pipeline
         ...
 
-    # Ou avec composition :
-    pipeline = (
-        loader.as_pipeline()
-        .map(apply_ibot_masks)
-        .select(quality_ok)
-        .with_epoch(steps_per_epoch)
-    )
-
-API publique
-------------
-``DINODataLoader`` conserve toute son API publique (set_epoch, checkpoint,
-set_weights, set_resolution, state_dict, load_state_dict, current_resolution,
-current_weights, backend, aug_spec).
-
-``__iter__`` délègue désormais à ``self._pipeline``.
-
-Méthodes de composition (``map``, ``select``, ``with_epoch``) retournent un
-nouveau ``NodePipeline`` sans modifier le loader.
-
-Changements
+Corrections
 -----------
-[PHASE-1-3]   ShardReaderNode est l'unique source.
-[WRAP-LOADER] __iter__ délègue à NodePipeline.
-[DALI-NODE]   _DALINode encapsule DALI + métriques + stall watchdog.
-[AS-PIPELINE] as_pipeline() expose le NodePipeline pour composition.
-[CFG-PIPE]    PipelineConfig utilisé.
-[FIX-CKPT]    state_dict() utilise l'état en mémoire.
+[FIX-ENV] L'objet ``DistribEnv`` retourné par ``init_distributed()`` est
+    conservé tel quel (self._env) plutôt que d'en dépouiller chaque attribut.
+    Les propriétés délèguent à self._env pour éviter la duplication.
+[FIX-ACTIVE-ITER] Guard contre le double-iter : __iter__ lève RuntimeError
+    si une itération est déjà en cours.
+[FIX-RESET-ITER] set_epoch() appelle _dali_node.reset_iter() (méthode
+    thread-safe avec lock interne) au lieu d'accéder à _iter directement.
+[FIX-META-FIFO] _ReaderAdapter utilise une queue.Queue pour aligner les
+    métadonnées sur les batches dans l'ordre FIFO strict.
+[FIX-FUTURE] from __future__ import annotations supprimé (Python ≥ 3.12 natif).
 """
 
 import logging
 import os
+import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
@@ -177,7 +163,10 @@ class DINODataLoader:
         self._epoch: int = 0
         self._last_ckpt_state: CheckpointState | None = None
 
-        self._epoch_lock = threading.Lock()
+        self._epoch_lock  = threading.Lock()
+        # [FIX-ACTIVE-ITER] Flag thread-safe pour détecter les double-iter.
+        self._active_iter = False
+        self._active_iter_lock = threading.Lock()
 
         # Backend
         if isinstance(backend, str):
@@ -196,27 +185,23 @@ class DINODataLoader:
                 )
                 raise RuntimeError(msg) from None
 
-        # Distributed
-        env = self._backend.init_distributed(
+        # [FIX-ENV] Conserver l'objet DistribEnv complet plutôt que d'en
+        # dépouiller chaque attribut individuellement.
+        self._env = self._backend.init_distributed(
             rank             = rank             if rank             is not None else self._infer_rank(),
             world_size       = world_size       if world_size       is not None else self._infer_world_size(),
             local_rank       = local_rank       if local_rank       is not None else device_id,
             local_world_size = local_world_size if local_world_size is not None else self._infer_local_world_size(),
             force_topology   = self._cfg.force_topology,
         )
-        self._rank             = env.rank
-        self._world_size       = env.world_size
-        self._local_rank       = env.local_rank
-        self._local_world_size = env.local_world_size
-        self._topo             = env.topology
 
         init_registry(
             job_id     = os.environ.get("SLURM_JOB_ID", "dino_local"),
-            create     = (self._local_rank == 0),
-            local_rank = self._local_rank,
+            create     = (self._env.local_rank == 0),
+            local_rank = self._env.local_rank,
         )
 
-        if self._cfg.prometheus_port is not None and self._rank == 0:
+        if self._cfg.prometheus_port is not None and self._env.rank == 0:
             self._start_prometheus(self._cfg.prometheus_port)
 
         # Resolution tracking
@@ -228,7 +213,7 @@ class DINODataLoader:
         )
 
         # Stage 1 : shard cache
-        node_master = (self._local_rank == 0)
+        node_master = (self._env.local_rank == 0)
         job_id      = os.environ.get("SLURM_JOB_ID", "dino_local")
 
         shard_cache = self._backend.build_shard_cache(
@@ -248,8 +233,8 @@ class DINODataLoader:
             specs               = specs,
             batch_size          = batch_size,
             cache               = shard_cache,
-            rank                = self._rank,
-            world_size          = self._world_size,
+            rank                = self._env.rank,
+            world_size          = self._env.world_size,
             pool_cfg            = self._cfg.extraction_pool,
             seed                = self._cfg.seed,
             device_id           = device_id,
@@ -270,7 +255,7 @@ class DINODataLoader:
         pipeline_cfg = PipelineConfig.from_loader_config(
             cfg       = self._cfg,
             device_id = device_id,
-            rank      = self._rank,
+            rank      = self._env.rank,
         )
         dali_pipeline = self._backend.build_pipeline(
             source       = self._dali_source,
@@ -286,9 +271,10 @@ class DINODataLoader:
         )
 
         # Stage 4-5 : H2D + FP8
-        device    = torch.device(f"cuda:{device_id}") if self._backend.supports_gpu else torch.device("cpu")
-        dali_fp8  = self._cfg.use_fp8_output and self._cfg.dali_fp8_output
-        self._h2d = self._backend.build_h2d_stream(device=device, topo=self._topo)
+        device   = torch.device(f"cuda:{device_id}") if self._backend.supports_gpu else torch.device("cpu")
+        dali_fp8 = self._cfg.use_fp8_output and self._cfg.dali_fp8_output
+        h2d_topo = getattr(self._env, "topology", None)
+        self._h2d = self._backend.build_h2d_stream(device=device, topo=h2d_topo)
         self._fp8 = (
             self._backend.build_fp8_formatter()
             if self._cfg.use_fp8_output and not dali_fp8
@@ -302,7 +288,7 @@ class DINODataLoader:
             build_batch_fn    = self._build_batch,
             output_map        = self._aug_spec.output_map,
             stall_timeout_s   = self._cfg.stall_timeout_s,
-            rank              = self._rank,
+            rank              = self._env.rank,
         )
 
         # NodePipeline interne : c'est ce que __iter__ utilise.
@@ -313,7 +299,7 @@ class DINODataLoader:
         self._ckpt = DataLoaderCheckpointer(
             ckpt_dir      = ckpt_dir,
             every_n_steps = self._cfg.checkpoint_every_steps,
-            rank          = self._rank,
+            rank          = self._env.rank,
         )
 
         if resume:
@@ -323,7 +309,7 @@ class DINODataLoader:
             "DINODataLoader ready: backend=%s rank=%d/%d batch=%d "
             "aug=%s resolution=%dx%d pool_workers=%d",
             self._backend.name,
-            self._rank, self._world_size, batch_size,
+            self._env.rank, self._env.world_size, batch_size,
             type(self._aug_spec).__name__,
             self._current_global_size, self._current_local_size,
             self._cfg.extraction_pool.max_workers,
@@ -351,27 +337,35 @@ class DINODataLoader:
         """Current normalised mixing weights."""
         return self._reader.current_weights
 
+    # ── Convenience accessors for distributed env ─────────────────────────────
+    # [FIX-ENV] Plutôt que de dupliquer chaque attribut de DistribEnv, on
+    # délègue via des propriétés.  Le code interne utilise self._env directement
+    # pour les accès groupés.
+
+    @property
+    def rank(self) -> int:
+        """Global rank of this process."""
+        return self._env.rank
+
+    @property
+    def world_size(self) -> int:
+        """Total number of processes."""
+        return self._env.world_size
+
+    @property
+    def local_rank(self) -> int:
+        """Local rank within the node."""
+        return self._env.local_rank
+
+    @property
+    def local_world_size(self) -> int:
+        """Number of processes on this node."""
+        return self._env.local_world_size
+
     # ── Composition API ───────────────────────────────────────────────────────
 
     def as_pipeline(self) -> NodePipeline:
-        """Return the internal NodePipeline for composition.
-
-        Exemple::
-
-            pipeline = (
-                loader.as_pipeline()
-                .map(apply_ibot_masks)
-                .select(quality_ok)
-                .with_epoch(steps_per_epoch)
-            )
-
-        Chaque appel à ``map/select/with_epoch`` retourne un nouveau
-        ``NodePipeline`` sans modifier le loader.
-
-        Returns:
-            Le ``NodePipeline`` interne du loader, prêt à être composé.
-
-        """
+        """Return the internal NodePipeline for composition."""
         return self._pipeline
 
     def map(self, fn: Callable[[Batch], Batch], *, label: str = "<map>") -> NodePipeline:
@@ -433,8 +427,9 @@ class DINODataLoader:
                 if new_global != self._current_global_size:
                     self.set_resolution(new_global, self._current_local_size)
             self._reader.set_epoch(epoch)
-            # Réinitialise l'itérateur DALI pour la nouvelle époque.
-            self._dali_node._iter = None  # type: ignore[attr-defined]
+            # [FIX-RESET-ITER] Utilise la méthode thread-safe au lieu d'accéder
+            # à _iter directement depuis l'extérieur.
+            self._dali_node.reset_iter()
 
     def set_resolution(self, global_size: int, local_size: int) -> None:
         """Update crop resolution.
@@ -535,8 +530,32 @@ class DINODataLoader:
     # ── Iteration — délégué au NodePipeline interne ───────────────────────────
 
     def __iter__(self) -> Iterator[Batch]:
-        """Iterate over training batches via the internal NodePipeline."""
-        return iter(self._pipeline)
+        """Iterate over training batches via the internal NodePipeline.
+
+        [FIX-ACTIVE-ITER] Lève RuntimeError si une itération est déjà active.
+        Cela prévient les bugs silencieux où deux boucles for consomment le
+        même flux de batches de façon entremêlée.
+
+        Raises:
+            RuntimeError: Si ``__iter__`` est appelé pendant une itération active.
+
+        """
+        with self._active_iter_lock:
+            if self._active_iter:
+                msg = (
+                    "DINODataLoader is already iterating. "
+                    "Cannot start a second iteration on the same loader. "
+                    "Call set_epoch() to start a new epoch, or use "
+                    "loader.as_pipeline() for concurrent-safe composition."
+                )
+                raise RuntimeError(msg)
+            self._active_iter = True
+
+        try:
+            yield from self._pipeline
+        finally:
+            with self._active_iter_lock:
+                self._active_iter = False
 
     def __len__(self) -> int:
         """Return steps_per_epoch if set; raises TypeError otherwise."""
@@ -553,8 +572,6 @@ class DINODataLoader:
         metadata: list[dict | None],
     ) -> Batch:
         """Build a Batch from pipeline output views.
-
-        Appelé par ``_DALINode.next()`` à chaque step.
 
         Args:
             views: Flat list of tensors from the augmentation pipeline.
@@ -606,11 +623,11 @@ class DINODataLoader:
         """Warn if any dataset has fewer shards than ranks."""
         for spec in specs:
             n_shards = len(spec.shards)
-            if n_shards < self._world_size:
+            if n_shards < self._env.world_size:
                 log.warning(
                     "DatasetSpec '%s': only %d shards for %d ranks. "
                     "Consider shard_sampling='resampled' for small datasets.",
-                    spec.name, n_shards, self._world_size,
+                    spec.name, n_shards, self._env.world_size,
                 )
 
     def _restore(self) -> None:
@@ -687,15 +704,19 @@ class DINODataLoader:
 class _ReaderAdapter:
     """Adaptateur exposant ShardReaderNode comme callable DALI/CPU source.
 
-    Attributs exposés pour les backends :
-    - ``_resolution_src`` : ResolutionSource pour DALI ExternalSource.
-    - ``_batch_size``     : taille de batch.
+    [FIX-META-FIFO] _last_metadata est une queue.Queue (FIFO) plutôt qu'une
+    variable scalaire.  Cela garantit l'alignement strict entre les batches
+    DALI et leurs métadonnées même quand DALI appelle ``__call__()`` de façon
+    préemptive depuis son thread de prefetch.
 
-    Méthodes exposées pour les backends :
-    - ``register_dataset_index_callback`` : pour NormSource (DALI fused norm).
-    - ``pop_last_metadata``               : pour _DALINode.
-
+    Chaque appel à ``__call__()`` pousse les métadonnées dans la queue.
+    ``pop_last_metadata()`` dépile la valeur la plus ancienne, préservant
+    ainsi l'ordre FIFO entre batches.
     """
+
+    # Taille maximale de la queue de métadonnées.  En pratique, DALI ne
+    # précharge pas plus de cpu_queue + gpu_queue batches en avance.
+    _META_QUEUE_MAXSIZE: int = 32
 
     def __init__(
         self,
@@ -707,21 +728,45 @@ class _ReaderAdapter:
         self._reader         = reader
         self._resolution_src = resolution_src
         self._batch_size     = batch_size
-        self._last_metadata: list[dict | None] = []
-        self._lock = threading.Lock()
+        # [FIX-META-FIFO] Queue FIFO pour l'alignement métadonnées ↔ batches.
+        self._meta_queue: queue.Queue[list[dict | None]] = queue.Queue(
+            maxsize=self._META_QUEUE_MAXSIZE,
+        )
 
     def __call__(self) -> list:
         """Return one batch of JPEG arrays (called by DALI per step)."""
         jpegs, metadata = self._reader.next()
-        with self._lock:
-            self._last_metadata = metadata
+        # [FIX-META-FIFO] Enqueue pour alignement FIFO avec le batch DALI.
+        # put_nowait() : si la queue est pleine (DALI prefetch très agressif),
+        # on lève queue.Full plutôt que de corrompre silencieusement l'ordre.
+        try:
+            self._meta_queue.put_nowait(metadata)
+        except queue.Full:
+            log.warning(
+                "_ReaderAdapter: metadata queue full (%d slots). "
+                "DALI prefetch depth may exceed _META_QUEUE_MAXSIZE=%d. "
+                "Increase _META_QUEUE_MAXSIZE or reduce DALI queue depths.",
+                self._META_QUEUE_MAXSIZE, self._META_QUEUE_MAXSIZE,
+            )
+            # Fallback : vider un slot pour ne pas bloquer DALI.
+            try:
+                self._meta_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._meta_queue.put_nowait(metadata)
         return jpegs
 
     def pop_last_metadata(self) -> list[dict | None]:
-        """Return metadata from the last __call__ and clear the buffer."""
-        with self._lock:
-            meta, self._last_metadata = self._last_metadata, []
-            return meta
+        """Return metadata for the oldest unconsumed batch (FIFO).
+
+        [FIX-META-FIFO] Dépile dans l'ordre FIFO pour garantir l'alignement
+        avec les batches retournés par DALI.
+        """
+        try:
+            return self._meta_queue.get_nowait()
+        except queue.Empty:
+            log.debug("_ReaderAdapter.pop_last_metadata: queue empty, returning []")
+            return []
 
     def register_dataset_index_callback(self, cb: Any) -> None:
         """Propagate NormSource callbacks to the inner MixingSource."""

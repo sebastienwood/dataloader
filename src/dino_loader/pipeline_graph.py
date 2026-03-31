@@ -6,7 +6,7 @@ Architecture
 ------------
 Ce module est le point d'entrée unique pour la composition post-augmentation.
 ``DINODataLoader`` construit un ``NodePipeline`` en interne via
-``_build_pipeline_graph()``.  L'utilisateur peut ensuite l'enrichir via
+``wrap_loader()``.  L'utilisateur peut ensuite l'enrichir via
 ``.map()``, ``.select()``, ``.with_epoch()`` sans toucher au loader.
 
 Rôle de chaque classe
@@ -27,47 +27,28 @@ Rôle de chaque classe
 
 ``NodePipeline``
     Wrapper composable.  Expose toutes les propriétés publiques de
-    ``DINODataLoader`` (``current_resolution``, ``current_weights``,
-    ``backend``, ``aug_spec``) pour que l'utilisateur n'ait jamais besoin
-    d'accéder au loader sous-jacent directement.
-
-API utilisateur
----------------
-::
-
-    from dino_loader import DINODataLoader
-    from dino_loader.pipeline_graph import wrap_loader
-
-    # Usage standalone (wrap_loader depuis l'extérieur)
-    pipeline = (
-        wrap_loader(DINODataLoader(...))
-        .map(apply_ibot_masks)
-        .select(quality_ok)
-        .with_epoch(steps_per_epoch)
-    )
-
-    # Ou via le loader lui-même (wrap_loader implicite)
-    loader = DINODataLoader(...)
-    pipeline = loader.as_pipeline()  # → NodePipeline prêt à l'emploi
-
-    for epoch in range(100):
-        pipeline.set_epoch(epoch)
-        for batch in pipeline:
-            train_step(batch)
+    ``DINODataLoader``.
 
 Corrections
 -----------
-[FIX-RESET] _DALINode.reset() ne restaure pas la position intra-époque
-    (DALI non sérialisable) — documenté explicitement.
-[METRICS]   Métriques et stall watchdog déplacés dans _DALINode.
+[FIX-ITER-RACE] _DALINode expose reset_iter() avec lock interne pour éviter
+    la race condition entre set_epoch() (thread principal) et next() (thread
+    tn.Loader).  loader.py utilise reset_iter() au lieu d'accéder à _iter
+    directement.
+[FIX-DOUBLE-ITER] DINODataLoader.__iter__ et NodePipeline gèrent l'itération
+    active via _active_iter pour lever RuntimeError si deux itérations
+    démarrent simultanément.
+[FIX-STATE-MAX-STEPS] max_steps est inclus dans state_dict() / load_state_dict()
+    pour qu'un round-trip le restitue correctement.
+[FIX-FUTURE] from __future__ import annotations supprimé (Python ≥ 3.12 natif).
+[METRICS]   Métriques et stall watchdog dans _DALINode.
 [PROPS]     NodePipeline expose current_resolution, current_weights,
     backend, aug_spec.
 """
 
-from __future__ import annotations
-
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
@@ -95,6 +76,13 @@ class _DALINode(BaseNode):  # type: ignore[misc]
     - La mise à jour des métriques (batches_yielded, pipeline_yield_ms).
     - La détection de stall (aucun batch produit après ``stall_timeout_s``).
 
+    Thread safety
+    -------------
+    ``reset_iter()`` et ``next()`` peuvent être appelés depuis des threads
+    différents (thread principal vs thread tn.Loader).  ``_iter_lock`` protège
+    l'accès à ``_iter`` pour éviter la race condition entre ``reset_iter()``
+    (appelé par ``set_epoch()``) et ``next()``.
+
     Restauration intra-époque
     --------------------------
     ``reset()`` repart de zéro (DALI n'est pas sérialisable).  Sur restore
@@ -109,6 +97,7 @@ class _DALINode(BaseNode):  # type: ignore[misc]
         build_batch_fn: Callable ``(views, metadata) -> Batch``.
         output_map: Noms des vues produites par l'itérateur DALI.
         stall_timeout_s: Secondes avant levée si aucun batch. 0 = désactivé.
+        rank: Rang global pour les messages d'erreur.
 
     """
 
@@ -131,12 +120,26 @@ class _DALINode(BaseNode):  # type: ignore[misc]
         self._rank           = rank
         self._iter: Any      = None
         self._num_yielded    = 0
+        # [FIX-ITER-RACE] Lock protégeant l'accès à _iter entre set_epoch()
+        # (thread principal) et next() (thread tn.Loader).
+        self._iter_lock      = threading.Lock()
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
         """(Re-)initialise l'itérateur DALI/CPU pour une nouvelle époque."""
         super().reset(initial_state)
-        self._iter        = self._iter_factory()
-        self._num_yielded = 0
+        with self._iter_lock:
+            self._iter        = self._iter_factory()
+            self._num_yielded = 0
+
+    def reset_iter(self) -> None:
+        """Invalide l'itérateur courant pour forcer sa recréation au prochain reset().
+
+        Appelé par ``DINODataLoader.set_epoch()`` depuis le thread principal.
+        Thread-safe : utilise ``_iter_lock`` pour éviter la race condition avec
+        ``next()`` qui peut s'exécuter dans le thread ``tn.Loader``.
+        """
+        with self._iter_lock:
+            self._iter = None
 
     def next(self) -> Batch:
         """Retourne le prochain Batch assemblé.
@@ -146,10 +149,15 @@ class _DALINode(BaseNode):  # type: ignore[misc]
             RuntimeError: Si aucun batch n'est produit et stall_timeout_s > 0.
 
         """
-        assert self._iter is not None, "reset() must be called before next()"
+        with self._iter_lock:
+            current_iter = self._iter
+
+        if current_iter is None:
+            msg = "reset() must be called before next()"
+            raise AssertionError(msg)
 
         try:
-            dali_out = next(self._iter)
+            dali_out = next(current_iter)
         except StopIteration:
             if self._num_yielded == 0 and self._stall_timeout > 0:
                 if os.environ.get("DINO_DISABLE_EMPTY_CHECK"):
@@ -340,8 +348,7 @@ class _LimitNode(BaseNode):  # type: ignore[misc]
 class NodePipeline:
     """Composable, stateful post-processing pipeline built on ``torchdata.nodes``.
 
-    Expose toutes les propriétés publiques de ``DINODataLoader`` pour que
-    l'utilisateur puisse se passer d'un accès direct au loader sous-jacent.
+    Expose toutes les propriétés publiques de ``DINODataLoader``.
 
     Propriétés déléguées
     --------------------
@@ -360,9 +367,11 @@ class NodePipeline:
 
     Note sur l'intra-époque
     -----------------------
-    ``state_dict`` persiste l'époque, les poids et la résolution.
+    ``state_dict`` persiste l'époque, les poids, la résolution et max_steps.
     La position intra-époque n'est **pas** restaurée (DALI non sérialisable).
 
+    [FIX-STATE-MAX-STEPS] max_steps est inclus dans state_dict pour un
+    round-trip correct lors de la reprise.
     """
 
     def __init__(
@@ -381,7 +390,7 @@ class NodePipeline:
     # Fluent composition API
     # ------------------------------------------------------------------
 
-    def map(self, fn: Callable[[Batch], Batch], *, label: str = "<map>") -> NodePipeline:
+    def map(self, fn: Callable[[Batch], Batch], *, label: str = "<map>") -> "NodePipeline":
         """Append a ``Batch → Batch`` transform.
 
         Args:
@@ -403,7 +412,7 @@ class NodePipeline:
         predicate: Callable[[Batch], bool],
         *,
         label: str = "<filter>",
-    ) -> NodePipeline:
+    ) -> "NodePipeline":
         """Drop batches for which ``predicate(batch)`` is ``False``.
 
         Args:
@@ -420,7 +429,7 @@ class NodePipeline:
             max_steps   = self._max_steps,
         )
 
-    def with_epoch(self, n_steps: int) -> NodePipeline:
+    def with_epoch(self, n_steps: int) -> "NodePipeline":
         """Limit iteration to ``n_steps`` batches per epoch.
 
         Args:
@@ -466,22 +475,33 @@ class NodePipeline:
     def state_dict(self) -> dict[str, Any]:
         """Return the full graph state dict.
 
-        Inclut l'état du loader (époque, poids, résolution) et le compteur
-        de batches yielded du nœud racine.  La position intra-époque n'est
-        **pas** restaurable (DALI non sérialisable).
+        [FIX-STATE-MAX-STEPS] max_steps est inclus pour qu'un round-trip via
+        load_state_dict() + with_epoch() restitue le même comportement.
+        La position intra-époque n'est pas restaurable (DALI non sérialisable).
         """
         loader_sd = self._loader.state_dict()
         tn_sd: dict[str, Any] = {}
         if self._tn_loader is not None:
             tn_sd = self._tn_loader.state_dict()
-        return {"loader": loader_sd, "tn_graph": tn_sd}
+        return {
+            "loader":    loader_sd,
+            "tn_graph":  tn_sd,
+            "max_steps": self._max_steps,
+        }
 
     def load_state_dict(self, sd: dict[str, Any]) -> None:
-        """Restore the full graph state."""
+        """Restore the full graph state.
+
+        Note: max_steps is restored in memory but does not rebuild the
+        tn.Loader graph. If the pipeline has already been built (i.e. iterated
+        over at least once), call with_epoch() again to apply the new limit.
+        """
         if "loader" in sd:
             self._loader.load_state_dict(sd["loader"])
         if "tn_graph" in sd and self._tn_loader is not None:
             self._tn_loader.load_state_dict(sd["tn_graph"])
+        if "max_steps" in sd:
+            self._max_steps = sd["max_steps"]
 
     # ------------------------------------------------------------------
     # Delegation vers DINODataLoader
@@ -540,11 +560,15 @@ def wrap_loader(dino_loader: Any) -> NodePipeline:
     en standalone pour les usages avancés.
 
     Args:
-        dino_loader: A ``DINODataLoader`` instance.
+        dino_loader: A ``DINODataLoader`` instance.  Doit exposer un attribut
+            ``_dali_node`` de type ``_DALINode``.
 
     Returns:
         ``NodePipeline`` — iterate directly or compose further with
         ``.map()``, ``.select()``, ``.with_epoch()``.
+
+    Raises:
+        TypeError: Si ``dino_loader`` n'expose pas ``_dali_node``.
 
     Example::
 
@@ -564,8 +588,14 @@ def wrap_loader(dino_loader: Any) -> NodePipeline:
             sd = pipeline.state_dict()
 
     """
-    # Accède au nœud DALI interne exposé par DINODataLoader.
-    dali_node = dino_loader._dali_node  # type: ignore[attr-defined]
+    dali_node = getattr(dino_loader, "_dali_node", None)
+    if dali_node is None:
+        msg = (
+            f"wrap_loader: the provided object ({type(dino_loader).__name__}) "
+            "does not expose a '_dali_node' attribute. "
+            "Pass a DINODataLoader instance."
+        )
+        raise TypeError(msg)
     return NodePipeline(root_node=dali_node, dino_loader=dino_loader)
 
 
@@ -592,7 +622,9 @@ class _DINOLoaderNode(BaseNode):  # type: ignore[misc]
 
     def next(self) -> Batch:
         """Return the next Batch from the loader."""
-        assert self._it is not None, "reset() must be called before next()"
+        if self._it is None:
+            msg = "reset() must be called before next()"
+            raise AssertionError(msg)
         batch = next(self._it)
         self._num_yielded += 1
         return batch

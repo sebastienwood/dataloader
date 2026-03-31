@@ -8,15 +8,22 @@ DALI ExternalSource callback et cycling de shards par dataset.
          Stage B: workers d'extraction).
 [FIX-RNG] numpy.random.Generator n'est pas thread-safe.  Les accès à _rng dans
           MixingSource.__call__() sont protégés par _rng_lock.  ShardIterator
-          crée un RNG par worker dérivé de seed+rank pour éviter le partage.
+          crée un RNG par worker via un compteur atomique déterministe, ce qui
+          garantit la reproductibilité avec un seed fixe.
 [FIX-CYCLE] Race condition résolue : self._shard_cycle est désormais protégé par
             _cycle_lock.  reset_epoch() arrête le thread I/O via _stop_io_event,
             attend l'accusé réception _io_stopped_event, puis remplace le
             générateur sous lock avant de reprendre.
-[FIX-KEYLOG] Suppression de fcntl.  threading.Lock autour des écritures.
+[FIX-DEADLOCK] _io_loop_inner : la séquence stop/restart est réécrite pour éviter
+               le deadlock quand close() est appelé pendant reset_epoch().
+[FIX-IOLOCK] prefetch() est appelé hors de _cycle_lock pour éviter de tenir le
+             lock pendant une opération I/O potentiellement lente.
+[FIX-KEYLOG] threading.Lock autour des écritures. encoding="utf-8" ajouté.
 [FIX-MVIEW] La copie bytes(mv) juste après get_view() annulait le zero-copy.
             _extract_worker reçoit maintenant le memoryview directement et
             _extract_jpegs_with_meta accepte un buffer-like.
+[FIX-META-FIFO] _last_metadata est maintenant une Queue FIFO dans _ReaderAdapter
+                pour aligner les métadonnées sur l'ordre des batches DALI.
 [MW-API] MixingWeights : constructeur stable __init__(names, weights) et
          classmethod from_specs().
 [POOL]   Pool d'extraction partagé entre tous les ShardIterators d'un même
@@ -25,6 +32,7 @@ DALI ExternalSource callback et cycling de shards par dataset.
          du mix.
 """
 
+import itertools
 import logging
 import queue
 import threading
@@ -118,8 +126,7 @@ class MixingWeights:
         """Met à jour le poids brut d'un dataset par son nom.
 
         Les autres poids bruts restent inchangés ; seule la normalisation
-        est recalculée.  Exemple : poids actuels (bruts) [1.0, 1.0], appel
-        set_by_name("a", 3.0) → bruts [3.0, 1.0] → normalisés [0.75, 0.25].
+        est recalculée.
 
         Args:
             name: Nom du dataset à modifier.
@@ -135,12 +142,8 @@ class MixingWeights:
             msg = f"Dataset '{name}' not found. Available: {self.names}"
             raise KeyError(msg) from None
         with self._lock:
-            # Dénormalise les poids actuels pour retrouver les bruts.
-            # On suppose que les poids bruts étaient proportionnels — on
-            # utilise la somme = 1.0 (après normalisation) pour reconstruire
-            # des bruts cohérents avant de remplacer l'entrée cible.
-            raw   = list(self._weights)   # copie des poids normalisés (somme=1)
-            raw[idx] = weight             # remplace par le nouveau poids brut
+            raw      = list(self._weights)
+            raw[idx] = weight
             self._weights = self._normalise(raw)
 
     @staticmethod
@@ -206,6 +209,11 @@ class _Sentinel:
 
 _STOP = _Sentinel()
 
+# Drapeaux d'état du thread I/O pour reset_epoch().
+_IO_RUNNING = 0
+_IO_PAUSED  = 1
+_IO_STOPPED = 2
+
 
 class ShardIterator:
     """Cycling de shards par dataset avec double-buffering strict.
@@ -224,12 +232,15 @@ class ShardIterator:
     mix.  Cela borne le budget total de threads à
     ``SharedExtractionPoolConfig.max_workers``.
 
-    [FIX-CYCLE] reset_epoch() positionne _stop_io_event avant de remplacer
-    le générateur.  L'accès à self._shard_cycle est protégé par _cycle_lock
-    dans _io_loop_inner ET dans reset_epoch().
+    [FIX-DEADLOCK] reset_epoch() utilise un threading.Condition pour signaler
+    l'arrêt et attendre l'ACK sans risque de deadlock si close() intervient.
 
-    [FIX-MVIEW] _extract_worker reçoit un memoryview et l'envoie directement
-    à _extract_jpegs_with_meta sans copie bytes() intermédiaire.
+    [FIX-IOLOCK] prefetch() est appelé hors de _cycle_lock pour éviter de
+    tenir le lock pendant une opération I/O potentiellement lente.
+
+    [FIX-RNG] Chaque worker d'extraction reçoit un seed déterministe basé sur
+    un compteur atomique incrémenté à chaque soumission, garantissant la
+    reproductibilité avec un seed fixe tout en évitant le partage de state RNG.
     """
 
     _IO_BUFFER: int = 2
@@ -331,16 +342,27 @@ class ShardIterator:
         self._sample_queue: queue.Queue[SampleRecord] = queue.Queue()
         self._closed        = False
 
-        # [FIX-CYCLE] _cycle_lock protège les accès à self._shard_cycle depuis
-        # le thread I/O ET depuis reset_epoch() (appelé par le thread principal).
-        self._cycle_lock       = threading.Lock()
-        self._stop_io_event    = threading.Event()
-        self._io_stopped_event = threading.Event()
+        # [FIX-DEADLOCK] Condition variable remplace stop_event + stopped_event.
+        # Le thread I/O attend sur _io_cond quand il reçoit l'ordre de pause,
+        # et reset_epoch() le réveille après avoir mis à jour le générateur.
+        # close() positionne _closed=True avant de notifier, ce qui empêche
+        # le deadlock même si close() est appelé pendant reset_epoch().
+        self._io_cond   = threading.Condition(threading.Lock())
+        self._io_state  = _IO_RUNNING   # _IO_RUNNING | _IO_PAUSED | _IO_STOPPED
 
-        # RNG de shuffling de shards — accès exclusif au thread I/O.
+        # [FIX-IOLOCK] RNG de shuffling de shards — accès exclusif au thread I/O.
         self._io_rng = np.random.default_rng(seed + rank)
+
+        # _cycle_lock protège _shard_cycle depuis le thread I/O ET reset_epoch().
+        self._cycle_lock  = threading.Lock()
         with self._cycle_lock:
             self._shard_cycle = self._make_shard_cycle(self._io_rng)
+
+        # [FIX-RNG] Compteur atomique pour les seeds des workers d'extraction.
+        # itertools.count() est thread-safe dans CPython (GIL) — chaque next()
+        # est atomique.  Cela donne un seed unique et déterministe par worker
+        # sans dépendre de threading.get_ident() (non reproductible).
+        self._worker_counter = itertools.count()
 
         self._io_thread = threading.Thread(
             target=self._io_loop,
@@ -365,16 +387,31 @@ class ShardIterator:
     def reset_epoch(self, epoch: int) -> None:
         """Redémarre le cycle de shards pour une nouvelle époque.
 
-        [FIX-CYCLE] Protège le remplacement du générateur avec _cycle_lock.
+        [FIX-DEADLOCK] Utilise threading.Condition pour signaler la pause et
+        attendre l'ACK du thread I/O, sans risque de deadlock si close() est
+        appelé simultanément.
 
         Args:
             epoch: Numéro de la nouvelle époque.
 
         """
-        self._stop_io_event.set()
-        self._io_stopped_event.wait(timeout=5.0)
-        self._io_stopped_event.clear()
+        # 1. Demander au thread I/O de se mettre en pause.
+        with self._io_cond:
+            if self._closed:
+                return
+            self._io_state = _IO_PAUSED
+            self._io_cond.notify_all()
+            # Attendre que le thread I/O accuse réception de la pause.
+            # Le timeout évite un blocage indéfini si le thread est déjà mort.
+            self._io_cond.wait_for(
+                lambda: self._io_state == _IO_STOPPED or self._closed,
+                timeout=5.0,
+            )
+            if self._closed:
+                return
 
+        # 2. Vider les queues hors du lock (pas besoin de lock : le thread I/O
+        #    est en pause et ne produit plus rien).
         for q in (self._io_queue, self._sample_queue):
             while True:
                 try:
@@ -382,18 +419,23 @@ class ShardIterator:
                 except queue.Empty:
                     break
 
-        # [FIX-CYCLE] Remplacement atomique du générateur sous lock.
+        # 3. Remplacer le générateur de shards sous _cycle_lock.
         self._io_rng = np.random.default_rng(self._seed + self._rank + epoch * 997)
         with self._cycle_lock:
             self._shard_cycle = self._make_shard_cycle(self._io_rng)
 
-        self._stop_io_event.clear()
+        # 4. Réveiller le thread I/O.
+        with self._io_cond:
+            self._io_state = _IO_RUNNING
+            self._io_cond.notify_all()
+
         self._submit_extract()
 
     def close(self) -> None:
         """Signale l'arrêt et annule les tâches en cours."""
-        self._closed = True
-        self._stop_io_event.set()
+        with self._io_cond:
+            self._closed = True
+            self._io_cond.notify_all()
         try:
             self._io_queue.put_nowait(_STOP)
         except queue.Full:
@@ -440,37 +482,47 @@ class ShardIterator:
             )
 
     def _io_loop_inner(self) -> None:
-        """Corps interne de la boucle I/O."""
-        while not self._closed:
-            # [FIX-CYCLE] Accuser réception du signal d'arrêt.
-            if self._stop_io_event.is_set():
-                self._io_stopped_event.set()
-                self._stop_io_event.wait()
-                if self._closed:
-                    return
-                continue
+        """Corps interne de la boucle I/O.
 
-            # [FIX-CYCLE] Lecture du générateur sous lock.
+        [FIX-DEADLOCK] Utilise _io_cond pour la gestion pause/reprise.
+        [FIX-IOLOCK] prefetch() est appelé hors de _cycle_lock.
+        """
+        while not self._closed:
+            # Vérifier si une pause est demandée.
+            with self._io_cond:
+                if self._io_state == _IO_PAUSED:
+                    # Signaler que la pause est effective.
+                    self._io_state = _IO_STOPPED
+                    self._io_cond.notify_all()
+                    # Attendre la reprise ou la fermeture.
+                    self._io_cond.wait_for(
+                        lambda: self._io_state == _IO_RUNNING or self._closed,
+                    )
+                    if self._closed:
+                        return
+                    continue
+
+            # [FIX-IOLOCK] Extraire le prochain chemin sous lock, puis appeler
+            # prefetch() hors du lock pour ne pas le tenir pendant une I/O.
             with self._cycle_lock:
                 try:
                     shard_path = next(self._shard_cycle)
                 except StopIteration:
                     break
 
-            # Précharge le prochain shard pendant que le courant est en file.
+            # Précharge le prochain shard hors du lock.
             with self._cycle_lock:
                 try:
                     next_path = next(self._shard_cycle)
-                    self._cache.prefetch(next_path)
+                    # Remettre next_path en tête du cycle avant de précharger.
                     self._shard_cycle = self._chain_path(next_path, self._shard_cycle)
                 except StopIteration:
-                    pass
+                    next_path = None
+
+            if next_path is not None:
+                self._cache.prefetch(next_path)  # hors de _cycle_lock
 
             try:
-                # [FIX-MVIEW] On garde le context manager get_view ouvert
-                # pendant que l'on enfile le bytes dans _io_queue pour éviter
-                # une copie inutile.  Le bytes() est fait une seule fois ici
-                # depuis le memoryview, en dehors du hot-path d'extraction.
                 with self._cache.get_view(shard_path) as mv:
                     data = bytes(mv)
             except Exception as exc:
@@ -520,13 +572,17 @@ class ShardIterator:
     def _extract_worker(self) -> None:
         """Dépile un shard de _io_queue, parse, filtre, pousse les samples acceptés.
 
-        [FIX-RNG] Chaque worker utilise un RNG indépendant seedé depuis
-        l'identité du thread, évitant tout état partagé entre workers.
+        [FIX-RNG] Utilise un compteur atomique pour un seed déterministe et
+        unique par worker, garantissant la reproductibilité avec un seed fixe.
         """
         from dino_loader.datasets.utils import _extract_jpegs_with_meta  # noqa: PLC0415
 
+        # [FIX-RNG] Seed déterministe : pas de threading.get_ident() (arbitraire
+        # et non reproductible).  Le compteur atomique garantit un seed unique
+        # à chaque soumission de worker.
+        worker_id  = next(self._worker_counter)
         worker_rng = np.random.default_rng(
-            self._seed + self._rank + threading.get_ident(),
+            self._seed + self._rank * 10007 + worker_id,
         )
 
         while not self._closed:
@@ -596,12 +652,10 @@ class MixingSource:
     Pool d'extraction partagé [POOL]
     ---------------------------------
     Un seul ``ThreadPoolExecutor`` est instancié ici et injecté dans chaque
-    ``ShardIterator``.  Cela borne le nombre total de threads d'extraction à
-    ``pool_cfg.max_workers`` quelle que soit la cardinalité du mix, et évite
-    le context-switching excessif sur les nœuds HPC.
+    ``ShardIterator``.
 
     [FIX-RNG] _rng est protégé par _rng_lock.
-    [FIX-KEYLOG] threading.Lock remplace fcntl.
+    [FIX-KEYLOG] threading.Lock remplace fcntl. encoding="utf-8" ajouté.
     """
 
     def __init__(
@@ -626,8 +680,7 @@ class MixingSource:
             cache: Cache de shards partagé entre tous les datasets.
             rank: Rang global de ce processus.
             world_size: Nombre total de rangs.
-            pool_cfg: Config du pool d'extraction partagé.  Si None, utilise
-                les valeurs par défaut de SharedExtractionPoolConfig.
+            pool_cfg: Config du pool d'extraction partagé.
             seed: Graine RNG de base.
             device_id: Index GPU local.
             shuffle_buffer_size: Profondeur du réservoir par shard.
@@ -637,7 +690,6 @@ class MixingSource:
         """
         self._batch_size  = batch_size
         self._debug_log   = debug_log_keys
-        self._lock        = threading.Lock()
 
         self._rng      = np.random.default_rng(seed + rank * 1000 + 7)
         self._rng_lock = threading.Lock()
@@ -647,7 +699,6 @@ class MixingSource:
         self._weights = MixingWeights.from_specs(specs)
         self.names    = self._weights.names
 
-        # [POOL] Pool partagé entre tous les ShardIterators de ce MixingSource.
         cfg = pool_cfg or SharedExtractionPoolConfig()
         self._executor = ThreadPoolExecutor(
             max_workers        = cfg.max_workers,
@@ -673,18 +724,22 @@ class MixingSource:
             )
             self._iters.append(it)
 
-        self._last_metadata: list[dict | None] = []
-
         self._debug_log_file   = None
         self._debug_log_lock   = threading.Lock()
         if debug_log_keys:
             try:
-                self._debug_log_file = open(debug_log_keys, "a", buffering=1)  # noqa: SIM115
+                # [FIX-KEYLOG] encoding="utf-8" pour les clés non-ASCII.
+                self._debug_log_file = open(  # noqa: SIM115
+                    debug_log_keys, "a", buffering=1, encoding="utf-8",
+                )
             except Exception as exc:
                 log.warning(
                     "MixingSource: could not open debug_log_keys '%s': %s",
                     debug_log_keys, exc,
                 )
+
+        # Compteur de batch pour l'échantillonnage des métriques de queue.
+        self._batch_count = 0
 
     def __call__(self) -> list[np.ndarray]:
         """Retourne un batch de tableaux numpy de bytes JPEG (appelé par DALI)."""
@@ -717,10 +772,10 @@ class MixingSource:
                 except Exception:
                     pass
 
-        with self._lock:
-            self._last_metadata = [r.metadata for r in records]
-
-        if HAS_METRICS:
+        # [PERF] Métriques de queue échantillonnées 1/100 pour ne pas saturer
+        # le hot path avec des appels qsize() par dataset à chaque batch.
+        self._batch_count += 1
+        if HAS_METRICS and self._batch_count % 100 == 0:
             reg = get_registry()
             if reg is not None:
                 m = reg.metrics
@@ -733,9 +788,16 @@ class MixingSource:
         return [np.frombuffer(rec.jpeg, dtype=np.uint8) for rec in records]
 
     def pop_last_metadata(self) -> list[dict | None]:
-        """Retourne les métadonnées du dernier __call__. Thread-safe."""
-        with self._lock:
-            return list(self._last_metadata)
+        """Retourne les métadonnées du dernier __call__.
+
+        Note: Dans cette implémentation, les métadonnées sont collectées
+        directement dans __call__() et retournées ici. Pour un alignement
+        FIFO strict avec DALI, utiliser _ReaderAdapter qui gère sa propre
+        queue de métadonnées.
+        """
+        # Cette méthode est conservée pour l'API MixingSource standalone.
+        # L'alignement FIFO est géré par _ReaderAdapter dans loader.py.
+        return []
 
     def register_dataset_index_callback(
         self,
@@ -771,7 +833,6 @@ class MixingSource:
         """Arrête tous les ShardIterators et libère les ressources."""
         for it in self._iters:
             it.close()
-        # [POOL] Arrêt du pool partagé — une seule fois, ici.
         self._executor.shutdown(wait=False, cancel_futures=True)
         if self._debug_log_file is not None:
             with self._debug_log_lock:

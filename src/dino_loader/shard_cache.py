@@ -28,20 +28,24 @@ When inotify is unavailable (e.g. FUSE mount), _inotify_wait() detects the
 failure and falls back to stat-polling automatically.  A WARNING is logged
 once per process to alert operators that the efficient path is unavailable.
 
-For optimal performance on CephFS:
-  - Use the kernel client (ceph.ko), not ceph-fuse.
-  - Mount options: rw,relatime,name=...,noatime
-  - Avoid FUSE mounts for the shard data path (data path only; metadata
-    paths and checkpoints can use FUSE without performance impact).
-
-[B2-FIX]  _evict_for_locked: backpressure instead of grow-and-proceed.
+Corrections
+-----------
+[B2-FIX]    _evict_for_locked: backpressure instead of grow-and-proceed.
 [FIX-EVICT] _evict_for_locked accounting drift fix.
-[FIX-HB]  Heartbeat file now stores "pid:job_id".
-[PERF-1]  No fsync on tmpfs.
-[PERF-2]  Persistent mmap pool.
-[LOG-1]   INFO→DEBUG demotion for per-shard logs.
-[FS-1]    _read_lustre renamed to _read_shard (filesystem-neutral).
-[FS-2]    _inotify_wait detects FUSE mounts and falls back gracefully.
+[FIX-EVICT-EARLY] Early exit dans _load_one si le shard dépasse le budget
+            total, évitant 20 s d'attente inutile.
+[FIX-HB]    Heartbeat file now stores "pid:job_id".
+[FIX-READ]  _read_file_sync utilise pathlib.Path.read_bytes() pour une
+            lecture correcte sur tous les filesystems (évite l'os.read()
+            partiel sur NFS/Lustre).
+[FIX-SIGNAL] _register_signals chaîne les handlers SIGTERM/SIGINT existants
+             (installés par PyTorch distributed / NCCL) plutôt que de les
+             écraser, évitant les deadlocks NCCL à la terminaison.
+[PERF-1]    No fsync on tmpfs.
+[PERF-2]    Persistent mmap pool.
+[LOG-1]     INFO→DEBUG demotion for per-shard logs.
+[FS-1]      _read_lustre renamed to _read_shard (filesystem-neutral).
+[FS-2]      _inotify_wait detects FUSE mounts and falls back gracefully.
 """
 
 import asyncio
@@ -87,7 +91,6 @@ _EVICT_WAIT_S  = 2.0
 _EVICT_RETRIES = 10
 
 # Whether inotify is available on this process's filesystem.
-# Set to False on first ENOSYS/failure to avoid repeated syscall attempts.
 _INOTIFY_AVAILABLE: bool = True
 
 
@@ -205,7 +208,7 @@ class _HeartbeatWriter:
         """Write the heartbeat file atomically."""
         tmp = self._path.with_suffix(".tmp")
         try:
-            tmp.write_text(f"{os.getpid()}:{self._job_id}")
+            tmp.write_text(f"{os.getpid()}:{self._job_id}", encoding="utf-8")
             tmp.rename(self._path)
         except Exception as exc:
             log.warning("HeartbeatWriter: could not write %s: %s", self._path, exc)
@@ -239,7 +242,7 @@ def _purge_orphaned_shm(job_name: str, hb_stale_s: float = _HB_STALE_S) -> None:
                 age   = time.time() - mtime
                 if age < hb_stale_s:
                     continue
-                content = hb.read_text().strip()
+                content = hb.read_text(encoding="utf-8").strip()
                 if ":" in content:
                     pid_str, hb_job_id = content.split(":", 1)
                     if hb_job_id == job_name:
@@ -301,13 +304,15 @@ def _check_shm_headroom(incoming: int) -> None:
 
 
 def _read_file_sync(path: str) -> bytes:
-    """Synchronous fallback for shard reads when aiofiles is unavailable."""
+    """Synchronous fallback for shard reads when aiofiles is unavailable.
+
+    [FIX-READ] Utilise pathlib.Path.read_bytes() pour une lecture correcte sur
+    tous les filesystems.  L'ancienne version utilisait os.read(fd, st_size)
+    qui n'est pas garanti de lire tous les octets en un seul appel sur NFS/Lustre
+    avec certaines options de montage.
+    """
     try:
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            return os.read(fd, os.fstat(fd).st_size)
-        finally:
-            os.close(fd)
+        return Path(path).read_bytes()
     except Exception as exc:
         raise RuntimeError(f"Failed to read shard {path}: {exc}") from exc
 
@@ -316,16 +321,6 @@ def _inotify_wait(shm: Path, timeout_s: float) -> None:
     """Block until shm is ready, using inotify on Linux or stat-poll elsewhere.
 
     [FS-2] Détection automatique de la disponibilité d'inotify.
-
-    inotify est supporté sur :
-    - tmpfs (/dev/shm)                   → toujours OK
-    - Lustre (llite)                     → OK
-    - CephFS kernel client (ceph.ko)     → OK (kernel ≥ 4.14)
-    - CephFS FUSE (ceph-fuse)            → ENOSYS → fallback stat-poll
-    - NFS                                → généralement OK
-
-    Sur la première défaillance ENOSYS, _INOTIFY_AVAILABLE est positionné à
-    False et un WARNING est émis une seule fois pour informer l'opérateur.
     """
     global _INOTIFY_AVAILABLE  # noqa: PLW0603
 
@@ -375,7 +370,6 @@ def _inotify_wait(shm: Path, timeout_s: float) -> None:
         except (TimeoutError, OSError):
             raise
         except Exception:
-            # Toute autre erreur inattendue → fallback stat-poll.
             pass
 
     # Stat-poll fallback (CephFS FUSE, NFS sans inotify, autres).
@@ -391,7 +385,6 @@ async def _read_shard_async(shard_path: str) -> bytes:
     """Lire un shard depuis le filesystem de manière asynchrone.
 
     Supporte Lustre, CephFS (kernel ou FUSE), et tout filesystem POSIX.
-    Le nom _read_shard est filesystem-neutre (anciennement _read_lustre).
 
     Args:
         shard_path: Chemin absolu vers le fichier .tar du shard.
@@ -415,11 +408,12 @@ async def _read_shard_async(shard_path: str) -> bytes:
 class NodeSharedShardCache:
     """Node-local /dev/shm shard cache.
 
-    One instance per process; all processes on the same node share the same
-    /dev/shm directory.
-
-    Compatible avec Lustre, CephFS kernel client, et CephFS FUSE (avec
-    dégradation automatique de inotify → stat-poll pour CephFS FUSE).
+    Corrections
+    -----------
+    [FIX-EVICT-EARLY] _load_one lève immédiatement si le shard dépasse le
+        budget total, sans attendre _EVICT_RETRIES itérations.
+    [FIX-SIGNAL] _register_signals chaîne les handlers existants (PyTorch
+        distributed / NCCL) pour éviter les deadlocks NCCL à la terminaison.
 
     Args:
         node_master: True for local rank 0 — this process fills the cache.
@@ -549,7 +543,11 @@ class NodeSharedShardCache:
         return self._base / digest
 
     async def _load_one(self, shard_path: str, shm: Path) -> None:
-        """Fetch one shard from the filesystem, write to /dev/shm."""
+        """Fetch one shard from the filesystem, write to /dev/shm.
+
+        [FIX-EVICT-EARLY] Si le shard dépasse structurellement le budget total,
+        on lève immédiatement sans attendre les _EVICT_RETRIES itérations.
+        """
         async with self._sem:
             try:
                 t0   = time.perf_counter()
@@ -560,7 +558,16 @@ class NodeSharedShardCache:
                     self._metrics.inc(MetricField.LUSTRE_READ_TIME_MS, elapsed_ms)
                     self._metrics.inc(MetricField.LUSTRE_BYTES_READ, len(data))
 
-                # [B2-FIX] Wait for eviction headroom with bounded retries.
+                # [FIX-EVICT-EARLY] Early exit si le shard lui-même dépasse
+                # le budget total — aucune éviction ne pourrait faire de la place.
+                if len(data) > self._max_bytes:
+                    msg = (
+                        f"NodeSharedShardCache: shard {shard_path!r} "
+                        f"({len(data) >> 20} MB) exceeds the entire shm budget "
+                        f"({self._max_bytes >> 30} GB). Increase node_shm_gb."
+                    )
+                    raise RuntimeError(msg)
+
                 for attempt in range(_EVICT_RETRIES):
                     with self._lru_lock:
                         if self._total_bytes + len(data) <= self._max_bytes:
@@ -663,20 +670,37 @@ class NodeSharedShardCache:
         self._base.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def _register_signals(self) -> None:
-        """Register SIGTERM/SIGINT handlers to trigger a clean shutdown."""
-        def _handler(signum: int, frame: object) -> None:
-            self._shutdown_event.set()
+        """Register SIGTERM/SIGINT handlers to trigger a clean shutdown.
 
-        def _watcher() -> None:
-            self._shutdown_event.wait()
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            signal.signal(signal.SIGINT,  signal.SIG_DFL)
-            os.kill(os.getpid(), signal.SIGTERM)
+        [FIX-SIGNAL] Chaîne les handlers existants (PyTorch distributed / NCCL)
+        plutôt que de les écraser.  Écraser SIGTERM quand torch.distributed est
+        déjà initialisé provoque des deadlocks NCCL lors de la terminaison du job.
 
-        signal.signal(signal.SIGTERM, _handler)
-        signal.signal(signal.SIGINT,  _handler)
-        t = threading.Thread(target=_watcher, name="shm-signal-watcher", daemon=True)
-        t.start()
+        Ce handler n'est enregistré que sur le node master (local_rank == 0),
+        le seul processus qui possède un cache /dev/shm à nettoyer.
+        """
+        def _make_handler(
+            old_handler: Any,
+        ) -> Any:
+            """Retourne un handler qui appelle l'ancien handler après nettoyage."""
+            def _handler(signum: int, frame: Any) -> None:
+                self._shutdown_event.set()
+                # Chaîner l'ancien handler s'il était un callable Python.
+                if callable(old_handler):
+                    old_handler(signum, frame)
+                elif old_handler == signal.SIG_DFL:
+                    signal.signal(signum, signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
+                # SIG_IGN : on ignore (rare pour SIGTERM, impossible pour SIGINT).
+            return _handler
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            old = signal.getsignal(sig)
+            try:
+                signal.signal(sig, _make_handler(old))
+            except (OSError, ValueError) as exc:
+                # Peut échouer si on n'est pas dans le thread principal.
+                log.debug("Could not register signal %s handler: %s", sig, exc)
 
     def _cleanup(self) -> None:
         """atexit: stop heartbeat, remove /dev/shm cache, close pools."""

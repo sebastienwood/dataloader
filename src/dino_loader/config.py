@@ -3,42 +3,18 @@
 All loader-level configuration lives here.  No logic — pure dataclasses.
 Serialised to / from JSON for checkpointing (no pickle fragility).
 
-Changes
--------
-[CFG-S1]  DatasetSpec.shard_sampling — explicit sampling mode.
-[CFG-S2]  DatasetSpec.prob — alias for weight=.
-[CFG-S3]  LoaderConfig.debug_log_keys — per-sample key logging.
-[CFG-S4]  LoaderConfig.fuse_normalization — DALI-fused per-dataset norm.
-[CFG-S5]  LoaderConfig.dali_fp8_output — in-graph FP8 cast.
-[CFG-S6]  LoaderConfig.stall_timeout_s — configurable watchdog timeout.
-[CFG-B4]  use_fp8_output validates TE presence at construction time.
-[CFG-M4]  heartbeat_stale_s configurable (default 300 s).
-[CFG-ARCH3] prometheus_port — opt-in Prometheus metrics endpoint.
-[CFG-NORM] NormStats dataclass — canonical normalisation stats with
-           to_dali_scale() helper, eliminating ad-hoc ×255 conversions.
-[CFG-POOL] SharedExtractionPoolConfig — budget de threads borné par MixingSource.
-[CFG-PIPE] PipelineConfig — regroupe les paramètres de build_pipeline pour
-           respecter la limite de 5 arguments de BackendProtocol.
-[CFG-CKPT] checkpoint_dir valide à la construction quand stateful_dataloader=True.
-
-Queue sizing note
------------------
-dali_cpu_queue defaults to 16 (previously 8).  AsyncPrefetchIterator has been
-removed from loader.py because DALI's own prefetch queues already provide
-equivalent double-buffering natively.  The larger cpu_queue value compensates
-for the removed application-level buffer, keeping the GPU compute pipeline
-fully saturated on NVL72 / B200 hardware where Lustre latency is variable.
-A value of 16 corresponds to ~2 full batches in-flight per worker thread at
-dali_num_threads=8.
-
-allocate_buffers note
----------------------
-Returns a single pinned tensor per crop type (not a list of two).
-The previous double-buffer was a leftover from AsyncPrefetchIterator and
-served no purpose after its removal.
+Corrections
+-----------
+[FIX-DEPRECATION] LoaderConfig.shard_extraction_workers émet un
+    DeprecationWarning si la valeur non-défaut est fournie explicitement.
+[FIX-CHECKSUM] CheckpointState.save() et load() utilisent sort_keys=True dans
+    json.dumps() pour garantir un checksum déterministe indépendamment de
+    l'ordre d'insertion des clés dict (garanti depuis Python 3.7 mais non
+    spécifié par la norme JSON).
 """
 
 import json
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -54,10 +30,8 @@ import numpy as np
 class NormStats:
     """Per-channel normalisation statistics in [0, 1] float32 scale.
 
-    All internal storage uses the [0, 1] convention (matching PyTorch
-    torchvision defaults).  Conversions to other scales (e.g. DALI's [0, 255]
-    convention) are performed explicitly via the helper methods below,
-    eliminating ad-hoc ``× 255`` multiplications scattered across the codebase.
+    All internal storage uses the [0, 1] convention.  Conversions to other
+    scales happen only at the point of use via the helper methods below.
 
     Attributes:
         mean: Per-channel mean in [0, 1].  Shape: (3,).
@@ -137,7 +111,7 @@ class NormStats:
 
 
 # ---------------------------------------------------------------------------
-# SharedExtractionPoolConfig — budget de threads borné [CFG-POOL]
+# SharedExtractionPoolConfig
 # ---------------------------------------------------------------------------
 
 
@@ -145,17 +119,9 @@ class NormStats:
 class SharedExtractionPoolConfig:
     """Configuration du pool d'extraction partagé entre les ShardIterators.
 
-    Plutôt que de créer N×W threads (N datasets × W workers), MixingSource
-    instancie un seul ``ThreadPoolExecutor`` qu'elle passe à tous ses
-    ``ShardIterator``.  Cela borne le budget total à ``max_workers`` quelle
-    que soit la cardinalité du mix de datasets.
-
     Attributes:
         max_workers: Nombre maximum de threads d'extraction simultanés.
-            Valeur recommandée : 4 × nombre de CPUs alloués par GPU.
-            Sur B200 PCIe (16 CPUs/GPU) : 16.  Sur NVL72 (4 CPUs/GPU) : 8.
         queue_depth_per_shard: Profondeur de la file de samples par shard.
-            Augmenter si les workers d'extraction sont plus rapides que DALI.
 
     """
 
@@ -176,17 +142,13 @@ class SharedExtractionPoolConfig:
 
 
 # ---------------------------------------------------------------------------
-# PipelineConfig — paramètres de construction du pipeline DALI [CFG-PIPE]
+# PipelineConfig
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class PipelineConfig:
     """Paramètres de construction du pipeline d'augmentation.
-
-    Regroupe tous les knobs spécifiques au pipeline DALI (ou CPU) pour
-    respecter la limite de 5 arguments de ``BackendProtocol.build_pipeline``
-    et éviter la propagation de paramètres dans toute la hiérarchie d'appels.
 
     Attributes:
         num_threads: DALI CPU worker threads for pre-decode operations.
@@ -259,10 +221,8 @@ class DINOAugConfig:
         preserve_aspect_ratio: Resize shorter side then centre-crop.
         resolution_schedule: List of (epoch, global_crop_size) for progressive
             resolution. Applied automatically by set_epoch().
-        max_global_crop_size: nvjpeg pre-allocation ceiling. Defaults to
-            global_crop_size.
-        max_local_crop_size: nvjpeg pre-allocation ceiling. Defaults to
-            local_crop_size.
+        max_global_crop_size: nvjpeg pre-allocation ceiling.
+        max_local_crop_size: nvjpeg pre-allocation ceiling.
         mean: Per-channel normalisation mean in [0, 1] (ImageNet defaults).
         std: Per-channel normalisation std in [0, 1] (ImageNet defaults).
 
@@ -282,7 +242,6 @@ class DINOAugConfig:
     color_jitter_prob:  float = 0.8
     grayscale_prob:     float = 0.2
 
-    # Augmentation geometry
     blur_sigma_min:     float = 0.1
     blur_sigma_max:     float = 2.0
     brightness:         float = 0.8
@@ -294,8 +253,8 @@ class DINOAugConfig:
     preserve_aspect_ratio: bool = True
 
     resolution_schedule:  list[tuple[int, int]] = field(default_factory=list)
-    max_global_crop_size: int  = 0   # 0 → set to global_crop_size in __post_init__
-    max_local_crop_size:  int  = 0   # 0 → set to local_crop_size in __post_init__
+    max_global_crop_size: int  = 0
+    max_local_crop_size:  int  = 0
 
     mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     std:  tuple[float, float, float] = (0.229, 0.224, 0.225)
@@ -359,29 +318,25 @@ class LoaderConfig:
         node_shm_gb: /dev/shm budget per node in GB.
         shard_prefetch_window: Max concurrent Lustre → /dev/shm downloads.
         shard_timeout_s: Max seconds a non-master rank waits for a shard.
-        shard_extraction_workers: Deprecated — use extraction_pool.max_workers.
-            Kept for backward compatibility; ignored when extraction_pool is set.
-        heartbeat_stale_s: Seconds without heartbeat before a /dev/shm dir is
-            considered orphaned.
-        extraction_pool: Shared extraction thread pool config [CFG-POOL].
-            Controls the total thread budget across all datasets.
-        dali_cpu_queue: DALI CPU-side prefetch queue depth.
-            Default 16 (increased from 8 after AsyncPrefetchIterator removal).
+        shard_extraction_workers: **Deprecated** — use extraction_pool.max_workers.
+            Emits a DeprecationWarning if a non-default value is provided.
+        heartbeat_stale_s: Seconds without heartbeat before orphan detection.
+        extraction_pool: Shared extraction thread pool config.
+        dali_cpu_queue: DALI CPU-side prefetch queue depth (default 16).
         dali_gpu_queue: DALI GPU-side prefetch queue depth.
-        dali_num_threads: DALI CPU worker threads for pre-decode operations.
-        hw_decoder_load: Fraction of JPEG decodes routed to nvjpeg HW ASIC.
+        dali_num_threads: DALI CPU worker threads.
+        hw_decoder_load: Fraction of JPEG decode via nvjpeg HW ASIC.
         shuffle_buffer_size: In-memory sample reservoir depth per ShardIterator.
         use_fp8_output: Quantise output to FP8 E4M3. Requires transformer-engine.
         dali_fp8_output: Fuse FP8 cast into DALI graph. Requires use_fp8_output.
         fuse_normalization: Fuse per-dataset normalisation into the DALI kernel.
         output_dtype: Intermediate dtype before optional FP8 cast.
         stateful_dataloader: Enable state_dict() / load_state_dict() interface.
-        checkpoint_dir: Where JSON checkpoint files are written.  Must be a
-            non-empty Lustre/NFS path when stateful_dataloader=True.
+        checkpoint_dir: Where JSON checkpoint files are written.
         checkpoint_every_steps: Checkpoint frequency (rank 0 only).
         force_topology: Override topology detection: "pcie" | None.
         seed: Base random seed.
-        debug_log_keys: Path to per-sample key audit log (disable in production).
+        debug_log_keys: Path to per-sample key audit log.
         stall_timeout_s: Seconds before raising on no batches. 0 = disabled.
         shm_warn_threshold: /dev/shm utilisation fraction that triggers a warning.
         prometheus_port: If set, start a prometheus_client HTTP server on this port.
@@ -394,58 +349,56 @@ class LoaderConfig:
     node_shm_gb:              float = 128.0
     shard_prefetch_window:    int   = 64
     shard_timeout_s:          float = 300.0
-    # Kept for backward compat — use extraction_pool instead.
+    # [FIX-DEPRECATION] Kept for backward compat — emits DeprecationWarning.
     shard_extraction_workers: int   = 4
 
     heartbeat_stale_s:        float = 300.0
 
-    # Shared extraction pool [CFG-POOL]
     extraction_pool: SharedExtractionPoolConfig = field(
         default_factory=SharedExtractionPoolConfig,
     )
 
-    # DALI — cpu_queue raised to 16 after AsyncPrefetchIterator removal.
     dali_cpu_queue:           int   = 16
     dali_gpu_queue:           int   = 6
     dali_num_threads:         int   = 8
     hw_decoder_load:          float = 0.90
 
-    # Data
     shuffle_buffer_size:      int   = 512
 
-    # Output precision
     use_fp8_output:           bool  = False
     dali_fp8_output:          bool  = False
     fuse_normalization:       bool  = True
     output_dtype:             str   = "bf16"
 
-    # Checkpointing [CFG-CKPT]
     stateful_dataloader:      bool  = True
     checkpoint_dir:           str   = ""
     checkpoint_every_steps:   int   = 500
 
-    # Cluster
     force_topology:           str | None = None
     seed:                     int   = 0
 
-    # Debug — no file rotation; for short one-shot sessions only.
     debug_log_keys:           str | None = None
 
-    # Watchdog
     stall_timeout_s:          float = 600.0
-
-    # SHM monitoring
     shm_warn_threshold:       float = 0.90
-
-    # Prometheus metrics endpoint (opt-in)
     prometheus_port:          int | None = None
 
-    # Adaptive prefetch PID controller (opt-in)
     adaptive_prefetch:              bool  = False
     adaptive_prefetch_target_util:  float = 0.80
 
     def __post_init__(self) -> None:
         """Validate all fields at construction time."""
+        # [FIX-DEPRECATION] Avertir si shard_extraction_workers est utilisé
+        # explicitement (valeur différente de la valeur par défaut = 4).
+        if self.shard_extraction_workers != 4:
+            warnings.warn(
+                "LoaderConfig.shard_extraction_workers is deprecated and ignored. "
+                "Use extraction_pool=SharedExtractionPoolConfig(max_workers=N) instead. "
+                "Example: LoaderConfig(extraction_pool=SharedExtractionPoolConfig(max_workers=8))",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         if self.use_fp8_output:
             try:
                 import transformer_engine.pytorch  # noqa: F401, PLC0415
@@ -519,7 +472,6 @@ class LoaderConfig:
                 )
                 raise ValueError(msg) from None
 
-        # [CFG-CKPT] Valide checkpoint_dir si le stateful mode est activé.
         if self.stateful_dataloader and not self.checkpoint_dir:
             msg = (
                 "LoaderConfig: stateful_dataloader=True requires a non-empty "
@@ -566,24 +518,30 @@ class CheckpointState:
     def save(self, path: Path) -> None:
         """Write atomically via a .tmp file with SHA-256 integrity envelope.
 
+        [FIX-CHECKSUM] json.dumps utilise sort_keys=True pour garantir un
+        checksum déterministe indépendamment de l'ordre d'insertion des clés.
+        La même option est utilisée dans load() pour la vérification, ce qui
+        garantit que save() et load() produisent toujours la même représentation
+        JSON pour un payload identique.
+
         Args:
-            path: Destination file path (must be on a POSIX-rename-atomic filesystem).
+            path: Destination file path.
 
         """
         import hashlib  # noqa: PLC0415
-        payload      = asdict(self)
-        payload_json = json.dumps(payload, indent=2)
+
+        payload = asdict(self)
+        # [FIX-CHECKSUM] sort_keys=True pour un checksum reproductible.
+        payload_json = json.dumps(payload, indent=2, sort_keys=True)
         checksum     = hashlib.sha256(payload_json.encode()).hexdigest()
         envelope     = {"payload": payload, "sha256": checksum}
         tmp          = path.with_suffix(".tmp")
         try:
-            tmp.write_text(json.dumps(envelope, indent=2))
+            tmp.write_text(json.dumps(envelope, indent=2, sort_keys=True), encoding="utf-8")
             tmp.rename(path)
         except Exception:
-            try:
+            with contextlib.suppress(Exception):
                 tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
             raise
 
     def to_dict(self) -> dict:
@@ -592,21 +550,16 @@ class CheckpointState:
 
     @classmethod
     def from_dict(cls, d: dict) -> "CheckpointState":
-        """Deserialise from a plain dict, ignoring unknown keys.
-
-        Args:
-            d: Dictionary previously produced by ``to_dict()``.
-
-        Returns:
-            A ``CheckpointState`` instance.
-
-        """
+        """Deserialise from a plain dict, ignoring unknown keys."""
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
 
     @classmethod
     def load(cls, path: Path) -> "CheckpointState":
         """Load and verify checkpoint, supporting both envelope and legacy formats.
+
+        [FIX-CHECKSUM] Utilise sort_keys=True pour reproduire exactement la même
+        représentation JSON que save(), garantissant la cohérence du checksum.
 
         Args:
             path: Path to the JSON checkpoint file.
@@ -615,17 +568,18 @@ class CheckpointState:
             A ``CheckpointState`` instance.
 
         Raises:
-            ValueError: If the SHA-256 integrity check fails (envelope format only).
+            ValueError: If the SHA-256 integrity check fails.
 
         """
         import hashlib  # noqa: PLC0415
         import logging  # noqa: PLC0415
 
         log = logging.getLogger(__name__)
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding="utf-8"))
 
         if "payload" in raw and "sha256" in raw:
-            payload_json = json.dumps(raw["payload"], indent=2)
+            # [FIX-CHECKSUM] sort_keys=True pour cohérence avec save().
+            payload_json = json.dumps(raw["payload"], indent=2, sort_keys=True)
             expected     = hashlib.sha256(payload_json.encode()).hexdigest()
             if raw["sha256"] != expected:
                 msg = (
@@ -646,3 +600,5 @@ class CheckpointState:
         data.setdefault("global_crop_size", 224)
         data.setdefault("local_crop_size",  96)
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
