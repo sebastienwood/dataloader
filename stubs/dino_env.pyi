@@ -5,20 +5,52 @@
 # Only the installed package version is reflected here.
 
 from __future__ import annotations
-
-from collections.abc import Sequence
-from datetime import timedelta
-from typing import Any
 import enum
+from typing import Any, Callable, Literal, Sequence
+from pathlib import Path
+from datetime import timedelta
+from collections.abc import Iterator
+
+BW_THRESHOLD_GB_S: dict[Any, Any]
+CPU_STUB: Any
+class ClusterTopology:
+    nvlink_gen: int = ...
+    nvlink_lanes_per_gpu: int = ...
+    gpus_per_nvlink_domain: int = ...
+    has_pcie: bool = ...
+    has_infiniband: bool = ...
+    has_sharp: bool = ...
+    has_nvlink_sharp: bool = ...
+    cuda_major: int = ...
+    cuda_minor: int = ...
+    def __init__(self, nvlink_gen: int = ..., nvlink_lanes_per_gpu: int = ..., gpus_per_nvlink_domain: int = ..., has_pcie: bool = ..., has_infiniband: bool = ..., has_sharp: bool = ..., has_nvlink_sharp: bool = ..., cuda_major: int = ..., cuda_minor: int = ...) -> None: ...
+
+    @property
+    def label(self) -> str: ...
 
 
-# ── Launcher detection ─────────────────────────────────────────────────────────
+class DistribEnv:
+    rank: int
+    world_size: int
+    local_rank: int
+    local_world_size: int
+    topology: ClusterTopology
+    launch_context: LaunchContext
+    process_group: object | None = ...
+    subgroup: object | None = ...
+    def __init__(self, rank: int, world_size: int, local_rank: int, local_world_size: int, topology: ClusterTopology, launch_context: LaunchContext, process_group: object | None = ..., subgroup: object | None = ...) -> None: ...
+
+    @property
+    def is_main_process(self) -> bool: ...
+
+    @property
+    def is_node_master(self) -> bool: ...
+
 
 class Launcher(enum.Enum):
-    TORCHRUN: int
-    SLURM: int
-    MANUAL: int
-
+    TORCHRUN = ...
+    SLURM = ...
+    MANUAL = ...
 
 class LaunchContext:
     launcher: Launcher
@@ -29,6 +61,7 @@ class LaunchContext:
     master_addr: str
     master_port: int
     job_id: str | None
+    def __init__(self, launcher: Launcher, rank: int, world_size: int, local_rank: int, local_world_size: int, master_addr: str, master_port: int, job_id: str | None) -> None: ...
 
     @property
     def is_main_process(self) -> bool: ...
@@ -40,144 +73,23 @@ class LaunchContext:
     def num_nodes(self) -> int: ...
 
 
-def detect_launcher(env: dict[str, str] | None = None) -> LaunchContext: ...
-
-
-# ── Hardware topology ──────────────────────────────────────────────────────────
-
-class ClusterTopology:
-    nvlink_gen: int
-    nvlink_lanes_per_gpu: int
-    gpus_per_nvlink_domain: int
-    has_pcie: bool
-    has_infiniband: bool
-    has_sharp: bool
-    has_nvlink_sharp: bool
-    cuda_major: int
-    cuda_minor: int
-
-    def __init__(
-        self,
-        nvlink_gen: int = 4,
-        nvlink_lanes_per_gpu: int = 9,
-        gpus_per_nvlink_domain: int = 8,
-        has_pcie: bool = True,
-        has_infiniband: bool = True,
-        has_sharp: bool = False,
-        has_nvlink_sharp: bool = False,
-        cuda_major: int = 12,
-        cuda_minor: int = 0,
-    ) -> None: ...
-
-    @property
-    def label(self) -> str: ...
-
-
-# Sentinel topology for GPU-less environments (tests, CPU-only CI).
-CPU_STUB: ClusterTopology
-
-# Bandwidth threshold map keyed by NVLink generation.
-BW_THRESHOLD_GB_S: dict[int, float]
-
-
-def detect_topology(
-    force: str | None = None,
-    gpu_index: int = 0,
-) -> ClusterTopology: ...
-
-
-def configure_nccl(
-    topo: ClusterTopology,
-    socket_ifname_exclude: str = "lo,docker,veth,eth0",
-) -> None: ...
-
-
-def verify_interconnect(
-    topo: ClusterTopology,
-    rank: int,
-    world_size: int,
-) -> None: ...
-
-
-# ── Distributed environment ────────────────────────────────────────────────────
-
-class DistribEnv:
-    rank: int
-    world_size: int
-    local_rank: int
-    local_world_size: int
-    topology: ClusterTopology
-    launch_context: LaunchContext
-    process_group: Any | None
-    subgroup: Any | None
-
-    def __init__(
-        self,
-        rank: int,
-        world_size: int,
-        local_rank: int,
-        local_world_size: int,
-        topology: ClusterTopology,
-        launch_context: LaunchContext,
-        process_group: Any | None = None,
-        subgroup: Any | None = None,
-    ) -> None: ...
-
-    @property
-    def is_main_process(self) -> bool: ...
-
-    @property
-    def is_node_master(self) -> bool: ...
-
-    def _replace(self, **kwargs: Any) -> DistribEnv: ...
-
-
-# ── Bootstrap ──────────────────────────────────────────────────────────────────
-
-def configure(
-    *,
-    force_topology: str | None = None,
-    socket_ifname_exclude: str = "lo,docker,veth,eth0",
-    restrict_print: bool = True,
-) -> DistribEnv: ...
-
-
-def init(
-    *,
-    force_topology: str | None = None,
-    socket_ifname_exclude: str = "lo,docker,veth,eth0",
-    restrict_print: bool = True,
-    nccl_async_error_handling: bool = False,
-    verify_bw: bool = True,
-    timeout: timedelta | None = None,
-) -> DistribEnv: ...
-
-
-def shutdown(*, destroy_subgroup: bool = True) -> None: ...
-
-
+def configure(force_topology: str | None = ..., socket_ifname_exclude: str = ..., restrict_print: bool = ...) -> DistribEnv: ...
+def configure_nccl(topo: ClusterTopology, socket_ifname_exclude: str = ...) -> None: ...
+def detect_launcher(env: dict[str, str] | None = ...) -> LaunchContext: ...
+def detect_topology(force: str | None = ..., gpu_index: int = ...) -> ClusterTopology: ...
 def get_env() -> DistribEnv: ...
-
-
-def new_subgroups(all_subgroup_ranks: Sequence[Sequence[int]]) -> None: ...
-
-
-def get_subgroup() -> Any: ...
-
-
-# ── Rank / world helpers ───────────────────────────────────────────────────────
-
-def is_distributed() -> bool: ...
-def get_rank(group: Any = None) -> int: ...
-def get_world_size(group: Any = None) -> int: ...
-def is_main_process(group: Any = None) -> bool: ...
 def get_local_rank() -> int: ...
 def get_local_world_size() -> int: ...
+def get_rank(group: object = ...) -> int: ...
+def get_subgroup() -> object: ...
 def get_subgroup_rank() -> int: ...
 def get_subgroup_size() -> int: ...
+def get_world_size(group: object = ...) -> int: ...
+def init(force_topology: str | None = ..., socket_ifname_exclude: str = ..., restrict_print: bool = ..., nccl_async_error_handling: bool = ..., verify_bw: bool = ..., timeout: timedelta | None = ...) -> DistribEnv: ...
+def is_distributed() -> bool: ...
+def is_main_process(group: object = ...) -> bool: ...
 def is_subgroup_main_process() -> bool: ...
-
-
-# ── I/O + collectives ─────────────────────────────────────────────────────────
-
-def save_in_main_process(*args: Any, group: Any = None, **kwargs: Any) -> None: ...
+def new_subgroups(all_subgroup_ranks: Sequence[Sequence[int]]) -> None: ...
+def save_in_main_process(*args: Any, group: object = ..., **kwargs: Any) -> None: ...
+def shutdown(destroy_subgroup: bool = ...) -> None: ...
+def verify_interconnect(topo: ClusterTopology, rank: int, world_size: int) -> None: ...

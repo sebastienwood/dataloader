@@ -5,66 +5,18 @@
 # Only the installed package version is reflected here.
 
 from __future__ import annotations
-
-from collections.abc import Callable, Iterator
+import enum
+from typing import Any, Callable, Literal, Sequence
 from pathlib import Path
-from typing import Any, Literal
-
-
-# ── Constants ──────────────────────────────────────────────────────────────────
+from datetime import timedelta
+from collections.abc import Iterator
 
 CONFIDENTIALITY_LEVELS: tuple[str, ...]
 DEFAULT_STRATEGY: str
-
-
-# ── DatasetSpec ────────────────────────────────────────────────────────────────
-
-class DatasetSpec:
-    name: str
-    shards: tuple[str, ...]
-    weight: float
-    shard_sampling: Literal["sequential", "shuffle", "epoch", "resampled"]
-    shard_quality_scores: tuple[float, ...] | None
-    min_sample_quality: float | None
-    mean: tuple[float, ...] | None
-    std: tuple[float, ...] | None
-    confidentialities: tuple[str, ...]
-    modalities: tuple[str, ...]
-    splits: tuple[str, ...]
-    strategies: tuple[str, ...]
-
-    def __init__(
-        self,
-        name: str,
-        shards: tuple[str, ...] | list[str],
-        weight: float = 1.0,
-        shard_sampling: Literal["sequential", "shuffle", "epoch", "resampled"] = "sequential",
-        shard_quality_scores: tuple[float, ...] | None = None,
-        min_sample_quality: float | None = None,
-        mean: tuple[float, ...] | None = None,
-        std: tuple[float, ...] | None = None,
-        confidentialities: tuple[str, ...] = (),
-        modalities: tuple[str, ...] = (),
-        splits: tuple[str, ...] = (),
-        strategies: tuple[str, ...] = (),
-        # Legacy alias
-        prob: float | None = None,
-        metadata_key: str | None = "json",
-    ) -> None: ...
-
-    def to_dict(self) -> dict[str, Any]: ...
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> DatasetSpec: ...
-
-
-# ── Settings / registry ────────────────────────────────────────────────────────
-
 class ConfidentialityMount:
     name: str
     path: Path
-
-    def __init__(self, name: str, path: Path | str) -> None: ...
+    def __init__(self, name: str, path: Path) -> None: ...
 
     @property
     def exists(self) -> bool: ...
@@ -73,94 +25,76 @@ class ConfidentialityMount:
 class ConfidentialityRegistry:
     def __init__(self) -> None: ...
 
-    def register(self, name: str, path: str | Path) -> ConfidentialityMount: ...
-    def all(self) -> list[ConfidentialityMount]: ...
+    def all(self) -> list: ...
+
     def all_up_to(self, level: str) -> list[ConfidentialityMount]: ...
+
+    def existing(self) -> list: ...
+
     def for_level(self, name: str) -> list[ConfidentialityMount]: ...
-    def get(self, name: str) -> ConfidentialityMount | None: ...
-    def names(self) -> list[str]: ...
-    def existing(self) -> list[ConfidentialityMount]: ...
 
     @classmethod
     def from_root(cls, root: str | Path) -> ConfidentialityRegistry: ...
 
-    def __contains__(self, name: str) -> bool: ...
-    def __iter__(self) -> Iterator[ConfidentialityMount]: ...
-    def __len__(self) -> int: ...
+    def get(self, name: str) -> ConfidentialityMount | Any | None: ...
 
+    def names(self) -> list[str]: ...
 
-def confidentialities_up_to(level: str) -> tuple[str, ...]: ...
-def register_confidentiality(name: str, path: str | Path) -> ConfidentialityMount: ...
-def get_confidentiality_mounts() -> list[ConfidentialityMount]: ...
-def get_confidentiality_mounts_for(level: str) -> list[ConfidentialityMount]: ...
-def get_registry() -> ConfidentialityRegistry: ...
-def resolve_path_for_confidentiality(name: str) -> Path: ...
-
-
-# ── Dataset discovery ──────────────────────────────────────────────────────────
-
-class DatasetConfig:
-    weight: float
-    strategy: str | None
-    allowed_confidentialities: list[str] | None
-    allowed_modalities: list[str] | None
-    allowed_splits: list[str] | None
-
-    def __init__(
-        self,
-        weight: float = 1.0,
-        strategy: str | None = None,
-        allowed_confidentialities: list[str] | None = None,
-        allowed_modalities: list[str] | None = None,
-        allowed_splits: list[str] | None = None,
-    ) -> None: ...
-
-
-class GlobalDatasetFilter:
-    allowed_confidentialities: list[str] | None
-    allowed_modalities: list[str] | None
-    allowed_splits: list[str] | None
-    strategy: str | None
-
-    def __init__(
-        self,
-        allowed_confidentialities: list[str] | None = None,
-        allowed_modalities: list[str] | None = None,
-        allowed_splits: list[str] | None = None,
-        strategy: str | None = None,
-    ) -> None: ...
+    def register(self, name: str, path: str | Path) -> ConfidentialityMount: ...
 
 
 class Dataset:
-    name: str
-
-    def __init__(
-        self,
-        name: str,
-        _default_filter: GlobalDatasetFilter | None = None,
-        *,
-        raise_if_empty: bool = False,
-        deep_validate: bool = False,
-    ) -> None: ...
-
-    def resolve(
-        self,
-        global_filter: GlobalDatasetFilter | None = None,
-        config: DatasetConfig | None = None,
-    ) -> list[str]: ...
-
-    def to_spec(
-        self,
-        global_filter: GlobalDatasetFilter | None = None,
-        config: DatasetConfig | None = None,
-    ) -> DatasetSpec | None: ...
+    def __init__(self, name: str, _default_filter: GlobalDatasetFilter | None = ..., raise_if_empty: bool = ..., deep_validate: bool = ...) -> None: ...
 
     def locations(self) -> list[tuple[str, str, Path]]: ...
 
+    def resolve(self, global_filter: GlobalDatasetFilter | None = ..., config: DatasetConfig | None = ...) -> list[str]: ...
 
-# ── Spec migration ─────────────────────────────────────────────────────────────
+    def to_spec(self, global_filter: GlobalDatasetFilter | None = ..., config: DatasetConfig | None = ...) -> DatasetSpec | None: ...
 
-def register_spec_migration(
-    from_version: int,
-    fn: Callable[[dict[str, Any]], dict[str, Any]],
-) -> None: ...
+
+class DatasetConfig:
+    weight: float = ...
+    strategy: str | None = ...
+    allowed_confidentialities: list[str] | None = ...
+    allowed_modalities: list[str] | None = ...
+    allowed_splits: list[str] | None = ...
+    def __init__(self, weight: float = ..., strategy: str | None = ..., allowed_confidentialities: list[str] | None = ..., allowed_modalities: list[str] | None = ..., allowed_splits: list[str] | None = ...) -> None: ...
+
+
+class DatasetSpec:
+    name: str
+    shards: tuple[str, ...]
+    weight: float = ...
+    shard_sampling: Literal['sequential', 'shuffle', 'epoch', 'resampled'] = ...
+    shard_quality_scores: tuple[float, ...] | None = ...
+    min_sample_quality: float | None = ...
+    mean: tuple[float, ...] | None = ...
+    std: tuple[float, ...] | None = ...
+    confidentialities: tuple[str, ...]
+    modalities: tuple[str, ...]
+    splits: tuple[str, ...]
+    strategies: tuple[str, ...]
+    def __init__(self, name: str, shards: tuple[str, ...], weight: float = ..., shard_sampling: Literal['sequential', 'shuffle', 'epoch', 'resampled'] = ..., shard_quality_scores: tuple[float, ...] | None = ..., min_sample_quality: float | None = ..., mean: tuple[float, ...] | None = ..., std: tuple[float, ...] | None = ..., confidentialities: tuple[str, ...] = ..., modalities: tuple[str, ...] = ..., splits: tuple[str, ...] = ..., strategies: tuple[str, ...] = ...) -> None: ...
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> DatasetSpec: ...
+
+    def to_dict(self) -> dict[str, Any]: ...
+
+
+class GlobalDatasetFilter:
+    allowed_confidentialities: list[str] | None = ...
+    allowed_modalities: list[str] | None = ...
+    allowed_splits: list[str] | None = ...
+    strategy: str | None = ...
+    def __init__(self, allowed_confidentialities: list[str] | None = ..., allowed_modalities: list[str] | None = ..., allowed_splits: list[str] | None = ..., strategy: str | None = ...) -> None: ...
+
+
+def confidentialities_up_to(level: str) -> tuple[str, ...]: ...
+def get_confidentiality_mounts() -> list: ...
+def get_confidentiality_mounts_for(level: str) -> list[ConfidentialityMount]: ...
+def get_registry() -> ConfidentialityRegistry: ...
+def register_confidentiality(name: str, path: str | Path) -> ConfidentialityMount: ...
+def register_spec_migration(from_version: int, fn: Callable[[dict[str, Any]], dict[str, Any]]) -> None: ...
+def resolve_path_for_confidentiality(name: str) -> Path: ...

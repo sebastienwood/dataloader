@@ -96,8 +96,10 @@ _HEADER = textwrap.dedent("""\
     # Only the installed package version is reflected here.
 
     from __future__ import annotations
+    import enum
     from typing import Any, Callable, Literal, Sequence
     from pathlib import Path
+    from datetime import timedelta
     from collections.abc import Iterator
 
 """)
@@ -134,17 +136,33 @@ def _annotation_str(annotation: object) -> str:
     """Best-effort stringification of a type annotation."""
     if annotation is inspect.Parameter.empty:
         return "Any"
-    raw = str(annotation)
-    # Strip module prefixes for common types
-    for prefix in (
+    
+    if isinstance(annotation, type):
+        raw = annotation.__name__
+    else:
+        raw = str(annotation)
+
+    # Added "datetime." to the prefixes to handle timedelta
+    prefixes = (
         "dino_datasets.", "dino_env.", "typing.", "collections.abc.",
-        "<class '", "'>",
-    ):
+        "pathlib.", "settings.", "dataset.", "datetime.", "<class '", "'>"
+    )
+    for prefix in prefixes:
         raw = raw.replace(prefix, "")
+    
+    # Map internal private names to Any
+    if raw.startswith("_") and "|" not in raw: 
+        return "Any"
+    
+    # Handle Union types containing internal names (e.g., Mount | _AnyMount)
+    if "_" in raw:
+        import re
+        raw = re.sub(r'_[a-zA-Z0-9]+', 'Any', raw)
+        
     return raw
 
 
-def _stub_callable(name: str, obj: object) -> str:
+def _stub_callable(name: str, obj: object, is_method: bool = False) -> str:
     """Emit a stub for a function or method."""
     try:
         sig = inspect.signature(obj)  # type: ignore[arg-type]
@@ -152,9 +170,15 @@ def _stub_callable(name: str, obj: object) -> str:
         return f"def {name}(*args: Any, **kwargs: Any) -> Any: ...\n"
 
     params: list[str] = []
-    for pname, param in sig.parameters.items():
+    for i, (pname, param) in enumerate(sig.parameters.items()):
+        # Skip 'self' or 'cls' for method stubs in .pyi files
+        if is_method and i == 0 and pname in ("self", "cls"):
+            params.append(pname)
+            continue
+
         ann = _annotation_str(param.annotation)
         if param.default is not inspect.Parameter.empty:
+            # We use ... for defaults in stubs
             params.append(f"{pname}: {ann} = ...")
         elif param.kind == inspect.Parameter.VAR_POSITIONAL:
             params.append(f"*{pname}: Any")
@@ -173,48 +197,43 @@ def _stub_class(name: str, cls: type) -> str:
     lines: list[str] = []
 
     if _is_enum(cls):
-        import enum
         lines.append(f"class {name}(enum.Enum):")
-        members = [m for m in cls.__members__]  # type: ignore[attr-defined]
-        if members:
-            for m in members:
-                lines.append(f"    {m}: int")
-        else:
-            lines.append("    ...")
+        # Enums in stubs usually show members as assignments
+        for member_name in cls.__members__:  # type: ignore[attr-defined]
+            lines.append(f"    {member_name} = ...")
         lines.append("")
         return "\n".join(lines) + "\n"
 
-    # Determine base class (frozen dataclass, plain dataclass, or object)
+    lines.append(f"class {name}:")
+
+    # 1. Handle Fields (for Dataclasses)
     if _is_dataclass(cls):
         import dataclasses
-        fields = dataclasses.fields(cls)  # type: ignore[arg-type]
-        lines.append(f"class {name}:")
-        if fields:
-            for f in fields:
-                ann = _annotation_str(f.type) if isinstance(f.type, str) else str(f.type)
-                if f.default is not dataclasses.MISSING:
-                    lines.append(f"    {f.name}: {ann} = ...")
-                elif f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
-                    lines.append(f"    {f.name}: {ann}")
-                else:
-                    lines.append(f"    {f.name}: {ann}")
-        else:
-            lines.append("    ...")
-
-        # Emit __init__ from signature
-        lines.append("")
-        lines.append("    " + _stub_callable("__init__", cls.__init__).rstrip())
-        lines.append("")
-    else:
-        lines.append(f"class {name}:")
+        fields = dataclasses.fields(cls)
+        for f in fields:
+            ann = _annotation_str(f.type)
+            if f.default is not dataclasses.MISSING:
+                lines.append(f"    {f.name}: {ann} = ...")
+            else:
+                lines.append(f"    {f.name}: {ann}")
+    
+    # 2. Emit __init__ once
+    try:
+        # We look at the raw __init__ function to ensure 'self' is present
+        init_stub = _stub_callable("__init__", cls.__init__, is_method=True).rstrip()
+        lines.append(f"    {init_stub}")
+    except Exception:
         lines.append("    def __init__(self, *args: Any, **kwargs: Any) -> None: ...")
-        lines.append("")
+    lines.append("")
 
-    # Emit public methods and properties
+    # 3. Emit public methods and properties
     for attr_name in sorted(dir(cls)):
-        if attr_name.startswith("_"):
+        if attr_name.startswith("_") or attr_name == "__init__":
             continue
+            
         try:
+            # We check the class __dict__ to see if it's a static/class method descriptor
+            raw_attr = cls.__dict__.get(attr_name)
             attr = getattr(cls, attr_name)
         except AttributeError:
             continue
@@ -228,7 +247,24 @@ def _stub_class(name: str, cls: type) -> str:
             lines.append(f"    def {attr_name}(self) -> {ret}: ...")
             lines.append("")
         elif callable(attr) and not isinstance(attr, type):
-            stub = _stub_callable(attr_name, attr).rstrip()
+            is_static = isinstance(raw_attr, staticmethod)
+            is_class = isinstance(raw_attr, classmethod)
+            
+            # --- THE FIX ---
+            # If it's a classmethod, getattr() returns a bound method.
+            # inspect.signature() on a bound method hides the 'cls' argument.
+            # We must use .__func__ to see the original signature with 'cls'.
+            target_obj = attr
+            if is_class and hasattr(attr, "__func__"):
+                target_obj = attr.__func__
+            # ---------------
+
+            if is_static:
+                lines.append("    @staticmethod")
+            elif is_class:
+                lines.append("    @classmethod")
+                
+            stub = _stub_callable(attr_name, target_obj, is_method=(not is_static)).rstrip()
             lines.append(f"    {stub}")
             lines.append("")
 
