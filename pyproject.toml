@@ -31,6 +31,7 @@ dev = [
     "pytest-timeout~=2.3",
     "pytest-mock~=3.14",
     "pytest-cov",
+    "pytest-xdist",
     "ruff",
     "ty",
 ]
@@ -81,7 +82,8 @@ markers = [
 timeout = 120
 # Default: exclude slow tests.  Run `pytest` with no -m flag to get the fast
 # suite.  Add `-m slow` or remove the addopts line to include slow tests.
-addopts = "-m 'not slow'"
+# addopts = "-m 'not slow'"
+addopts = "-n auto"
 
 [tool.uv.sources]
 dino-datasets = { git = "https://github.com/piflepaf1-eng/dino_datasets" }
