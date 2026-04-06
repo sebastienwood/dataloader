@@ -28,6 +28,24 @@ Changes in this version
             ``NormStats.to_dali_scale()``, eliminating ad-hoc ``× 255``
             multiplications scattered across the codebase.
 
+[FIX-FLIP]  ``_augment_view_dinov2`` previously forced every sample to be
+            horizontally flipped (``fn.flip(..., horizontal=1)``), ignoring
+            ``DINOAugConfig.flip_prob`` entirely and diverging from the CPU
+            path.  The flip is now gated by a ``fn.random.coin_flip`` with the
+            correct probability.
+
+[FIX-SOL]   Solarization was computed in ``_build_dinov2_pipeline`` but never
+            forwarded to ``_augment_view_dinov2`` — the parameter was missing
+            from the function signature.  It is now correctly passed and
+            applied, matching the documented DINOv2 recipe.
+
+[FIX-DTYPE] ``_augment_view_dinov2`` (and every other pipeline function)
+            previously hard-coded ``dtype=types.FLOAT16`` for normalisation,
+            ignoring ``LoaderConfig.output_dtype`` / ``PipelineConfig.output_dtype``.
+            The dtype is now resolved via ``PipelineConfig.dali_dtype_str`` and
+            forwarded through each pipeline builder, so selecting ``"fp32"``
+            actually produces FP32 tensors.
+
 [PL-1..5]   All previous improvements retained.
 """
 
@@ -46,7 +64,7 @@ from dino_loader.augmentation import (
     LeJEPAAugSpec,
     UserAugSpec,
 )
-from dino_loader.config import NormStats
+from dino_loader.config import NormStats, PipelineConfig
 
 if TYPE_CHECKING:
     from dino_datasets import DatasetSpec
@@ -61,6 +79,27 @@ try:
 except ImportError:
     HAS_DALI = False
     log.error("nvidia-dali not installed — pipeline will not build")
+
+
+# ---------------------------------------------------------------------------
+# Dtype helpers
+# ---------------------------------------------------------------------------
+
+def _dali_dtype(dali_dtype_str: str) -> Any:
+    """Resolve a DALI type from its string name.
+
+    Args:
+        dali_dtype_str: One of ``"FLOAT16"`` or ``"FLOAT"`` (as produced by
+            ``PipelineConfig.dali_dtype_str``).
+
+    Returns:
+        The corresponding ``nvidia.dali.types`` constant, or
+        ``types.FLOAT16`` as a safe fallback.
+
+    """
+    if not HAS_DALI:
+        return None
+    return getattr(types, dali_dtype_str, types.FLOAT16)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -159,6 +198,7 @@ def build_pipeline(
     norm_source:        NormSource | None = None,
     fuse_normalization: bool  = True,
     dali_fp8_output:    bool  = False,
+    pipeline_cfg:       PipelineConfig | None = None,
 ) -> Any:
     """Build and return a compiled DALI pipeline dispatched on ``aug_spec`` type.
 
@@ -177,6 +217,8 @@ def build_pipeline(
         norm_source: NormSource for per-dataset normalisation (PL-3).
         fuse_normalization: Fuse per-dataset norm into DALI kernel.
         dali_fp8_output: Emit FP8-cast tensors from the DALI graph (PL-5).
+        pipeline_cfg: If provided, overrides the individual dtype/queue/thread
+            parameters.  Preferred over passing them individually.
 
     Returns:
         A compiled DALI pipeline object.
@@ -192,16 +234,31 @@ def build_pipeline(
             "Install with: pip install nvidia-dali-cuda120",
         )
 
+    # Resolve effective dtype: PipelineConfig wins when supplied.
+    effective_dali_dtype_str = (
+        pipeline_cfg.dali_dtype_str if pipeline_cfg is not None else "FLOAT16"
+    )
+    if pipeline_cfg is not None:
+        num_threads     = pipeline_cfg.num_threads
+        device_id       = pipeline_cfg.device_id
+        hw_decoder_load = pipeline_cfg.hw_decoder_load
+        cpu_queue       = pipeline_cfg.cpu_queue
+        gpu_queue       = pipeline_cfg.gpu_queue
+        seed            = pipeline_cfg.seed
+        fuse_normalization = pipeline_cfg.fuse_normalization
+        dali_fp8_output    = pipeline_cfg.dali_fp8_output
+
     common_kwargs: dict[str, Any] = dict(
-        source          = source,
-        batch_size      = batch_size,
-        num_threads     = num_threads,
-        device_id       = device_id,
-        resolution_src  = resolution_src,
-        hw_decoder_load = hw_decoder_load,
-        cpu_queue       = cpu_queue,
-        gpu_queue       = gpu_queue,
-        seed            = seed,
+        source               = source,
+        batch_size           = batch_size,
+        num_threads          = num_threads,
+        device_id            = device_id,
+        resolution_src       = resolution_src,
+        hw_decoder_load      = hw_decoder_load,
+        cpu_queue            = cpu_queue,
+        gpu_queue            = gpu_queue,
+        seed                 = seed,
+        dali_dtype_str       = effective_dali_dtype_str,
     )
 
     match aug_spec:
@@ -245,11 +302,13 @@ def _build_dinov2_pipeline(
     norm_source:        NormSource | None,
     fuse_normalization: bool,
     dali_fp8_output:    bool,
+    dali_dtype_str:     str = "FLOAT16",
 ) -> Any:
     """Build the original DINOv2 multi-crop DALI pipeline."""
     n_views = aug_cfg.n_views
     # Fallback stats in [0,255] for when per-sample fused normalisation is off.
     global_mean_255, global_std_255 = aug_cfg.norm_stats.to_dali_scale()
+    out_dtype = _dali_dtype(dali_dtype_str)
 
     @pipeline_def(
         batch_size      = batch_size,
@@ -297,6 +356,9 @@ def _build_dinov2_pipeline(
                 else aug_cfg.blur_prob_global2 if is_global
                 else aug_cfg.blur_prob_local
             )
+            # [FIX-SOL] Solarization only on the second global crop (i == 1).
+            # Previously sol_prob was computed here but never forwarded to the
+            # augmentation helper — the parameter was absent from its signature.
             sol_prob   = aug_cfg.solarize_prob if (i == 1) else 0.0
             view = _augment_view_dinov2(
                 jpegs            = jpegs,
@@ -311,6 +373,7 @@ def _build_dinov2_pipeline(
                 stds             = stds,
                 global_mean_255  = global_mean_255,
                 global_std_255   = global_std_255,
+                out_dtype        = out_dtype,
                 dali_fp8_output  = dali_fp8_output,
                 name             = f"view_{i}",
             )
@@ -336,6 +399,7 @@ def _augment_view_dinov2(
     stds,
     global_mean_255: list[float],
     global_std_255:  list[float],
+    out_dtype:       Any,
     dali_fp8_output: bool,
     name:            str,
 ) -> Any:
@@ -354,6 +418,7 @@ def _augment_view_dinov2(
         stds: Per-sample std tensors from NormSource, or None.
         global_mean_255: Fallback mean in [0, 255].
         global_std_255: Fallback std in [0, 255].
+        out_dtype: DALI dtype constant for normalisation output.
         dali_fp8_output: Whether to cast output to FP8.
         name: Output tensor name.
 
@@ -391,32 +456,48 @@ def _augment_view_dinov2(
         saturation = fn.random.uniform(range=(0.6, 1.4), seed=seed + 2),
         hue        = fn.random.uniform(range=(-0.1, 0.1), seed=seed + 3),
     )
-    augmented = fn.flip(augmented, horizontal=1, vertical=0)
+
+    # [FIX-FLIP] Previously `fn.flip(..., horizontal=1)` forced every sample to
+    # be flipped regardless of DINOAugConfig.flip_prob, diverging from the CPU
+    # path and the documented DINOv2 recipe.  The flip is now stochastic and
+    # respects the configured probability.
+    flip_coin = fn.random.coin_flip(probability=aug_cfg.flip_prob, seed=seed + 6)
+    augmented = fn.flip(augmented, horizontal=flip_coin, vertical=0)
 
     blurred = fn.gaussian_blur(
         augmented,
         sigma = fn.random.uniform(range=(0.1, 2.0), seed=seed + 4),
     )
+    blur_coin = fn.random.coin_flip(probability=blur_prob, seed=seed + 5)
     augmented = (
-        fn.cast(fn.random.coin_flip(probability=blur_prob, seed=seed + 5), dtype=types.FLOAT)
-        * blurred
-        + fn.cast(
-            1 - fn.random.coin_flip(probability=blur_prob, seed=seed + 5),
-            dtype=types.FLOAT,
-        )
-        * augmented
+        fn.cast(blur_coin, dtype=types.FLOAT) * blurred
+        + fn.cast(1 - blur_coin, dtype=types.FLOAT) * augmented
     )
 
+    # [FIX-SOL] Solarization is now actually applied when sol_prob > 0.
+    # Previously the sol_prob value was computed in the caller but the
+    # parameter was absent from this function's signature, so the operator
+    # was never inserted into the DALI graph.
+    if sol_prob > 0.0:
+        sol_coin  = fn.random.coin_flip(probability=sol_prob, seed=seed + 7)
+        solarised = fn.experimental.solarize(augmented, threshold=128)
+        augmented = (
+            fn.cast(sol_coin, dtype=types.FLOAT) * solarised
+            + fn.cast(1 - sol_coin, dtype=types.FLOAT) * augmented
+        )
+
+    # [FIX-DTYPE] Use out_dtype (resolved from PipelineConfig.dali_dtype_str)
+    # instead of hard-coding types.FLOAT16.
     if means is not None and stds is not None:
         # Per-sample stats from NormSource (already in [0,255]).
-        normalised = fn.normalize(augmented, mean=means, stddev=stds, dtype=types.FLOAT16)
+        normalised = fn.normalize(augmented, mean=means, stddev=stds, dtype=out_dtype)
     else:
         # Global fallback stats (pre-converted to [0,255]).
         normalised = fn.normalize(
             augmented,
             mean   = global_mean_255,
             stddev = global_std_255,
-            dtype  = types.FLOAT16,
+            dtype  = out_dtype,
         )
 
     if dali_fp8_output:
@@ -425,7 +506,8 @@ def _augment_view_dinov2(
         except AttributeError:
             log.warning(
                 "DALI FLOAT8_E4M3 not available (requires DALI ≥ 1.36) — "
-                "falling back to FLOAT16 output.",
+                "falling back to %s output.",
+                out_dtype,
             )
             output = normalised
     else:
@@ -449,11 +531,13 @@ def _build_eval_pipeline(
     cpu_queue:       int,
     gpu_queue:       int,
     seed:            int,
+    dali_dtype_str:  str = "FLOAT16",
 ) -> Any:
     """Build the evaluation pipeline: resize-shorter-side + centre-crop."""
     crop_size          = aug_spec.crop_size
     mean_255, std_255  = aug_spec.norm_stats.to_dali_scale()
     interp             = types.INTERP_CUBIC if aug_spec.interpolation == "bicubic" else types.INTERP_LINEAR
+    out_dtype          = _dali_dtype(dali_dtype_str)
 
     @pipeline_def(
         batch_size           = batch_size,
@@ -497,11 +581,12 @@ def _build_eval_pipeline(
             device     = "gpu",
         )
 
+        # [FIX-DTYPE] Honour out_dtype.
         normalised = fn.normalize(
             cropped,
             mean   = mean_255,
             stddev = std_255,
-            dtype  = types.FLOAT16,
+            dtype  = out_dtype,
         )
         return fn.transpose(normalised, perm=[2, 0, 1], name="view_0")
 
@@ -525,9 +610,11 @@ def _build_lejpa_pipeline(
     cpu_queue:       int,
     gpu_queue:       int,
     seed:            int,
+    dali_dtype_str:  str = "FLOAT16",
 ) -> Any:
     """Build the LeJEPA pipeline: one context crop + N target crops."""
     mean_255, std_255 = aug_spec.norm_stats.to_dali_scale()
+    out_dtype         = _dali_dtype(dali_dtype_str)
 
     @pipeline_def(
         batch_size           = batch_size,
@@ -569,8 +656,13 @@ def _build_lejpa_pipeline(
             saturation = fn.random.uniform(range=(0.6, 1.4), seed=seed + 2),
             hue        = fn.random.uniform(range=(-0.1, 0.1), seed=seed + 3),
         )
-        context = fn.flip(context, horizontal=1, vertical=0)
-        context = fn.normalize(context, mean=mean_255, stddev=std_255, dtype=types.FLOAT16)
+        context = fn.flip(
+            context,
+            horizontal=fn.random.coin_flip(probability=0.5, seed=seed + 4),
+            vertical=0,
+        )
+        # [FIX-DTYPE] Honour out_dtype.
+        context = fn.normalize(context, mean=mean_255, stddev=std_255, dtype=out_dtype)
         context = fn.transpose(context, perm=[2, 0, 1], name="context")
         outputs.append(context)
 
@@ -582,7 +674,8 @@ def _build_lejpa_pipeline(
                 device      = "gpu",
                 seed        = seed + 10 + i,
             )
-            target = fn.normalize(target, mean=mean_255, stddev=std_255, dtype=types.FLOAT16)
+            # [FIX-DTYPE] Honour out_dtype.
+            target = fn.normalize(target, mean=mean_255, stddev=std_255, dtype=out_dtype)
             target = fn.transpose(target, perm=[2, 0, 1], name=f"target_{i}")
             outputs.append(target)
 
@@ -608,6 +701,7 @@ def _build_decode_only_pipeline(
     cpu_queue:       int,
     gpu_queue:       int,
     seed:            int,
+    dali_dtype_str:  str = "FLOAT16",
 ) -> Any:
     """Build a decode-only pipeline for user-defined augmentation.
 
@@ -615,6 +709,7 @@ def _build_decode_only_pipeline(
     The user function is applied outside the DALI graph by the iterator wrapper.
     """
     mean_255, std_255 = aug_spec.norm_stats.to_dali_scale()
+    out_dtype         = _dali_dtype(dali_dtype_str)
 
     @pipeline_def(
         batch_size           = batch_size,
@@ -647,11 +742,12 @@ def _build_decode_only_pipeline(
             device         = "gpu",
         )
 
+        # [FIX-DTYPE] Honour out_dtype.
         normalised = fn.normalize(
             resized,
             mean   = mean_255,
             stddev = std_255,
-            dtype  = types.FLOAT16,
+            dtype  = out_dtype,
         )
         return fn.transpose(normalised, perm=[2, 0, 1], name="decoded")
 

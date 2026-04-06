@@ -11,8 +11,16 @@ Corrections
     json.dumps() pour garantir un checksum déterministe indépendamment de
     l'ordre d'insertion des clés dict (garanti depuis Python 3.7 mais non
     spécifié par la norme JSON).
+[FIX-CONTEXTLIB] import contextlib ajouté au niveau module — il était
+    référencé dans CheckpointState.save() sans être importé, transformant
+    toute erreur d'I/O en NameError secondaire.
+[FIX-DTYPE] PipelineConfig expose output_dtype ("bf16" | "fp32") et le
+    propage depuis LoaderConfig.  Les backends lisent ce champ pour choisir
+    le dtype DALI/torch effectif, rendant ainsi la config publique cohérente
+    avec l'exécution.
 """
 
+import contextlib
 import json
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -145,6 +153,20 @@ class SharedExtractionPoolConfig:
 # PipelineConfig
 # ---------------------------------------------------------------------------
 
+# Mapping from the public string token to a torch dtype string understood by
+# backends.  New dtypes can be added here without touching LoaderConfig.
+_DTYPE_TO_TORCH: dict[str, str] = {
+    "bf16": "bfloat16",
+    "fp32": "float32",
+}
+
+# Mapping to the DALI types string name; resolved lazily inside the DALI
+# backend to avoid importing nvidia.dali at config parse time.
+_DTYPE_TO_DALI: dict[str, str] = {
+    "bf16": "FLOAT16",
+    "fp32": "FLOAT",
+}
+
 
 @dataclass(frozen=True)
 class PipelineConfig:
@@ -159,6 +181,9 @@ class PipelineConfig:
         seed: Pipeline RNG seed (rank offset applied by the caller).
         fuse_normalization: Fuse per-dataset mean/std into the DALI kernel.
         dali_fp8_output: Fuse FP8 cast into the DALI graph (no TE metadata).
+        output_dtype: Intermediate normalisation dtype — ``"bf16"`` or
+            ``"fp32"``.  Consumed by both the DALI and CPU backends so that
+            ``LoaderConfig.output_dtype`` actually affects execution.
 
     """
 
@@ -170,6 +195,17 @@ class PipelineConfig:
     seed:               int   = 0
     fuse_normalization: bool  = True
     dali_fp8_output:    bool  = False
+    output_dtype:       str   = "bf16"
+
+    @property
+    def torch_dtype_str(self) -> str:
+        """Return the torch dtype string for this config (e.g. ``"bfloat16"``)."""
+        return _DTYPE_TO_TORCH.get(self.output_dtype, "bfloat16")
+
+    @property
+    def dali_dtype_str(self) -> str:
+        """Return the DALI type name for this config (e.g. ``"FLOAT16"``)."""
+        return _DTYPE_TO_DALI.get(self.output_dtype, "FLOAT16")
 
     @classmethod
     def from_loader_config(cls, cfg: "LoaderConfig", device_id: int, rank: int) -> "PipelineConfig":
@@ -193,6 +229,7 @@ class PipelineConfig:
             seed               = cfg.seed + rank,
             fuse_normalization = cfg.fuse_normalization,
             dali_fp8_output    = cfg.use_fp8_output and cfg.dali_fp8_output,
+            output_dtype       = cfg.output_dtype,
         )
 
 
@@ -330,7 +367,9 @@ class LoaderConfig:
         use_fp8_output: Quantise output to FP8 E4M3. Requires transformer-engine.
         dali_fp8_output: Fuse FP8 cast into DALI graph. Requires use_fp8_output.
         fuse_normalization: Fuse per-dataset normalisation into the DALI kernel.
-        output_dtype: Intermediate dtype before optional FP8 cast.
+        output_dtype: Intermediate normalisation dtype before optional FP8 cast.
+            ``"bf16"`` maps to BF16/FLOAT16; ``"fp32"`` maps to FP32.
+            Both the DALI and CPU backends honour this setting.
         stateful_dataloader: Enable state_dict() / load_state_dict() interface.
         checkpoint_dir: Where JSON checkpoint files are written.
         checkpoint_every_steps: Checkpoint frequency (rank 0 only).
@@ -414,10 +453,10 @@ class LoaderConfig:
             msg = "LoaderConfig: dali_fp8_output=True requires use_fp8_output=True."
             raise ValueError(msg)
 
-        if self.output_dtype not in ("bf16", "fp32"):
+        if self.output_dtype not in _DTYPE_TO_TORCH:
             msg = (
-                f"LoaderConfig: output_dtype must be 'bf16' or 'fp32', "
-                f"got {self.output_dtype!r}."
+                f"LoaderConfig: output_dtype must be one of "
+                f"{list(_DTYPE_TO_TORCH)}, got {self.output_dtype!r}."
             )
             raise ValueError(msg)
 
@@ -524,6 +563,10 @@ class CheckpointState:
         garantit que save() et load() produisent toujours la même représentation
         JSON pour un payload identique.
 
+        [FIX-CONTEXTLIB] contextlib est maintenant importé au niveau module.
+        L'ancienne version référençait contextlib.suppress() sans import,
+        masquant l'erreur I/O originale derrière un NameError secondaire.
+
         Args:
             path: Destination file path.
 
@@ -540,6 +583,9 @@ class CheckpointState:
             tmp.write_text(json.dumps(envelope, indent=2, sort_keys=True), encoding="utf-8")
             tmp.rename(path)
         except Exception:
+            # [FIX-CONTEXTLIB] contextlib imported at module level — the
+            # previous code used contextlib.suppress() without any import,
+            # converting every I/O failure into a secondary NameError.
             with contextlib.suppress(Exception):
                 tmp.unlink(missing_ok=True)
             raise
@@ -600,5 +646,3 @@ class CheckpointState:
         data.setdefault("global_crop_size", 224)
         data.setdefault("local_crop_size",  96)
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-
-

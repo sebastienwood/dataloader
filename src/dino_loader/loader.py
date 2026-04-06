@@ -34,6 +34,11 @@ Corrections
 [FIX-META-FIFO] _ReaderAdapter utilise une queue.Queue pour aligner les
     métadonnées sur les batches dans l'ordre FIFO strict.
 [FIX-FUTURE] from __future__ import annotations supprimé (Python ≥ 3.12 natif).
+[FIX-RESTORE-LOCAL] _restore() maintenant appelle set_resolution() dès que
+    l'une des deux dimensions (global **ou** local) diffère de la valeur
+    courante. L'ancienne condition ne testait que global_crop_size, laissant
+    local_crop_size silencieusement non restauré lors des reprises où seule
+    cette dimension avait changé, rendant le checkpoint non-idempotent.
 """
 
 import logging
@@ -307,12 +312,13 @@ class DINODataLoader:
 
         log.info(
             "DINODataLoader ready: backend=%s rank=%d/%d batch=%d "
-            "aug=%s resolution=%dx%d pool_workers=%d",
+            "aug=%s resolution=%dx%d pool_workers=%d dtype=%s",
             self._backend.name,
             self._env.rank, self._env.world_size, batch_size,
             type(self._aug_spec).__name__,
             self._current_global_size, self._current_local_size,
             self._cfg.extraction_pool.max_workers,
+            self._cfg.output_dtype,
         )
 
     # ── Public properties ─────────────────────────────────────────────────────
@@ -631,7 +637,18 @@ class DINODataLoader:
                 )
 
     def _restore(self) -> None:
-        """Load the latest checkpoint and apply its state."""
+        """Load the latest checkpoint and apply its state.
+
+        [FIX-RESTORE-LOCAL] The previous implementation only called
+        ``set_resolution()`` when ``global_crop_size`` differed from the
+        current value.  If a job changed *only* ``local_crop_size`` (e.g.
+        during a resolution curriculum that adjusts local crops independently),
+        the saved local size was silently ignored and the loader continued at
+        the constructor default.
+
+        The fix: call ``set_resolution()`` whenever *either* dimension in the
+        checkpoint differs from the currently active values.
+        """
         state = self._ckpt.load()
         if state is None:
             return
@@ -644,8 +661,14 @@ class DINODataLoader:
             )
         else:
             self._reader.set_weights(state.mixing_weights)
-        if state.global_crop_size != self._current_global_size:
+
+        # [FIX-RESTORE-LOCAL] Restore resolution when either dimension changed.
+        if (
+            state.global_crop_size != self._current_global_size
+            or state.local_crop_size != self._current_local_size
+        ):
             self.set_resolution(state.global_crop_size, state.local_crop_size)
+
         self._epoch = state.epoch
         self._step  = state.step
 
