@@ -91,7 +91,7 @@ def main() -> None:
         DatasetSpec(
             name               = "datacomp1b",
             shards             = [f"/lustre/datacomp/shard-{i:06d}.tar" for i in range(30_000)],
-            prob               = 0.3,           # [CFG-S2] wds.RandomMix alias
+            weight               = 0.3,           # [CFG-S2] wds.RandomMix alias
             shard_sampling     = "epoch",
             min_sample_quality = 0.20,
             metadata_key       = "json",
