@@ -5,19 +5,14 @@ Source de données basée sur ``webdataset``, compatible avec l'interface de
 
 Motivation
 ----------
-``MixingSource`` (``hpc_source.py``) est optimisée pour les clusters HPC
-avec Lustre lent et beaucoup de rangs par nœud : elle maintient un cache
-``/dev/shm`` et un double-buffering custom.  Cette complexité est justifiée
-quand 70+ rangs lisent depuis ``/dev/shm`` plutôt que depuis Lustre.
+``MixingSource`` (``hpc_source.py``) est optimisée pour les clusters HPC avec
+Lustre lent et beaucoup de rangs par nœud : elle maintient un cache ``/dev/shm``
+et un double-buffering custom.  Cette complexité est justifiée quand 70+ rangs
+lisent depuis ``/dev/shm`` plutôt que depuis Lustre.
 
-``WDSSource`` est une alternative **plus simple** qui délègue entièrement le
-cycling, le shuffle et le mixing à la bibliothèque ``webdataset`` :
-
-- Cycling / shuffle / resampling → ``wds.ResampledShards`` / ``wds.SimpleShardList``
-- Parsing du tar → ``wds.tarfile_to_samples``
-- Mixing multi-dataset → ``wds.RandomMix``
-- Filtrage qualité → ``wds.select``
-- Buffer shuffle → ``wds.shuffle``
+``WDSSource`` est une alternative **plus simple** qui délègue le cycling, le
+shuffle et le mixing à ``webdataset``, en ajoutant uniquement le suivi des
+indices de dataset via ``IndexedRandomMixDataset`` (``_wds_mix.py``).
 
 Quand l'utiliser ?
 ------------------
@@ -30,8 +25,6 @@ Limites
 -------
 - Pas de cache ``/dev/shm`` : chaque rang lit directement depuis le filesystem.
 - ``set_weights()`` recrée l'itérateur (coût ~ms).
-- Les indices de dataset passés aux callbacks sont approximatifs quand
-  ``wds.RandomMix`` est utilisé (l'API publique WDS ne les expose pas).
 
 Compatibilité avec ``ShardReaderNode``
 ---------------------------------------
@@ -55,6 +48,7 @@ except ImportError:
 from dino_datasets import DatasetSpec
 
 from dino_loader.sources._weights import MixingWeights
+from dino_loader.sources._wds_mix import IndexedRandomMixDataset
 
 log = logging.getLogger(__name__)
 
@@ -80,14 +74,14 @@ class WDSSource:
     """Source de données basée sur ``webdataset``, compatible ``MixingSource``.
 
     Args:
-        specs: Liste ordonnée de spécifications de datasets.
-        batch_size: Nombre de samples par batch.
-        rank: Rang global de ce processus (partitionnement des shards).
-        world_size: Nombre total de rangs.
-        seed: Graine RNG de base.
+        specs:          Liste ordonnée de spécifications de datasets.
+        batch_size:     Nombre de samples par batch.
+        rank:           Rang global de ce processus (partitionnement des shards).
+        world_size:     Nombre total de rangs.
+        seed:           Graine RNG de base.
         shuffle_buffer: Taille du buffer de shuffle WDS en nombre de samples.
-        num_workers: Nombre de workers WDS (0 = thread principal).
-        url_handler: Handler URL personnalisé (ex. : client objet-store S3,
+        num_workers:    Nombre de workers WDS (0 = thread principal).
+        url_handler:    Handler URL personnalisé (ex. : client objet-store S3,
             proxy vers le cache ``/dev/shm``). Si ``None``, lecture directe.
 
     """
@@ -120,7 +114,7 @@ class WDSSource:
         self._lock           = threading.Lock()
 
         self._ds_index_callbacks: list[Callable[[list[int]], None]] = []
-        self._last_metadata: list[dict | None] = []
+        self._last_metadata:   list[dict | None] = []
         self._last_ds_indices: list[int] = []
 
         # Pipeline WDS créé paresseusement au premier appel à __call__().
@@ -131,68 +125,97 @@ class WDSSource:
     # Construction du pipeline
     # ------------------------------------------------------------------
 
+    def _build_single_pipeline(
+        self, spec: DatasetSpec, epoch_seed: int, ds_index: int,
+    ) -> Any:
+        """Construit un pipeline WDS pour un seul dataset.
+
+        Args:
+            spec:       Spécification du dataset.
+            epoch_seed: Seed de base pour cette époque.
+            ds_index:   Index du dataset dans ``self._specs`` (pour le seed).
+
+        Returns:
+            Pipeline WDS (``webdataset.WebDataset``).
+
+        """
+        assigned_shards = [
+            s for j, s in enumerate(spec.shards)
+            if j % self._world_size == self._rank
+        ]
+        if not assigned_shards:
+            log.warning(
+                "WDSSource: dataset '%s' has no shards assigned to rank %d/%d.",
+                spec.name, self._rank, self._world_size,
+            )
+            return None
+
+        shard_seed = epoch_seed + ds_index * 31
+        if spec.shard_sampling == "resampled":
+            shard_source = wds.ResampledShards(
+                urls          = assigned_shards,
+                seed          = shard_seed,
+                deterministic = True,
+            )
+        else:
+            shuffled = list(assigned_shards)
+            rng = np.random.default_rng(shard_seed)
+            rng.shuffle(shuffled)
+            shard_source = wds.SimpleShardList(shuffled)
+
+        pipe_kwargs: dict[str, Any] = {}
+        if self._url_handler is not None:
+            pipe_kwargs["handler"] = self._url_handler
+
+        pipeline = (
+            wds.WebDataset(shard_source, **pipe_kwargs)
+            .shuffle(self._shuffle_buffer, seed=epoch_seed + ds_index * 13)
+            .decode("pil")
+            .to_tuple("jpg;jpeg;png", "json", handler=wds.warn_and_continue)
+        )
+
+        if spec.min_sample_quality is not None:
+            min_quality = spec.min_sample_quality
+            pipeline = pipeline.select(
+                lambda sample, mq=min_quality: (
+                    sample[1].get("quality_score", 1.0) >= mq
+                    if sample[1] is not None else True
+                )
+            )
+
+        return pipeline
+
     def _build_pipeline(self, epoch: int) -> Any:
-        """Construit un pipeline WDS pour l'époque donnée.
+        """Construit le pipeline de mixing pour l'époque donnée.
 
         Le seed est dérivé de l'époque pour garantir la reproductibilité :
         même ``epoch`` + même ``seed`` → même ordre de shards et de samples.
+
+        Avec un seul dataset, retourne son itérateur directement en yielding
+        ``(sample, 0)``.  Avec plusieurs datasets, utilise
+        ``IndexedRandomMixDataset`` qui expose l'indice de dataset source.
 
         Args:
             epoch: Numéro d'époque (utilisé pour dériver le seed).
 
         Returns:
-            Itérateur WebDataset prêt à être consommé.
+            Itérateur de ``(sample, ds_index)``.
+
+        Raises:
+            RuntimeError: Si aucun shard n'est assigné à ce rang.
 
         """
         epoch_seed = self._seed + epoch * 997 + self._rank
         weights    = self._weights.get()
+
         pipelines: list[Any] = []
+        active_weights: list[float] = []
 
         for i, spec in enumerate(self._specs):
-            assigned_shards = [
-                s for j, s in enumerate(spec.shards)
-                if j % self._world_size == self._rank
-            ]
-            if not assigned_shards:
-                log.warning(
-                    "WDSSource: dataset '%s' has no shards assigned to rank %d/%d.",
-                    spec.name, self._rank, self._world_size,
-                )
-                continue
-
-            if spec.shard_sampling == "resampled":
-                shard_source = wds.ResampledShards(
-                    urls          = assigned_shards,
-                    seed          = epoch_seed + i * 31,
-                    deterministic = True,
-                )
-            else:
-                shuffled = list(assigned_shards)
-                rng = np.random.default_rng(epoch_seed + i * 31)
-                rng.shuffle(shuffled)
-                shard_source = wds.SimpleShardList(shuffled)
-
-            pipe_kwargs: dict[str, Any] = {}
-            if self._url_handler is not None:
-                pipe_kwargs["handler"] = self._url_handler
-
-            pipeline = (
-                wds.WebDataset(shard_source, **pipe_kwargs)
-                .shuffle(self._shuffle_buffer, seed=epoch_seed + i * 13)
-                .decode("pil")
-                .to_tuple("jpg;jpeg;png", "json", handler=wds.warn_and_continue)
-            )
-
-            min_quality = spec.min_sample_quality
-            if min_quality is not None:
-                pipeline = pipeline.select(
-                    lambda sample, mq=min_quality: (
-                        sample[1].get("quality_score", 1.0) >= mq
-                        if sample[1] is not None else True
-                    )
-                )
-
-            pipelines.append(pipeline)
+            pipe = self._build_single_pipeline(spec, epoch_seed, ds_index=i)
+            if pipe is not None:
+                pipelines.append(pipe)
+                active_weights.append(weights[i])
 
         if not pipelines:
             msg = (
@@ -202,9 +225,15 @@ class WDSSource:
             raise RuntimeError(msg)
 
         if len(pipelines) == 1:
-            return iter(pipelines[0])
+            # Un seul dataset : wrap minimal pour exposer l'indice 0.
+            return ((sample, 0) for sample in pipelines[0])
 
-        return iter(wds.RandomMix(pipelines, probs=weights, seed=epoch_seed))
+        mix = IndexedRandomMixDataset(
+            datasets = pipelines,
+            probs    = active_weights,
+            seed     = epoch_seed,
+        )
+        return iter(mix)
 
     def _get_or_build_iterator(self) -> Any:
         """Retourne l'itérateur courant, le construisant si nécessaire."""
@@ -224,95 +253,37 @@ class WDSSource:
             Liste de ``batch_size`` tableaux numpy de dtype ``uint8``.
 
         """
+        import io  # noqa: PLC0415
+
         it = self._get_or_build_iterator()
 
-        jpegs: list[np.ndarray] = []
-        metadata: list[dict | None] = []
-        ds_indices: list[int] = []
+        jpegs:      list[np.ndarray]  = []
+        metadata:   list[dict | None] = []
+        ds_indices: list[int]         = []
 
         while len(jpegs) < self._batch_size:
             try:
-                sample = next(it)
+                sample, ds_idx = next(it)
             except StopIteration:
                 with self._iter_lock:
                     self._iterator = self._build_pipeline(self._epoch)
                     it = self._iterator
-                sample = next(it)
+                sample, ds_idx = next(it)
 
             img, meta = sample
 
-            import io  # noqa: PLC0415
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=95)
             jpegs.append(np.frombuffer(buf.getvalue(), dtype=np.uint8))
             metadata.append(meta if isinstance(meta, dict) else None)
-            # Note : avec wds.RandomMix, l'index de dataset n'est pas exposé
-            # par l'API publique. On utilise 0 comme approximation.
-            # TODO: Fix this
-            # Here is the reference implementation of wds.RandomMix, maybe a small reimpl. is sufficient to get the dataset index while remaining true to the objectif of wds_source.
-            """
-            def random_samples(sources, probs=None, longest=False):
-    '''Yield samples randomly from multiple sources based on given probabilities.
-
-    Args:
-        sources (list): List of iterable sources to draw samples from.
-        probs (list, optional): List of probabilities for each source. Defaults to None.
-        longest (bool): If True, continue until all sources are exhausted. Defaults to False.
-
-    Yields:
-        Sample randomly selected from one of the sources.
-    '''
-    if probs is None:
-        probs = [1] * len(sources)
-    else:
-        probs = list(probs)
-    while len(sources) > 0:
-        cum = (np.array(probs) / np.sum(probs)).cumsum()
-        r = random.random()
-        i = np.searchsorted(cum, r)
-        try:
-            yield next(sources[i])
-        except StopIteration:
-            if longest:
-                del sources[i]
-                del probs[i]
-            else:
-                break
-
-
-class RandomMix(IterableDataset):
-    '''Iterate over multiple datasets by randomly selecting samples based on given probabilities.'''
-
-    def __init__(self, datasets, probs=None, longest=False):
-        '''Initialize the RandomMix iterator.
-
-        Args:
-            datasets (list): List of datasets to iterate over.
-            probs (list, optional): List of probabilities for each dataset. Defaults to None.
-            longest (bool): If True, continue until all datasets are exhausted. Defaults to False.
-        '''
-        self.datasets = datasets
-        self.probs = probs
-        self.longest = longest
-
-    def __iter__(self):
-        '''Return an iterator over the sources.
-
-        Returns:
-            iterator: An iterator that yields samples randomly from the datasets.
-        '''
-        sources = [iter(d) for d in self.datasets]
-        return random_samples(sources, self.probs, longest=self.longest)
-            """
-            ds_indices.append(0)
+            ds_indices.append(ds_idx)
 
         with self._lock:
             self._last_metadata   = metadata
             self._last_ds_indices = ds_indices
 
-        if self._ds_index_callbacks:
-            for cb in self._ds_index_callbacks:
-                cb(ds_indices)
+        for cb in self._ds_index_callbacks:
+            cb(ds_indices)
 
         return jpegs
 
@@ -332,21 +303,14 @@ class RandomMix(IterableDataset):
     ) -> None:
         """Enregistre un callback recevant les indices de dataset par sample.
 
-        Note: avec plusieurs datasets et ``wds.RandomMix``, les indices sont
-        approximatifs (toujours 0). Pour une normalisation per-dataset précise,
-        utiliser ``MixingSource`` qui maintient des itérateurs séparés.
+        Les indices sont exacts même avec plusieurs datasets : ils reflètent
+        le pipeline source réel dans ``IndexedRandomMixDataset``.
 
         Args:
             cb: Callable appelé avec ``list[int]`` après chaque batch.
 
         """
         self._ds_index_callbacks.append(cb)
-        if len(self._specs) > 1:
-            log.warning(
-                "WDSSource: register_dataset_index_callback with multiple datasets "
-                "— dataset indices will be approximate (always 0). "
-                "For accurate per-dataset normalization, use MixingSource instead."
-            )
 
     def set_epoch(self, epoch: int) -> None:
         """Recrée le pipeline pour une nouvelle époque.
@@ -375,7 +339,7 @@ class RandomMix(IterableDataset):
         """Met à jour le poids d'un dataset par son nom.
 
         Args:
-            name: Nom du dataset.
+            name:   Nom du dataset.
             weight: Nouveau poids brut.
 
         """
@@ -478,7 +442,7 @@ class WDSShardReaderNode:
         """Met à jour le poids d'un dataset par son nom.
 
         Args:
-            name: Nom du dataset.
+            name:   Nom du dataset.
             weight: Nouveau poids brut.
 
         """
