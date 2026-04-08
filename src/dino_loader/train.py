@@ -1,38 +1,36 @@
-r"""train.py — Reference DINOv3 training script using dino_loader.
+r"""train.py — Script de référence DINOv3 utilisant dino_loader.
 
-Demonstrates all improvements introduced in this version:
+Illustre les fonctionnalités principales :
 
-  1. [CFG-S1] shard_sampling='resampled' for small curated dataset
-  2. [CFG-S2] prob= alias aligned with wds.RandomMix API
-  3. [CFG-S3] debug_log_keys — per-sample key auditing
-  4. [CFG-S4] fuse_normalization — per-dataset norm fused in DALI graph
-  5. [CFG-S5] dali_fp8_output — optional in-graph FP8 cast (comment shows trade-off)
-  6. [LD-8]   PostProcessPipeline — fluid interface for post-DALI transforms
-  7. [LD-10]  empty_check watchdog — automatic stall detection
+  1. Spécification multi-dataset avec poids et filtres qualité
+  2. ``shard_sampling='resampled'`` pour les petits datasets curatés
+  3. ``fuse_normalization`` — normalisation par-dataset fusionnée dans DALI
+  4. ``dali_fp8_output`` — cast FP8 optionnel dans le graphe DALI
+  5. API de composition fluide (``map``, ``select``, ``with_epoch``)
+  6. Curriculum de résolution progressive via ``resolution_schedule``
+  7. Masquage de patches iBOT (``MaskingGenerator``, CPU post-DALI)
+  8. Interface ``StatefulDataLoader`` (``state_dict`` / ``load_state_dict``)
+  9. Curriculum de poids de datasets
 
-Also retained from previous version:
-  - Resolution schedule (zero-downtime, automatic via set_epoch)
-  - Per-shard quality filtering
-  - MaskingGenerator (iBOT token masking)
-  - StatefulDataLoader interface (state_dict / load_state_dict)
-  - Curriculum dataset weight schedule
+Pourquoi le masquage iBOT reste hors de DALI
+----------------------------------------------
+``MaskingGenerator`` opère sur des indices de patches ViT (grille bool de forme
+``grid × grid`` où ``grid = img_size // patch_size``), et non sur des pixels.
+Le graphe DALI ne traite que des tenseurs image denses, rendant impossible
+l'expression d'opérations sur des indices de patches. Le surcoût CPU est
+d'environ 0,3 ms pour une grille 37×37 — négligeable face aux ~40 ms du
+décodage DALI.
 
-Why iBOT masking stays outside DALI
---------------------------------------
-MaskingGenerator operates on ViT patch-level indices (a bool grid of shape
-gridxgrid where grid = img_size // patch_size), not on image pixels.
-DALI's computation graph only processes dense image tensors, so there is no
-way to express patch-index masking as a DALI operator.  The CPU overhead is
-~0.3 ms for a 37x37 grid — negligible compared to a 40 ms DALI decode step.
+Exemples de soumission SLURM
+-----------------------------
+GB200 NVL72 (72 GPU / rack, 4 racks = 288 rangs) :
 
-SLURM submission examples
---------------------------
-GB200 NVL72 (72 GPUs / rack, 4 racks = 288 ranks):
     sbatch --nodes=4 --ntasks-per-node=72 --gres=gpu:72 \\
            --cpus-per-task=4 --mem=2048G                  \\
            --wrap="python train.py"
 
-B200 PCIe (8 GPUs / node, 32 nodes = 256 ranks):
+B200 PCIe (8 GPU / nœud, 32 nœuds = 256 rangs) :
+
     sbatch --nodes=32 --ntasks-per-node=8 --gres=gpu:8  \\
            --cpus-per-task=16 --mem=512G                 \\
            --wrap="python train.py"
@@ -53,7 +51,7 @@ from dino_loader import (
     LoaderConfig,
 )
 from dino_loader.masking import MaskingGenerator
-from dino_loader.nodes import MaskMapNode
+from dino_loader.pipeline_graph import MaskMapNode
 
 logging.basicConfig(
     level   = logging.INFO,
@@ -66,36 +64,32 @@ _TOTAL_IMAGES = 50_000 * 10_000 + 30_000 * 10_000 + 5_000 * 10_000  # ~850 M
 
 
 def main() -> None:
-    # ── 1. Distributed init ────────────────────────────────────────────────────
+    # ── 1. Init distribué ─────────────────────────────────────────────────────
     env    = init()
     device = torch.device(f"cuda:{env.local_rank % torch.cuda.device_count()}")  # noqa: F841
 
-    # ── 2. Dataset catalogue ──────────────────────────────────────────────────
+    # ── 2. Catalogue des datasets ─────────────────────────────────────────────
     #
-    # [CFG-S1] imagenet22k uses shard_sampling='resampled' — it is small (5k
-    #          shards) and we want to over-sample it proportionally to its
-    #          weight=0.2 without cycling epochs manually.
+    # imagenet22k utilise shard_sampling='resampled' : petit dataset (5k shards)
+    # sur-échantillonné proportionnellement à son poids sans cycling manuel.
     #
-    # [CFG-S2] datacomp uses prob= (wds.RandomMix alias) instead of weight=
-    #          to demonstrate API alignment.  Both are equivalent.
-    #
+    # datacomp utilise une normalisation par-dataset (stats distinctes d'ImageNet).
     specs = [
         DatasetSpec(
             name               = "laion2b",
             shards             = [f"/lustre/laion2b/shard-{i:06d}.tar"  for i in range(50_000)],
             weight             = 0.5,
-            shard_sampling     = "epoch",       # default — full deterministic pass
+            shard_sampling     = "epoch",
             min_sample_quality = 0.25,
             metadata_key       = "json",
         ),
         DatasetSpec(
             name               = "datacomp1b",
             shards             = [f"/lustre/datacomp/shard-{i:06d}.tar" for i in range(30_000)],
-            prob               = 0.3,           # [CFG-S2] wds.RandomMix alias
+            weight             = 0.3,
             shard_sampling     = "epoch",
             min_sample_quality = 0.20,
             metadata_key       = "json",
-            # Per-dataset normalisation stats (DataComp has slightly different dist.)
             mean               = (0.490, 0.460, 0.420),
             std                = (0.235, 0.228, 0.232),
         ),
@@ -103,67 +97,57 @@ def main() -> None:
             name           = "imagenet22k",
             shards         = [f"/lustre/in22k/shard-{i:06d}.tar" for i in range(5_000)],
             weight         = 0.2,
-            shard_sampling = "resampled",   # [CFG-S1] infinite with-replacement
-            metadata_key   = None,          # no sidecars — skip extraction
+            shard_sampling = "resampled",
+            metadata_key   = None,
         ),
     ]
 
-    # ── 3. Augmentation config ────────────────────────────────────────────────
+    # ── 3. Config d'augmentation ──────────────────────────────────────────────
     aug_cfg = DINOAugConfig(
-        n_local_crops        = 8,
-        preserve_aspect_ratio= True,
-        resolution_schedule  = [(0, 224), (10, 448), (30, 518)],
-        max_global_crop_size = 518,
-        max_local_crop_size  = 224,
+        n_local_crops         = 8,
+        preserve_aspect_ratio = True,
+        resolution_schedule   = [(0, 224), (10, 448), (30, 518)],
+        max_global_crop_size  = 518,
+        max_local_crop_size   = 224,
     )
 
-    # ── 4. Loader config ──────────────────────────────────────────────────────
+    # ── 4. Config du loader ───────────────────────────────────────────────────
     batch_size = 512
 
     cfg = LoaderConfig(
-        node_shm_gb              = 256,
-        shard_prefetch_window    = 128,
-        shard_extraction_workers = 8,
-        dali_cpu_queue           = 8,
-        dali_gpu_queue           = 6,
-        hw_decoder_load          = 0.90,
-        shuffle_buffer_size      = 512,
+        node_shm_gb           = 256,
+        shard_prefetch_window = 128,
+        dali_cpu_queue        = 8,
+        dali_gpu_queue        = 6,
+        hw_decoder_load       = 0.90,
+        shuffle_buffer_size   = 512,
 
-        # [CFG-S4] Fuse per-dataset mean/std into DALI graph — reduces one
-        # kernel launch by merging normalize → cast → transpose.
-        fuse_normalization       = True,
+        # Fusionner la normalisation par-dataset dans le graphe DALI :
+        # réduit un kernel launch en fusionnant normalize → cast → transpose.
+        fuse_normalization    = True,
 
-        # [CFG-S5] In-graph FP8 cast.
-        # Set dali_fp8_output=True to fuse the FP8 cast into the DALI graph
-        # (normalize → cast FP8 → transpose in one kernel).
-        # Trade-off: FP8TensorMeta (TE rolling amax) is NOT available.
-        # Use False (default) when you need te.fp8_autocast compatibility.
-        use_fp8_output           = True,
-        dali_fp8_output          = False,   # False → FP8Formatter post-DALI with TE meta
+        # Cast FP8 post-DALI via Transformer Engine (rolling amax, compatible
+        # te.fp8_autocast). Mettre dali_fp8_output=True pour fusionner le cast
+        # dans le graphe DALI (plus rapide, mais sans FP8TensorMeta TE).
+        use_fp8_output        = True,
+        dali_fp8_output       = False,
 
-        stateful_dataloader      = True,
-        checkpoint_dir           = f"/lustre/ckpts/{os.environ.get('SLURM_JOB_ID', 'local')}/dl",
-        checkpoint_every_steps   = 500,
-
-        # [CFG-S3] Debug: log sample keys to file (disable in production)
-        debug_log_keys           = None,  # e.g. "/lustre/logs/sample_keys.tsv"
+        stateful_dataloader   = True,
+        checkpoint_dir        = f"/lustre/ckpts/{os.environ.get('SLURM_JOB_ID', 'local')}/dl",
+        checkpoint_every_steps = 500,
     )
 
-    # ── 5. iBOT MaskingGenerator (CPU, post-DALI) ────────────────────────────
-    #
-    # iBOT masking cannot be fused into DALI: MaskingGenerator produces a
-    # boolean grid over ViT patch indices (shape gridxgrid), not pixel-level
-    # operations.  DALI only processes dense image tensors.  CPU overhead is
-    # ~0.3 ms per batch — negligible vs 40 ms DALI decode.
-    #
+    # ── 5. MaskingGenerator iBOT (CPU, post-DALI) ─────────────────────────────
     patch_size = 14
     gen = MaskingGenerator(
-       input_size=(aug_cfg.max_global_crop_size // patch_size,
-                   aug_cfg.max_global_crop_size // patch_size),
-       num_masking_patches=int(0.5 * (aug_cfg.max_global_crop_size // patch_size) ** 2),
-   )
+        input_size           = (aug_cfg.max_global_crop_size // patch_size,
+                                aug_cfg.max_global_crop_size // patch_size),
+        num_masking_patches  = int(
+            0.5 * (aug_cfg.max_global_crop_size // patch_size) ** 2
+        ),
+    )
 
-    # ── 6. Build loader ───────────────────────────────────────────────────────
+    # ── 6. Construction du loader ─────────────────────────────────────────────
     steps_per_epoch = _TOTAL_IMAGES // (batch_size * env.world_size)
 
     base_loader = DINODataLoader(
@@ -178,55 +162,50 @@ def main() -> None:
         steps_per_epoch  = steps_per_epoch,
     )
 
-    # ── 7. [LD-8] PostProcessPipeline — fluid API ─────────────────────────────
+    # ── 7. Composition du pipeline ────────────────────────────────────────────
     #
-    # Chain post-DALI transforms in a readable, composable style:
+    # L'API fluide permet de chaîner des transforms post-DALI :
+    #   .map(fn)       → applique fn(Batch) → Batch sur chaque batch
+    #   .select(pred)  → ignore les batches où pred(Batch) est False
+    #   .with_epoch(n) → limite à n steps par époque
     #
-    #   .map(fn)       — apply fn(Batch) → Batch on every batch
-    #   .select(pred)  — drop batches where pred(Batch) is False
-    #   .with_epoch(n) — limit to n steps per epoch (replaces steps_per_epoch)
-    #
-    # Each call returns a new PostProcessPipeline; the base_loader is unchanged.
-    # The pipeline is lazy — transforms run as batches flow through.
-    #
-    # The empty_check watchdog [LD-10] fires inside _raw_iter() if no batch
-    # is produced within 120s, giving a diagnostic message instead of hanging.
-    #
+    # Chaque appel retourne un nouveau NodePipeline ; base_loader est intact.
+    # Les transforms s'exécutent paresseusement au fil de l'itération.
     def quality_filter(batch) -> bool:
-        """Example: skip batches where all metadata is None (no quality signal)."""  # noqa: D401
+        """Ignore les batches sans aucun signal de qualité (tout None)."""
         if not batch.metadata:
             return True
         return any(m is not None for m in batch.metadata)
 
     loader = (
         base_loader
-        .select(quality_filter)     # skip all-None-metadata batches
+        .select(quality_filter)
         .map(MaskMapNode.as_transform(gen))
         .with_epoch(steps_per_epoch)
     )
 
-    # ── 8. Model (placeholder) ────────────────────────────────────────────────
-    # model = TE_ViT_Giant(...).to(device) # noqa: ERA001
-    # optim = torch.optim.AdamW(model.parameters(), lr=1e-3) # noqa: ERA001
+    # ── 8. Modèle (placeholder) ───────────────────────────────────────────────
+    # model = TE_ViT_Giant(...).to(device)
+    # optim = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
-    # ── 9. Training loop ──────────────────────────────────────────────────────
+    # ── 9. Boucle d'entraînement ──────────────────────────────────────────────
     for epoch in range(100):
         loader.set_epoch(epoch)
 
-        # Curriculum: shift toward curated data over time
+        # Curriculum : augmenter le poids du dataset curatés au fil du temps
         if epoch == 20:  # noqa: PLR2004
-            log.info("Epoch %d: curriculum shift — boosting imagenet22k weight", epoch)
+            log.info("Époque %d : curriculum — augmentation du poids imagenet22k", epoch)
             loader.set_weight_by_name("imagenet22k", 0.35)
 
         for step, batch in enumerate(loader):  # noqa: B007
-            # batch.global_crops : list[Tensor[B,3,H,W]]  — BF16 (or FP8) on GPU
-            # batch.local_crops  : list[Tensor[B,3,h,w]] # noqa: ERA001
-            # batch.metadata     : list[Optional[dict]]   — per-sample JSON sidecar
-            # batch.masks        : Optional[Tensor]        — iBOT patch masks
+            # batch.global_crops : list[Tensor[B,3,H,W]]  — BF16 (ou FP8) sur GPU
+            # batch.local_crops  : list[Tensor[B,3,h,w]]
+            # batch.metadata     : list[Optional[dict]]   — sidecar JSON par sample
+            # batch.masks        : Optional[Tensor]        — masques de patches iBOT
 
-            # loss = model(batch) # noqa: ERA001
-            # loss.backward() # noqa: ERA001
-            # optim.step()  # noqa: ERA001
+            # loss = model(batch)
+            # loss.backward()
+            # optim.step()
 
             loader.checkpoint(step)
 

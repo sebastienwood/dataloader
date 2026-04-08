@@ -1,49 +1,58 @@
 """dino_loader.pipeline_graph
 ============================
-Composable, stateful post-processing pipeline built on ``torchdata.nodes``.
+Pipeline de post-traitement composable et stateful, construit sur
+``torchdata.nodes``.
 
-Architecture
-------------
-Ce module est le point d'entrée unique pour la composition post-augmentation.
-``DINODataLoader`` construit un ``NodePipeline`` en interne via
-``wrap_loader()``.  L'utilisateur peut ensuite l'enrichir via
-``.map()``, ``.select()``, ``.with_epoch()`` sans toucher au loader.
+Responsabilités de ce module
+-----------------------------
+Ce module est le point d'entrée unique pour **tout ce qui opère sur des
+``Batch``** après la sortie du pipeline d'augmentation (DALI ou CPU) :
 
-Rôle de chaque classe
----------------------
 ``_DALINode``
-    BaseNode qui pilote l'itérateur DALI/CPU, assemble les ``Batch``,
-    met à jour les métriques et détecte les stalls.  C'est le seul endroit
-    qui connaît l'itérateur DALI.
+    Pilote l'itérateur DALI/CPU, assemble les ``Batch``, met à jour les
+    métriques et détecte les stalls.  Seul endroit qui connaît l'itérateur.
+
+``MetadataNode``
+    Sépare les flux JPEG et métadonnées issus d'un ``ShardReaderNode``.
+    Bufferise les métadonnées pour une récupération décorrélée.
+
+``MaskMapNode``
+    Attache des masques de patches iBOT (``MaskingGenerator``) aux ``Batch``.
+    Opère sur des indices de patches ViT, pas sur des pixels — ne peut donc
+    pas être fusionné dans le graphe DALI.
 
 ``BatchMapNode``
-    Applique une transformation ``Batch → Batch``.
+    Applique une transformation ``Batch → Batch`` arbitraire.
 
 ``BatchFilterNode``
-    Filtre les batches selon un prédicat.  Incrémente le compteur de métriques.
+    Filtre les batches selon un prédicat booléen.
 
 ``_LimitNode``
-    Limite à ``max_steps`` batches par époque.
+    Borne l'itération à ``max_steps`` batches par époque.
 
 ``NodePipeline``
-    Wrapper composable.  Expose toutes les propriétés publiques de
-    ``DINODataLoader``.
+    Wrapper composable exposant toutes les propriétés publiques de
+    ``DINODataLoader``.  Point d'entrée pour l'utilisateur final.
 
-Corrections
------------
-[FIX-ITER-RACE] _DALINode expose reset_iter() avec lock interne pour éviter
-    la race condition entre set_epoch() (thread principal) et next() (thread
-    tn.Loader).  loader.py utilise reset_iter() au lieu d'accéder à _iter
-    directement.
-[FIX-DOUBLE-ITER] DINODataLoader.__iter__ et NodePipeline gèrent l'itération
-    active via _active_iter pour lever RuntimeError si deux itérations
-    démarrent simultanément.
-[FIX-STATE-MAX-STEPS] max_steps est inclus dans state_dict() / load_state_dict()
-    pour qu'un round-trip le restitue correctement.
-[FIX-FUTURE] from __future__ import annotations supprimé (Python ≥ 3.12 natif).
-[METRICS]   Métriques et stall watchdog dans _DALINode.
-[PROPS]     NodePipeline expose current_resolution, current_weights,
-    backend, aug_spec.
+``wrap_loader``
+    Factory publique : bridge ``DINODataLoader`` → ``NodePipeline``.
+
+Séparation des responsabilités
+--------------------------------
+Ce module n'importe PAS depuis ``shard_reader`` (dépendance sens unique) :
+
+    loader.py → shard_reader.py → sources/
+    loader.py → pipeline_graph.py
+    pipeline_graph.py → memory.py (Batch)
+
+Corrections intégrées
+---------------------
+[FIX-ITER-RACE]    _DALINode.reset_iter() protégé par lock interne.
+[FIX-DOUBLE-ITER]  DINODataLoader.__iter__ lève RuntimeError si déjà actif.
+[FIX-STATE-MAX-STEPS] max_steps inclus dans state_dict / load_state_dict.
+[METRICS]          Métriques et stall watchdog dans _DALINode.
+[PROPS]            NodePipeline expose current_resolution, current_weights,
+                   backend, aug_spec.
 """
 
 import logging
@@ -53,6 +62,8 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
+import numpy as np
+import torch
 import torchdata.nodes as tn
 from torchdata.nodes import BaseNode
 
@@ -71,6 +82,7 @@ class _DALINode(BaseNode):  # type: ignore[misc]
 
     Ce nœud est la frontière entre torchdata.nodes et le pipeline DALI.
     Il encapsule :
+
     - Le défilement de l'itérateur DALI/CPU.
     - L'assemblage des vues en ``Batch`` (via ``build_batch_fn``).
     - La mise à jour des métriques (batches_yielded, pipeline_yield_ms).
@@ -83,21 +95,15 @@ class _DALINode(BaseNode):  # type: ignore[misc]
     l'accès à ``_iter`` pour éviter la race condition entre ``reset_iter()``
     (appelé par ``set_epoch()``) et ``next()``.
 
-    Restauration intra-époque
-    --------------------------
-    ``reset()`` repart de zéro (DALI n'est pas sérialisable).  Sur restore
-    d'un state_dict, l'itération repart du début de l'époque avec le bon
-    seed.  ``_num_yielded`` est persisté pour information seulement.
-
     Args:
         dali_iter_factory: Callable ``() -> iterator`` appelé à chaque
             ``reset()``.  Produit un itérateur compatible DALIGenericIterator.
-        pop_metadata_fn: Callable ``() -> list[dict|None]`` pour récupérer
-            les métadonnées du batch courant depuis ``_ReaderAdapter``.
-        build_batch_fn: Callable ``(views, metadata) -> Batch``.
-        output_map: Noms des vues produites par l'itérateur DALI.
-        stall_timeout_s: Secondes avant levée si aucun batch. 0 = désactivé.
-        rank: Rang global pour les messages d'erreur.
+        pop_metadata_fn:   Callable ``() -> list[dict|None]`` pour récupérer
+            les métadonnées du batch courant.
+        build_batch_fn:    Callable ``(views, metadata) -> Batch``.
+        output_map:        Noms des vues produites par l'itérateur DALI.
+        stall_timeout_s:   Secondes avant levée si aucun batch. 0 = désactivé.
+        rank:              Rang global pour les messages d'erreur.
 
     """
 
@@ -112,17 +118,15 @@ class _DALINode(BaseNode):  # type: ignore[misc]
     ) -> None:
         """Initialise _DALINode."""
         super().__init__()
-        self._iter_factory   = dali_iter_factory
-        self._pop_metadata   = pop_metadata_fn
-        self._build_batch    = build_batch_fn
-        self._output_map     = output_map
-        self._stall_timeout  = stall_timeout_s
-        self._rank           = rank
-        self._iter: Any      = None
-        self._num_yielded    = 0
-        # [FIX-ITER-RACE] Lock protégeant l'accès à _iter entre set_epoch()
-        # (thread principal) et next() (thread tn.Loader).
-        self._iter_lock      = threading.Lock()
+        self._iter_factory  = dali_iter_factory
+        self._pop_metadata  = pop_metadata_fn
+        self._build_batch   = build_batch_fn
+        self._output_map    = output_map
+        self._stall_timeout = stall_timeout_s
+        self._rank          = rank
+        self._iter: Any     = None
+        self._num_yielded   = 0
+        self._iter_lock     = threading.Lock()
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
         """(Re-)initialise l'itérateur DALI/CPU pour une nouvelle époque."""
@@ -135,8 +139,7 @@ class _DALINode(BaseNode):  # type: ignore[misc]
         """Invalide l'itérateur courant pour forcer sa recréation au prochain reset().
 
         Appelé par ``DINODataLoader.set_epoch()`` depuis le thread principal.
-        Thread-safe : utilise ``_iter_lock`` pour éviter la race condition avec
-        ``next()`` qui peut s'exécuter dans le thread ``tn.Loader``.
+        Thread-safe via ``_iter_lock``.
         """
         with self._iter_lock:
             self._iter = None
@@ -145,8 +148,9 @@ class _DALINode(BaseNode):  # type: ignore[misc]
         """Retourne le prochain Batch assemblé.
 
         Raises:
-            StopIteration: En fin d'époque (signal normal pour tn.Loader).
-            RuntimeError: Si aucun batch n'est produit et stall_timeout_s > 0.
+            StopIteration: En fin d'époque.
+            RuntimeError:  Si aucun batch n'est produit et stall_timeout_s > 0.
+            AssertionError: Si reset() n'a pas été appelé.
 
         """
         with self._iter_lock:
@@ -162,16 +166,16 @@ class _DALINode(BaseNode):  # type: ignore[misc]
             if self._num_yielded == 0 and self._stall_timeout > 0:
                 if os.environ.get("DINO_DISABLE_EMPTY_CHECK"):
                     log.warning(
-                        "_DALINode rank %d: no batch produced but "
-                        "DINO_DISABLE_EMPTY_CHECK is set — continuing silently.",
+                        "_DALINode rank %d: aucun batch produit mais "
+                        "DINO_DISABLE_EMPTY_CHECK est actif — continuation silencieuse.",
                         self._rank,
                     )
                 else:
                     msg = (
-                        f"_DALINode (rank {self._rank}): no batch produced. "
-                        "Possible causes: corrupted shards, /dev/shm full, "
-                        "sample_predicate rejected every sample, filesystem MDS slow start. "
-                        "Disable: DINO_DISABLE_EMPTY_CHECK=1 or stall_timeout_s=0."
+                        f"_DALINode (rank {self._rank}): aucun batch produit. "
+                        "Causes possibles : shards corrompus, /dev/shm plein, "
+                        "sample_predicate a rejeté tous les samples, démarrage MDS lent. "
+                        "Désactiver : DINO_DISABLE_EMPTY_CHECK=1 ou stall_timeout_s=0."
                     )
                     raise RuntimeError(msg) from None
             raise
@@ -206,12 +210,161 @@ class _DALINode(BaseNode):  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
+# MetadataNode
+# ---------------------------------------------------------------------------
+
+
+class MetadataNode(BaseNode):  # type: ignore[misc]
+    """Sépare le flux JPEG et métadonnées issu d'un ``ShardReaderNode``.
+
+    ``ShardReaderNode.next()`` retourne un ``ReaderBatch`` :
+    ``(list[np.ndarray], list[dict | None])``.  ``MetadataNode`` bufferise
+    les métadonnées pour permettre leur récupération décorrélée (après la
+    passe DALI) via ``pop_last_metadata()``.
+
+    Args:
+        source: Nœud amont produisant des ``ReaderBatch``.
+
+    """
+
+    def __init__(self, source: BaseNode) -> None:  # type: ignore[type-arg]
+        """Initialise un MetadataNode."""
+        super().__init__()
+        self._source: BaseNode                           = source  # type: ignore[type-arg]
+        self._last_meta: list[dict[str, Any] | None]    = []
+
+    def reset(self, initial_state: dict[str, Any] | None = None) -> None:
+        """Remet à zéro la source amont et vide le buffer de métadonnées."""
+        super().reset(initial_state)
+        self._source.reset(initial_state)
+        self._last_meta = []
+
+    def next(self) -> tuple[list[np.ndarray], list[dict[str, Any] | None]]:
+        """Retourne le prochain batch en bufferisant les métadonnées."""
+        jpegs, meta     = self._source.next()
+        self._last_meta = meta
+        return jpegs, meta
+
+    def get_state(self) -> dict[str, Any]:
+        """Délègue l'état à la source amont."""
+        return self._source.get_state()
+
+    def pop_last_metadata(self) -> list[dict[str, Any] | None]:
+        """Retourne les métadonnées du dernier ``next()`` et vide le buffer."""
+        meta, self._last_meta = self._last_meta, []
+        return meta
+
+
+# ---------------------------------------------------------------------------
+# MaskMapNode
+# ---------------------------------------------------------------------------
+
+
+class MaskMapNode(BaseNode):  # type: ignore[misc]
+    """Attache des masques de patches iBOT à chaque ``Batch``.
+
+    ``MaskingGenerator`` opère sur des indices de patches ViT (grille bool
+    de forme ``grid × grid`` où ``grid = img_size // patch_size``), et non
+    sur des pixels.  Le graphe DALI ne peut traiter que des tenseurs image
+    denses : ce nœud doit donc rester hors du graphe DALI, sur CPU.
+
+    Le surcoût CPU est d'environ 0,3 ms par batch pour une grille 37×37 —
+    négligeable face aux ~40 ms du décodage DALI.
+
+    Args:
+        source:              Nœud amont produisant des ``Batch``.
+        mask_generator:      Instance de ``MaskingGenerator``.
+        num_masking_patches: Nombre cible de patches masqués (transmis au
+                             générateur si fourni).
+
+    """
+
+    def __init__(
+        self,
+        source:              BaseNode,  # type: ignore[type-arg]
+        mask_generator:      Any,
+        num_masking_patches: int | None = None,
+    ) -> None:
+        """Initialise un MaskMapNode."""
+        super().__init__()
+        self._source = source
+        self._gen    = mask_generator
+        self._n_mask = num_masking_patches
+
+    def reset(self, initial_state: dict[str, Any] | None = None) -> None:
+        """Remet à zéro la source amont."""
+        super().reset(initial_state)
+        self._source.reset(initial_state)
+
+    def next(self) -> Batch:
+        """Retourne le prochain ``Batch`` avec ``Batch.masks`` renseigné."""
+        batch: Batch = self._source.next()
+        if not batch.global_crops:
+            msg = (
+                "MaskMapNode.next: batch.global_crops est vide. "
+                "MaskMapNode requiert au moins un crop global pour dériver "
+                "la dimension batch des masques."
+            )
+            raise ValueError(msg)
+
+        mask  = self._gen(flat=True)
+        masks = torch.from_numpy(mask).unsqueeze(0)
+        b     = batch.global_crops[0].shape[0]
+        masks = masks.expand(b, -1)
+
+        batch.masks = masks
+        return batch
+
+    def get_state(self) -> dict[str, Any]:
+        """Délègue l'état à la source amont."""
+        return self._source.get_state()
+
+    @staticmethod
+    def as_transform(
+        mask_generator:      Any,
+        num_masking_patches: int | None = None,
+    ) -> Callable[[Batch], Batch]:
+        """Retourne un callable ``Batch → Batch`` pour utilisation avec ``.map()``.
+
+        Args:
+            mask_generator:      Instance de ``MaskingGenerator``.
+            num_masking_patches: Passé au générateur (non utilisé actuellement,
+                                 réservé pour la validation future).
+
+        Returns:
+            Callable applicable via ``NodePipeline.map()``.
+
+        """
+        def _apply(batch: Batch) -> Batch:
+            if not batch.global_crops:
+                msg = (
+                    "MaskMapNode.as_transform: batch.global_crops est vide. "
+                    "Le masquage requiert au moins un crop global."
+                )
+                raise ValueError(msg)
+
+            mask  = mask_generator(flat=True)
+            masks = torch.from_numpy(mask).unsqueeze(0)
+            b     = batch.global_crops[0].shape[0]
+            masks = masks.expand(b, -1)
+
+            return Batch(
+                global_crops = batch.global_crops,
+                local_crops  = batch.local_crops,
+                metadata     = batch.metadata,
+                masks        = masks,
+            )
+
+        return _apply
+
+
+# ---------------------------------------------------------------------------
 # BatchMapNode
 # ---------------------------------------------------------------------------
 
 
 class BatchMapNode(BaseNode):  # type: ignore[misc]
-    """Apply a ``Batch → Batch`` function to every element of a node stream."""
+    """Applique une transformation ``Batch → Batch`` à chaque élément du flux."""
 
     def __init__(
         self,
@@ -220,27 +373,27 @@ class BatchMapNode(BaseNode):  # type: ignore[misc]
         *,
         label:  str = "<map>",
     ) -> None:
-        """Initialise a BatchMapNode."""
+        """Initialise un BatchMapNode."""
         super().__init__()
         self._source = source
         self._fn     = fn
         self._label  = label
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
-        """Reset upstream source."""
+        """Remet à zéro la source amont."""
         super().reset(initial_state)
         self._source.reset(initial_state)
 
     def next(self) -> Batch:
-        """Apply fn to the next batch from source."""
+        """Applique fn au prochain batch de la source."""
         return self._fn(self._source.next())
 
     def get_state(self) -> dict[str, Any]:
-        """Delegate to source."""
+        """Délègue l'état à la source amont."""
         return self._source.get_state()
 
     def __repr__(self) -> str:
-        """Return a compact string representation."""
+        """Représentation compacte."""
         return f"BatchMapNode({self._label!r})"
 
 
@@ -250,7 +403,7 @@ class BatchMapNode(BaseNode):  # type: ignore[misc]
 
 
 class BatchFilterNode(BaseNode):  # type: ignore[misc]
-    """Skip ``Batch`` objects for which a predicate returns ``False``."""
+    """Ignore les ``Batch`` pour lesquels un prédicat retourne ``False``."""
 
     def __init__(
         self,
@@ -259,7 +412,7 @@ class BatchFilterNode(BaseNode):  # type: ignore[misc]
         *,
         label:     str = "<filter>",
     ) -> None:
-        """Initialise a BatchFilterNode."""
+        """Initialise un BatchFilterNode."""
         super().__init__()
         self._source    = source
         self._predicate = predicate
@@ -267,13 +420,13 @@ class BatchFilterNode(BaseNode):  # type: ignore[misc]
         self._n_skipped = 0
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
-        """Reset upstream source and clear skip counter."""
+        """Remet à zéro la source et le compteur de batches ignorés."""
         super().reset(initial_state)
         self._source.reset(initial_state)
         self._n_skipped = 0
 
     def next(self) -> Batch:
-        """Return the next batch accepted by the predicate."""
+        """Retourne le prochain batch accepté par le prédicat."""
         while True:
             batch = self._source.next()
             if self._predicate(batch):
@@ -282,21 +435,21 @@ class BatchFilterNode(BaseNode):  # type: ignore[misc]
             self._record_filtered()
 
     def get_state(self) -> dict[str, Any]:
-        """Delegate to source."""
+        """Délègue l'état à la source amont."""
         return self._source.get_state()
 
     @property
     def n_skipped(self) -> int:
-        """Running count of batches rejected by the predicate."""
+        """Nombre cumulé de batches rejetés par le prédicat."""
         return self._n_skipped
 
     def __repr__(self) -> str:
-        """Return a compact string representation."""
+        """Représentation compacte."""
         return f"BatchFilterNode({self._label!r}, skipped={self._n_skipped})"
 
     @staticmethod
     def _record_filtered() -> None:
-        """Increment the batches_filtered metric if the registry is available."""
+        """Incrémente le compteur batches_filtered si le registry est disponible."""
         try:
             from dino_loader.monitor.metrics import get_registry  # noqa: PLC0415
             reg = get_registry()
@@ -312,23 +465,23 @@ class BatchFilterNode(BaseNode):  # type: ignore[misc]
 
 
 class _LimitNode(BaseNode):  # type: ignore[misc]
-    """Yield at most ``max_steps`` batches per epoch, then raise StopIteration."""
+    """Émet au plus ``max_steps`` batches par époque, puis lève StopIteration."""
 
     def __init__(self, source: BaseNode, max_steps: int) -> None:  # type: ignore[type-arg]
-        """Initialise a _LimitNode."""
+        """Initialise un _LimitNode."""
         super().__init__()
         self._source    = source
         self._max_steps = max_steps
         self._yielded   = 0
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
-        """Reset upstream and clear yield counter."""
+        """Remet à zéro la source et le compteur de batches émis."""
         super().reset(initial_state)
         self._source.reset(initial_state)
         self._yielded = 0
 
     def next(self) -> Batch:
-        """Return next batch or raise StopIteration when limit is reached."""
+        """Retourne le prochain batch ou lève StopIteration si la limite est atteinte."""
         if self._yielded >= self._max_steps:
             raise StopIteration
         batch = self._source.next()
@@ -336,19 +489,21 @@ class _LimitNode(BaseNode):  # type: ignore[misc]
         return batch
 
     def get_state(self) -> dict[str, Any]:
-        """Return source state (limit counter not persisted)."""
+        """Retourne l'état de la source (compteur non persisté)."""
         return self._source.get_state()
 
 
 # ---------------------------------------------------------------------------
-# NodePipeline — pipeline composable avec toutes les propriétés DINODataLoader
+# NodePipeline — pipeline composable exposant toutes les propriétés DINODataLoader
 # ---------------------------------------------------------------------------
 
 
 class NodePipeline:
-    """Composable, stateful post-processing pipeline built on ``torchdata.nodes``.
+    """Pipeline de post-traitement composable et stateful.
 
-    Expose toutes les propriétés publiques de ``DINODataLoader``.
+    Expose toutes les propriétés publiques de ``DINODataLoader`` par délégation,
+    ce qui permet de l'utiliser comme drop-in replacement dans la boucle
+    d'entraînement.
 
     Propriétés déléguées
     --------------------
@@ -359,14 +514,14 @@ class NodePipeline:
     ``set_epoch``, ``checkpoint``, ``set_weights``, ``set_weight_by_name``,
     ``set_resolution``, ``state_dict``, ``load_state_dict``
 
-    Méthodes de composition
-    -----------------------
-    ``.map(fn)``         — ajoute un ``Batch → Batch`` transform.
+    Méthodes de composition (retournent un nouveau NodePipeline)
+    -------------------------------------------------------------
+    ``.map(fn)``         — ajoute un transform ``Batch → Batch``.
     ``.select(pred)``    — filtre les batches.
-    ``.with_epoch(n)``   — limite à n steps par époque.
+    ``.with_epoch(n)``   — limite à n batches par époque.
 
-    Note sur l'intra-époque
-    -----------------------
+    Note sur la position intra-époque
+    ----------------------------------
     ``state_dict`` persiste l'époque, les poids, la résolution et max_steps.
     La position intra-époque n'est **pas** restaurée (DALI non sérialisable).
 
@@ -380,25 +535,25 @@ class NodePipeline:
         dino_loader: Any,
         max_steps:   int | None = None,
     ) -> None:
-        """Initialise a NodePipeline."""
+        """Initialise un NodePipeline."""
         self._root      = root_node
         self._loader    = dino_loader
         self._max_steps = max_steps
         self._tn_loader: tn.Loader | None = None
 
     # ------------------------------------------------------------------
-    # Fluent composition API
+    # API de composition fluide
     # ------------------------------------------------------------------
 
     def map(self, fn: Callable[[Batch], Batch], *, label: str = "<map>") -> "NodePipeline":
-        """Append a ``Batch → Batch`` transform.
+        """Ajoute un transform ``Batch → Batch``.
 
         Args:
-            fn: Transform applied to every batch.
-            label: Optional label for debugging.
+            fn:    Transform appliqué à chaque batch.
+            label: Label optionnel pour le débogage.
 
         Returns:
-            A new ``NodePipeline`` with ``fn`` appended.
+            Nouveau ``NodePipeline`` avec ``fn`` ajouté.
 
         """
         return NodePipeline(
@@ -413,14 +568,14 @@ class NodePipeline:
         *,
         label: str = "<filter>",
     ) -> "NodePipeline":
-        """Drop batches for which ``predicate(batch)`` is ``False``.
+        """Ignore les batches pour lesquels ``predicate(batch)`` est ``False``.
 
         Args:
-            predicate: Return ``True`` to keep a batch, ``False`` to skip it.
-            label: Optional label for debugging.
+            predicate: Retourne ``True`` pour garder un batch.
+            label:     Label optionnel pour le débogage.
 
         Returns:
-            A new ``NodePipeline`` with the filter appended.
+            Nouveau ``NodePipeline`` avec le filtre ajouté.
 
         """
         return NodePipeline(
@@ -430,13 +585,13 @@ class NodePipeline:
         )
 
     def with_epoch(self, n_steps: int) -> "NodePipeline":
-        """Limit iteration to ``n_steps`` batches per epoch.
+        """Limite l'itération à ``n_steps`` batches par époque.
 
         Args:
-            n_steps: Maximum number of batches yielded before ``StopIteration``.
+            n_steps: Nombre maximum de batches avant ``StopIteration``.
 
         Returns:
-            A new ``NodePipeline`` bounded to ``n_steps``.
+            Nouveau ``NodePipeline`` borné à ``n_steps``.
 
         """
         return NodePipeline(
@@ -446,38 +601,37 @@ class NodePipeline:
         )
 
     # ------------------------------------------------------------------
-    # Iteration
+    # Itération
     # ------------------------------------------------------------------
 
     def _build_tn_loader(self) -> tn.Loader:
-        """Build the underlying tn.Loader, adding a _LimitNode if needed."""
+        """Construit le ``tn.Loader`` sous-jacent, en ajoutant un _LimitNode si besoin."""
         root = self._root
         if self._max_steps is not None:
             root = _LimitNode(root, self._max_steps)
         return tn.Loader(root, restart_on_stop_iteration=True)
 
     def __iter__(self) -> Iterator[Batch]:
-        """Iterate over batches, building the tn.Loader lazily."""
+        """Itère sur les batches, en construisant le tn.Loader paresseusement."""
         if self._tn_loader is None:
             self._tn_loader = self._build_tn_loader()
         return iter(self._tn_loader)
 
     def __len__(self) -> int:
-        """Return max_steps if set, else delegate to the underlying loader."""
+        """Retourne max_steps si défini, sinon délègue au loader sous-jacent."""
         if self._max_steps is not None:
             return self._max_steps
         return len(self._loader)
 
     # ------------------------------------------------------------------
-    # State management
+    # Gestion d'état
     # ------------------------------------------------------------------
 
     def state_dict(self) -> dict[str, Any]:
-        """Return the full graph state dict.
+        """Retourne le state dict complet du graphe.
 
         [FIX-STATE-MAX-STEPS] max_steps est inclus pour qu'un round-trip via
-        load_state_dict() + with_epoch() restitue le même comportement.
-        La position intra-époque n'est pas restaurable (DALI non sérialisable).
+        ``load_state_dict()`` + ``with_epoch()`` restitue le même comportement.
         """
         loader_sd = self._loader.state_dict()
         tn_sd: dict[str, Any] = {}
@@ -490,11 +644,11 @@ class NodePipeline:
         }
 
     def load_state_dict(self, sd: dict[str, Any]) -> None:
-        """Restore the full graph state.
+        """Restaure le graphe depuis un state dict.
 
-        Note: max_steps is restored in memory but does not rebuild the
-        tn.Loader graph. If the pipeline has already been built (i.e. iterated
-        over at least once), call with_epoch() again to apply the new limit.
+        Note : max_steps est restauré en mémoire mais ne reconstruit pas le
+        ``tn.Loader``.  Appeler ``with_epoch()`` à nouveau si le pipeline a
+        déjà itéré.
         """
         if "loader" in sd:
             self._loader.load_state_dict(sd["loader"])
@@ -504,47 +658,47 @@ class NodePipeline:
             self._max_steps = sd["max_steps"]
 
     # ------------------------------------------------------------------
-    # Delegation vers DINODataLoader
+    # Délégation vers DINODataLoader
     # ------------------------------------------------------------------
 
     def set_epoch(self, epoch: int) -> None:
-        """Delegate to the underlying ``DINODataLoader``."""
+        """Délègue à ``DINODataLoader``."""
         self._loader.set_epoch(epoch)
 
     def checkpoint(self, step: int) -> None:
-        """Delegate to the underlying ``DINODataLoader``."""
+        """Délègue à ``DINODataLoader``."""
         self._loader.checkpoint(step)
 
     def set_weights(self, weights: Sequence[float]) -> None:
-        """Delegate to the underlying ``DINODataLoader``."""
+        """Délègue à ``DINODataLoader``."""
         self._loader.set_weights(weights)
 
     def set_weight_by_name(self, name: str, weight: float) -> None:
-        """Delegate to the underlying ``DINODataLoader``."""
+        """Délègue à ``DINODataLoader``."""
         self._loader.set_weight_by_name(name, weight)
 
     def set_resolution(self, global_size: int, local_size: int) -> None:
-        """Delegate to the underlying ``DINODataLoader``."""
+        """Délègue à ``DINODataLoader``."""
         self._loader.set_resolution(global_size, local_size)
 
     @property
     def current_resolution(self) -> tuple[int, int]:
-        """Current crop resolution as ``(global_size, local_size)``."""
+        """Résolution de crop courante sous la forme ``(global_size, local_size)``."""
         return self._loader.current_resolution
 
     @property
     def current_weights(self) -> list[float]:
-        """Current normalised mixing weights."""
+        """Poids de mixage normalisés courants."""
         return self._loader.current_weights
 
     @property
     def backend(self) -> Any:
-        """The active backend instance."""
+        """Instance du backend actif."""
         return self._loader.backend
 
     @property
     def aug_spec(self) -> Any:
-        """The active augmentation spec."""
+        """Spec d'augmentation active."""
         return self._loader.aug_spec
 
 
@@ -554,17 +708,17 @@ class NodePipeline:
 
 
 def wrap_loader(dino_loader: Any) -> NodePipeline:
-    """Wrap a ``DINODataLoader`` in a composable ``NodePipeline``.
+    """Enveloppe un ``DINODataLoader`` dans un ``NodePipeline`` composable.
 
-    Utilisé en interne par ``DINODataLoader.as_pipeline()`` et disponible
-    en standalone pour les usages avancés.
+    C'est le point d'entrée recommandé pour construire un pipeline de
+    post-traitement.  Utilisé en interne par ``DINODataLoader.as_pipeline()``.
 
     Args:
-        dino_loader: A ``DINODataLoader`` instance.  Doit exposer un attribut
+        dino_loader: Instance de ``DINODataLoader``.  Doit exposer un attribut
             ``_dali_node`` de type ``_DALINode``.
 
     Returns:
-        ``NodePipeline`` — iterate directly or compose further with
+        ``NodePipeline`` — itérable directement ou composable via
         ``.map()``, ``.select()``, ``.with_epoch()``.
 
     Raises:
@@ -591,49 +745,9 @@ def wrap_loader(dino_loader: Any) -> NodePipeline:
     dali_node = getattr(dino_loader, "_dali_node", None)
     if dali_node is None:
         msg = (
-            f"wrap_loader: the provided object ({type(dino_loader).__name__}) "
-            "does not expose a '_dali_node' attribute. "
-            "Pass a DINODataLoader instance."
+            f"wrap_loader: l'objet fourni ({type(dino_loader).__name__}) "
+            "n'expose pas d'attribut '_dali_node'. "
+            "Passer une instance de DINODataLoader."
         )
         raise TypeError(msg)
     return NodePipeline(root_node=dali_node, dino_loader=dino_loader)
-
-
-# ---------------------------------------------------------------------------
-# Backward-compat : _DINOLoaderNode conservé pour les tests existants
-# ---------------------------------------------------------------------------
-
-
-class _DINOLoaderNode(BaseNode):  # type: ignore[misc]
-    """Backward-compatible wrapper. Préférer _DALINode pour les nouveaux usages."""
-
-    def __init__(self, dino_loader: Any) -> None:
-        """Initialise a _DINOLoaderNode."""
-        super().__init__()
-        self._dino_loader  = dino_loader
-        self._it: Iterator[Batch] | None = None
-        self._num_yielded  = 0
-
-    def reset(self, initial_state: dict[str, Any] | None = None) -> None:
-        """Re-enter the loader iterator for a new epoch."""
-        super().reset(initial_state)
-        self._it          = iter(self._dino_loader)
-        self._num_yielded = 0
-
-    def next(self) -> Batch:
-        """Return the next Batch from the loader."""
-        if self._it is None:
-            msg = "reset() must be called before next()"
-            raise AssertionError(msg)
-        batch = next(self._it)
-        self._num_yielded += 1
-        return batch
-
-    def get_state(self) -> dict[str, Any]:
-        """Return loader state dict."""
-        loader_sd: dict[str, Any] = {}
-        try:
-            loader_sd = self._dino_loader.state_dict()
-        except RuntimeError:
-            pass
-        return {**loader_sd, "_num_yielded": self._num_yielded}
