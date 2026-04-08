@@ -2,18 +2,18 @@
 ========================
 End-to-end integration tests for DINODataLoader using the CPU backend.
 
-Post-migration [PHASE-1-3 + WRAP-LOADER]
------------------------------------------
-- DINODataLoader.__iter__ délègue à un NodePipeline interne.
-- DINODataLoader._reader est un ShardReaderNode.
-- DINODataLoader.as_pipeline() retourne le NodePipeline pour composition.
-- DINODataLoader.map/select/with_epoch sont des raccourcis de composition.
+DINODataLoader.__iter__ delegates to an internal NodePipeline.
+DINODataLoader._reader is a ShardReaderNode.
+DINODataLoader.as_pipeline() returns the NodePipeline for composition.
+DINODataLoader.map/select/with_epoch are composition shortcuts.
 """
 
 from __future__ import annotations
+
 import json
 import sys
 from pathlib import Path
+
 import pytest
 import torch
 
@@ -22,13 +22,14 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from dino_datasets import DatasetSpec
+
 from dino_loader.backends import get_backend
 from dino_loader.backends.cpu import CPUBackend
 from dino_loader.config import DINOAugConfig, LoaderConfig
 from dino_loader.loader import DINODataLoader
 from dino_loader.memory import Batch
-from dino_loader.nodes import ShardReaderNode
 from dino_loader.pipeline_graph import NodePipeline
+from dino_loader.shard_reader import ShardReaderNode
 from tests.conftest import make_spec
 
 
@@ -120,17 +121,18 @@ class TestLoaderBasic:
         assert _loader(paths, tmp_path, aug_cfg=small_aug_cfg).backend.name == "cpu"
 
 
-# ═══════════════════ Migration Phase 1/3 ═══════════════════
+# ═══════════════════ Internal architecture ═══════════════════
 
 
-class TestLoaderShardReaderNode:
+class TestLoaderInternalArchitecture:
+    """Verify the internal structure introduced by Phase 1/3 migration."""
 
     def test_reader_is_shard_reader_node(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
         _, paths = tmp_dataset_dir
         loader = _loader(paths, tmp_path, aug_cfg=small_aug_cfg)
         assert isinstance(loader._reader, ShardReaderNode)
 
-    def test_iter_uses_node_pipeline(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
+    def test_pipeline_is_node_pipeline(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
         _, paths = tmp_dataset_dir
         loader = _loader(paths, tmp_path, aug_cfg=small_aug_cfg)
         assert isinstance(loader._pipeline, NodePipeline)
@@ -139,11 +141,17 @@ class TestLoaderShardReaderNode:
         _, paths = tmp_dataset_dir
         assert isinstance(_loader(paths, tmp_path, aug_cfg=small_aug_cfg).as_pipeline(), NodePipeline)
 
-    def test_set_epoch_updates_reader(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
+    def test_set_epoch_updates_reader_epoch(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
         _, paths = tmp_dataset_dir
         loader = _loader(paths, tmp_path, aug_cfg=small_aug_cfg)
         loader.set_epoch(5)
         assert loader._reader._epoch == 5
+
+    def test_dali_node_exists(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
+        """_dali_node is required for wrap_loader and NodePipeline composition."""
+        _, paths = tmp_dataset_dir
+        loader = _loader(paths, tmp_path, aug_cfg=small_aug_cfg)
+        assert hasattr(loader, "_dali_node")
 
 
 # ═══════════════════ Composition API ═══════════════════
@@ -165,32 +173,67 @@ class TestLoaderComposition:
 
     def test_composition_does_not_mutate_loader(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
         _, paths = tmp_dataset_dir
-        loader   = _loader(paths, tmp_path, aug_cfg=small_aug_cfg)
+        loader = _loader(paths, tmp_path, aug_cfg=small_aug_cfg)
         pipeline = loader.map(lambda b: b)
+
         loader.set_epoch(0)
         assert isinstance(next(iter(loader)), Batch)
+
         pipeline.set_epoch(0)
         assert isinstance(next(iter(pipeline)), Batch)
 
     def test_map_applied_to_every_batch(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
         _, paths = tmp_dataset_dir
-        counter  = [0]
+        counter = [0]
+
         def _count(b):
             counter[0] += 1
             return b
-        pipeline = _loader(paths, tmp_path, aug_cfg=small_aug_cfg, batch_size=4).map(_count).with_epoch(2)
+
+        pipeline = (
+            _loader(paths, tmp_path, aug_cfg=small_aug_cfg, batch_size=4)
+            .map(_count)
+            .with_epoch(2)
+        )
         pipeline.set_epoch(0)
         assert len(list(pipeline)) == 2
         assert counter[0] == 2
 
     def test_pipeline_exposes_loader_properties(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
         _, paths = tmp_dataset_dir
-        loader   = _loader(paths, tmp_path, aug_cfg=small_aug_cfg)
+        loader = _loader(paths, tmp_path, aug_cfg=small_aug_cfg)
         pipeline = loader.as_pipeline()
         assert pipeline.current_resolution == loader.current_resolution
-        assert pipeline.current_weights    == loader.current_weights
-        assert pipeline.backend.name       == "cpu"
-        assert pipeline.aug_spec           is loader.aug_spec
+        assert pipeline.current_weights == loader.current_weights
+        assert pipeline.backend.name == "cpu"
+        assert pipeline.aug_spec is loader.aug_spec
+
+    def test_select_filters_batches(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
+        """select() must pass through only matching batches."""
+        _, paths = tmp_dataset_dir
+        accepted: list[Batch] = []
+        rejected_count = [0]
+
+        def _track(b: Batch) -> Batch:
+            accepted.append(b)
+            return b
+
+        toggle = [0]
+
+        def _predicate(b: Batch) -> bool:
+            result = toggle[0] % 2 == 0
+            toggle[0] += 1
+            return result
+
+        pipeline = (
+            _loader(paths, tmp_path, aug_cfg=small_aug_cfg, batch_size=4)
+            .select(_predicate)
+            .map(_track)
+            .with_epoch(2)
+        )
+        pipeline.set_epoch(0)
+        list(pipeline)
+        assert len(accepted) == 2
 
 
 # ═══════════════════ Multi-dataset ═══════════════════
@@ -285,6 +328,13 @@ class TestLoaderResolution:
         loader.set_epoch(1)
         assert loader._current_global_size == 64
 
+    def test_current_resolution_property(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
+        _, paths = tmp_dataset_dir
+        loader = _loader(paths, tmp_path, aug_cfg=small_aug_cfg)
+        g, l = loader.current_resolution
+        assert g == small_aug_cfg.global_crop_size
+        assert l == small_aug_cfg.local_crop_size
+
 
 # ═══════════════════ Checkpointing ═══════════════════
 
@@ -321,7 +371,9 @@ class TestLoaderCheckpoint:
         loader.checkpoint(step=2)
         files = list(Path(ckpt_dir).glob("dl_state_*.json"))
         assert len(files) == 1
-        payload = json.load(open(files[0])).get("payload", json.load(open(files[0])))
+        raw = json.load(open(files[0]))
+        # Supports both envelope format and legacy flat format.
+        payload = raw.get("payload", raw)
         assert payload["step"] == 2
 
     def test_state_dict_no_disk_io(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
@@ -350,7 +402,7 @@ class TestLoaderCheckpoint:
 
     def test_pipeline_state_dict(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
         _, paths = tmp_dataset_dir
-        loader   = _loader(paths, tmp_path, aug_cfg=small_aug_cfg, loader_cfg=_cfg(tmp_path, stateful=True))
+        loader = _loader(paths, tmp_path, aug_cfg=small_aug_cfg, loader_cfg=_cfg(tmp_path, stateful=True))
         pipeline = loader.as_pipeline()
         pipeline.set_epoch(0)
         next(iter(pipeline))

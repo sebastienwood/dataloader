@@ -1,10 +1,11 @@
-"""tests/test_mixing_source.py
-================================
-Unit tests for hpc_source.py (ex-mixing_source.py).
+"""tests/sources/test_mixing_source.py
+========================================
+Unit tests for hpc_source.py (MixingSource, ShardIterator) and
+the shared MixingWeights / ResolutionSource utilities.
 
-[POOL] MixingSource accepte pool_cfg (SharedExtractionPoolConfig).
-       ShardIterator requiert un executor injecté par MixingSource.
-[SLOW] Tests d'intégration multi-dataset avec le pool partagé.
+[POOL] MixingSource accepts pool_cfg (SharedExtractionPoolConfig).
+       ShardIterator requires an executor injected by MixingSource.
+[SLOW] Integration tests with real threads and the shared pool.
 
 Run fast tests only::
 
@@ -24,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-_SRC = str(Path(__file__).parent.parent / "src")
+_SRC = str(Path(__file__).parent.parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
@@ -56,7 +57,7 @@ class TestResolutionSource:
         assert int(g) == 448 and int(l) == 192
 
     def test_thread_safety(self):
-        rs     = ResolutionSource(32, 16)
+        rs = ResolutionSource(32, 16)
         errors: list = []
 
         def writer():
@@ -75,9 +76,11 @@ class TestResolutionSource:
         assert not errors
 
     def test_returns_numpy_arrays(self):
+        import numpy as np
         rs = ResolutionSource(224, 96)
         g, _ = rs()
-        assert hasattr(g, "dtype")
+        assert isinstance(g, np.ndarray)
+        assert g.dtype == np.int32
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -89,7 +92,7 @@ class TestMixingWeights:
 
     def test_normalises_on_init(self):
         mw = MixingWeights(["a", "b"], [3.0, 1.0])
-        w  = mw.get()
+        w = mw.get()
         assert abs(w[0] - 0.75) < 1e-6 and abs(w[1] - 0.25) < 1e-6
 
     def test_sum_to_one(self):
@@ -102,7 +105,7 @@ class TestMixingWeights:
         assert abs(mw.get()[0] - 0.70) < 1e-6
 
     def test_set_by_name_documented_behaviour(self):
-        """set_by_name utilise les poids normalisés courants comme base."""
+        """set_by_name updates the weight of one dataset and renormalises."""
         mw = MixingWeights(["a", "b"], [1.0, 1.0])
         mw.set_by_name("a", 3.0)
         w = mw.get()
@@ -132,9 +135,18 @@ class TestMixingWeights:
         with pytest.raises(ValueError):
             mw.set([1.0])
 
+    def test_from_specs_factory(self):
+        specs = [
+            DatasetSpec(name="x", shards=["a.tar"], weight=3.0),
+            DatasetSpec(name="y", shards=["b.tar"], weight=1.0),
+        ]
+        mw = MixingWeights.from_specs(specs)
+        assert mw.names == ["x", "y"]
+        assert abs(mw.get()[0] - 0.75) < 1e-6
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ShardIterator._passes_predicate — rapide
+# ShardIterator._passes_predicate — fast
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -142,33 +154,33 @@ class TestPassesPredicate:
 
     def _make_iter(self, tmp_path, **spec_kw):
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
-        spec      = DatasetSpec(name="ds", shards=tar_paths, weight=1.0, **spec_kw)
-        cache     = InProcessShardCache(max_gb=0.5)
-        executor  = ThreadPoolExecutor(max_workers=2)
+        spec = DatasetSpec(name="ds", shards=tar_paths, weight=1.0, **spec_kw)
+        cache = InProcessShardCache(max_gb=0.5)
+        executor = ThreadPoolExecutor(max_workers=2)
         return ShardIterator(spec=spec, cache=cache, rank=0, world_size=1, executor=executor)
 
     def test_passes_no_filters(self, tmp_path):
-        it  = self._make_iter(tmp_path)
+        it = self._make_iter(tmp_path)
         rec = SampleRecord(jpeg=b"", metadata={"quality_score": 0.0}, key="k")
         assert it._passes_predicate(rec, "s.tar") is True
 
     def test_fails_below_threshold(self, tmp_path):
-        it  = self._make_iter(tmp_path, min_sample_quality=0.5)
+        it = self._make_iter(tmp_path, min_sample_quality=0.5)
         rec = SampleRecord(jpeg=b"", metadata={"quality_score": 0.1}, key="k")
         assert it._passes_predicate(rec, "s.tar") is False
 
     def test_passes_above_threshold(self, tmp_path):
-        it  = self._make_iter(tmp_path, min_sample_quality=0.5)
+        it = self._make_iter(tmp_path, min_sample_quality=0.5)
         rec = SampleRecord(jpeg=b"", metadata={"quality_score": 0.9}, key="k")
         assert it._passes_predicate(rec, "s.tar") is True
 
     def test_passes_no_quality_key(self, tmp_path):
-        it  = self._make_iter(tmp_path, min_sample_quality=0.5)
+        it = self._make_iter(tmp_path, min_sample_quality=0.5)
         rec = SampleRecord(jpeg=b"", metadata={"caption": "x"}, key="k")
         assert it._passes_predicate(rec, "s.tar") is True
 
     def test_passes_none_metadata(self, tmp_path):
-        it  = self._make_iter(tmp_path, min_sample_quality=0.5)
+        it = self._make_iter(tmp_path, min_sample_quality=0.5)
         rec = SampleRecord(jpeg=b"", metadata=None, key="k")
         assert it._passes_predicate(rec, "s.tar") is True
 
@@ -182,9 +194,9 @@ class TestPassesPredicate:
             return meta.key == "keep"
 
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
-        spec      = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
-        executor  = ThreadPoolExecutor(max_workers=2)
-        it        = ShardIterator(
+        spec = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+        executor = ThreadPoolExecutor(max_workers=2)
+        it = ShardIterator(
             spec=spec, cache=InProcessShardCache(max_gb=0.5),
             rank=0, world_size=1, executor=executor, sample_predicate=_pred,
         )
@@ -202,19 +214,19 @@ class TestShardIteratorConstruction:
 
     def test_no_shards_assigned_raises(self, tmp_path):
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
-        spec      = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
-        executor  = ThreadPoolExecutor(max_workers=2)
+        spec = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+        executor = ThreadPoolExecutor(max_workers=2)
         with pytest.raises(RuntimeError, match="no shards assigned"):
             ShardIterator(spec=spec, cache=InProcessShardCache(max_gb=1.0),
                           rank=2, world_size=3, executor=executor)
 
     def test_pool_cfg_sets_max_workers(self, tmp_path):
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2)
-        spec      = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
-        pool_cfg  = SharedExtractionPoolConfig(max_workers=3)
-        ms        = MixingSource(specs=[spec], batch_size=4,
-                                 cache=InProcessShardCache(max_gb=0.5),
-                                 rank=0, world_size=1, pool_cfg=pool_cfg)
+        spec = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+        pool_cfg = SharedExtractionPoolConfig(max_workers=3)
+        ms = MixingSource(specs=[spec], batch_size=4,
+                          cache=InProcessShardCache(max_gb=0.5),
+                          rank=0, world_size=1, pool_cfg=pool_cfg)
         assert ms._executor._max_workers == 3
         ms.close()
 
@@ -228,16 +240,25 @@ class TestRegisterCallback:
 
     def test_register_before_call_does_not_crash(self, tmp_path):
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
-        spec      = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
-        ms        = MixingSource(specs=[spec], batch_size=4,
-                                 cache=InProcessShardCache(max_gb=1.0),
-                                 rank=0, world_size=1)
+        spec = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+        ms = MixingSource(specs=[spec], batch_size=4,
+                          cache=InProcessShardCache(max_gb=1.0),
+                          rank=0, world_size=1)
         ms.register_dataset_index_callback(lambda _: None)
+        ms.close()
+
+    def test_dataset_names_property(self, tmp_path):
+        tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
+        spec = DatasetSpec(name="myds", shards=tar_paths, weight=1.0)
+        ms = MixingSource(specs=[spec], batch_size=4,
+                          cache=InProcessShardCache(max_gb=1.0),
+                          rank=0, world_size=1)
+        assert ms.dataset_names == ["myds"]
         ms.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Integration tests — slow (vrais threads + I/O)
+# Integration tests — slow (real threads + I/O)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -245,8 +266,8 @@ class TestRegisterCallback:
 def shard_iter(tmp_path):
     tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2,
                                      n_samples_per_shard=8, with_metadata=True)
-    spec      = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
-    executor  = ThreadPoolExecutor(max_workers=4)
+    spec = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+    executor = ThreadPoolExecutor(max_workers=4)
     return ShardIterator(spec=spec, cache=InProcessShardCache(max_gb=1.0),
                          rank=0, world_size=1, executor=executor, seed=42,
                          shuffle_buffer_size=4)
@@ -273,15 +294,15 @@ class TestShardIteratorIntegration:
         shard_iter.reset_epoch(epoch=1)
 
     def test_quality_filter(self, tmp_path):
-        scores   = [0.1, 0.9, 0.1, 0.9]
+        scores = [0.1, 0.9, 0.1, 0.9]
         tar_path, _ = write_shard(tmp_path, n_samples=4, with_metadata=True,
                                   quality_scores=scores)
-        spec     = DatasetSpec(name="ds", shards=[tar_path], weight=1.0,
-                               min_sample_quality=0.5)
+        spec = DatasetSpec(name="ds", shards=[tar_path], weight=1.0,
+                           min_sample_quality=0.5)
         executor = ThreadPoolExecutor(max_workers=2)
-        it       = ShardIterator(spec=spec, cache=InProcessShardCache(max_gb=1.0),
-                                 rank=0, world_size=1, executor=executor,
-                                 shuffle_buffer_size=0)
+        it = ShardIterator(spec=spec, cache=InProcessShardCache(max_gb=1.0),
+                           rank=0, world_size=1, executor=executor,
+                           shuffle_buffer_size=0)
         passing: list[float] = []
         try:
             for _ in range(4):
@@ -294,10 +315,10 @@ class TestShardIteratorIntegration:
 @pytest.fixture
 def mixing_source_fixture(tmp_path):
     tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2, n_samples_per_shard=8)
-    spec      = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
-    ms        = MixingSource(specs=[spec], batch_size=4,
-                             cache=InProcessShardCache(max_gb=1.0),
-                             rank=0, world_size=1)
+    spec = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+    ms = MixingSource(specs=[spec], batch_size=4,
+                      cache=InProcessShardCache(max_gb=1.0),
+                      rank=0, world_size=1)
     yield ms
     ms.close()
 
@@ -306,12 +327,16 @@ def mixing_source_fixture(tmp_path):
 class TestMixingSourceIntegration:
 
     def test_call_returns_arrays(self, mixing_source_fixture):
+        import numpy as np
         result = mixing_source_fixture()
         assert isinstance(result, list) and len(result) == 4
+        assert all(isinstance(r, np.ndarray) for r in result)
 
-    def test_metadata_length(self, mixing_source_fixture):
+    def test_pop_last_metadata_returns_empty_list(self, mixing_source_fixture):
+        """MixingSource.pop_last_metadata() returns [] — metadata alignment
+        is handled by _ReaderAdapter in loader.py."""
         mixing_source_fixture()
-        assert len(mixing_source_fixture.pop_last_metadata()) == 4
+        assert mixing_source_fixture.pop_last_metadata() == []
 
     def test_set_epoch(self, mixing_source_fixture):
         mixing_source_fixture.set_epoch(1)
@@ -320,18 +345,18 @@ class TestMixingSourceIntegration:
         assert mixing_source_fixture.dataset_names == ["ds"]
 
     def test_shared_pool_closed_once(self, tmp_path):
-        """[POOL] close() ne doit appeler shutdown() qu'une fois."""
+        """[POOL] close() must call shutdown() only once."""
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2)
-        spec      = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
-        ms        = MixingSource(specs=[spec], batch_size=4,
-                                 cache=InProcessShardCache(max_gb=1.0),
-                                 rank=0, world_size=1)
+        spec = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+        ms = MixingSource(specs=[spec], batch_size=4,
+                          cache=InProcessShardCache(max_gb=1.0),
+                          rank=0, world_size=1)
         executor = ms._executor
         ms.close()
-        executor.shutdown(wait=False, cancel_futures=True)  # doit ne pas lever
+        executor.shutdown(wait=False, cancel_futures=True)  # must not raise
 
     def test_two_dataset_mixing(self, tmp_path):
-        """[POOL] Pool partagé avec deux datasets."""
+        """[POOL] Shared pool with two datasets."""
         specs = [
             DatasetSpec(
                 name="alpha",
@@ -352,12 +377,12 @@ class TestMixingSourceIntegration:
         ms.close()
 
     def test_callback_receives_indices(self, tmp_path):
-        """register_dataset_index_callback doit recevoir des indices valides."""
+        """register_dataset_index_callback must receive valid dataset indices."""
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2, n_samples_per_shard=8)
-        spec      = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
-        ms        = MixingSource(specs=[spec], batch_size=4,
-                                 cache=InProcessShardCache(max_gb=1.0),
-                                 rank=0, world_size=1)
+        spec = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
+        ms = MixingSource(specs=[spec], batch_size=4,
+                          cache=InProcessShardCache(max_gb=1.0),
+                          rank=0, world_size=1)
         received: list[list[int]] = []
         ms.register_dataset_index_callback(lambda idxs: received.append(list(idxs)))
         ms()
@@ -365,3 +390,17 @@ class TestMixingSourceIntegration:
         assert len(received) == 1
         assert len(received[0]) == 4
         assert all(i == 0 for i in received[0])
+
+    def test_current_weights_after_set(self, tmp_path):
+        """set_weights updates current_weights on MixingSource."""
+        specs = [
+            DatasetSpec(name="a", shards=scaffold_dataset_dir(root=tmp_path / "a", n_shards=1), weight=1.0),
+            DatasetSpec(name="b", shards=scaffold_dataset_dir(root=tmp_path / "b", n_shards=1), weight=1.0),
+        ]
+        ms = MixingSource(specs=specs, batch_size=4,
+                          cache=InProcessShardCache(max_gb=1.0),
+                          rank=0, world_size=1)
+        ms.set_weights([3.0, 1.0])
+        w = ms.current_weights
+        assert abs(w[0] - 0.75) < 1e-5
+        ms.close()
