@@ -8,7 +8,7 @@ Coverage
 set_epoch thread safety [B3]
 - Concurrent calls to set_epoch do not raise or corrupt state
 
-__iter__ double-call guard [FIX-ITER]
+__iter__ double-call guard [FIX-ACTIVE-ITER]
 - Starting a second __iter__ while already iterating raises RuntimeError
 
 dino_env.init() precondition [FIX-ENV]
@@ -49,7 +49,7 @@ def _small_loader(tmp_path: Path) -> DINODataLoader:
             node_shm_gb=0.1,
             stall_timeout_s=0,
             stateful_dataloader=False,
-            checkpoint_dir=str(tmp_path / "ckpt"),
+            checkpoint_dir="",
         ),
         backend="cpu",
     )
@@ -78,16 +78,41 @@ class TestSetEpochThreadSafety:
 
 
 class TestDoubleIterGuard:
-    """Starting __iter__ while already iterating must raise [FIX-ITER]."""
+    """Starting __iter__ while already iterating must raise [FIX-ACTIVE-ITER]."""
 
     def test_double_iter_raises_runtime_error(self, tmp_path):
         loader = _small_loader(tmp_path)
         loader.set_epoch(0)
-        it1 = iter(loader)
-        next(it1)
-        with pytest.raises(RuntimeError, match="already iterating"):
+
+        # Manually set the guard flag — this is the exact internal mechanism.
+        with loader._active_iter_lock:
             loader._active_iter = True
-            iter(loader)
+
+        try:
+            with pytest.raises(RuntimeError, match="déjà en cours d'itération"):
+                iter(loader)
+        finally:
+            # Clean up so the loader doesn't stay locked.
+            with loader._active_iter_lock:
+                loader._active_iter = False
+
+    def test_iter_resets_guard_after_completion(self, tmp_path):
+        """After iteration ends, the guard must be cleared for re-use."""
+        loader = _small_loader(tmp_path)
+        loader.set_epoch(0)
+
+        # Consume one batch only — then stop early.
+        it = loader.__iter__()
+        try:
+            next(it)
+        except StopIteration:
+            pass
+
+        # Force exit from the generator to trigger the finally block.
+        it.close()
+
+        with loader._active_iter_lock:
+            assert not loader._active_iter, "Guard was not cleared after iteration ended"
 
 
 class TestDALIBackendPrecondition:
