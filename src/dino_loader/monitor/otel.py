@@ -389,11 +389,11 @@ class StageTimer:
 # ══════════════════════════════════════════════════════════════════════════════
 
 __all__ = [
-    "LoaderContext",
-    "set_loader_context",
     "DINOLoggingFilter",
-    "install_logging_filter",
-    "init_otel",
-    "stage",
+    "LoaderContext",
     "StageTimer",
+    "init_otel",
+    "install_logging_filter",
+    "set_loader_context",
+    "stage",
 ]

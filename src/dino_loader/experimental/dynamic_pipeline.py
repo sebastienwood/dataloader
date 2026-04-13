@@ -83,7 +83,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -274,10 +273,10 @@ def _make_dinov2_aug_fn(
             # No index information: use global fallback for all samples.
             b = len(jpegs)
             batch_means = np.tile(
-                np.array(fallback_mean_255, dtype=np.float32), (b, 1)
+                np.array(fallback_mean_255, dtype=np.float32), (b, 1),
             )
             batch_stds = np.tile(
-                np.array(fallback_std_255,  dtype=np.float32), (b, 1)
+                np.array(fallback_std_255,  dtype=np.float32), (b, 1),
             )
 
         views: dict[str, ndd.Batch] = {}

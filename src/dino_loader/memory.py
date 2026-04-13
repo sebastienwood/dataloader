@@ -18,6 +18,13 @@ La version précédente retournait une liste de deux tenseurs par type de crop
 n'avait plus d'utilisateur et consommait de la mémoire paginée inutilement.
 allocate_buffers retourne désormais un seul tenseur paginé par type.
 
+allocate_buffers — correction [FIX-PIN]
+----------------------------------------
+pin_memory() est conditionnel : si CUDA n'est pas disponible (machine CI
+sans GPU ou driver trop ancien), on retourne un tenseur CPU non paginé.
+Cela évite RuntimeError en tests et CI tout en gardant la performance
+maximale en production GPU.
+
 FP8Formatter.quantise — correction [FIX-FP8]
 ----------------------------------------------
 La garde sur les tenseurs déjà FP8 est remplacée par un assert : ce cas ne
@@ -69,6 +76,14 @@ class Batch:
         return iter((self.global_crops, self.local_crops))
 
 
+def _can_pin() -> bool:
+    """True when CUDA is available and functional enough for pin_memory()."""
+    try:
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
 def allocate_buffers(
     batch_size: int,
     aug_cfg:    DINOAugConfig,
@@ -82,6 +97,10 @@ def allocate_buffers(
     au lieu d'une liste de deux.  Le double-buffer de l'ancienne version était
     un vestige d'AsyncPrefetchIterator, supprimé car sans utilisateur.
 
+    [FIX-PIN] pin_memory() is skipped when CUDA is unavailable (CI/test
+    environments with no GPU or an incompatible driver) — returns a regular
+    CPU tensor instead.  Production GPU runs get pinned memory as before.
+
     Uses max_global_crop_size / max_local_crop_size so no re-allocation
     occurs when set_resolution() is called mid-training.
 
@@ -93,11 +112,15 @@ def allocate_buffers(
         dtype: Tensor dtype (default bfloat16).
 
     Returns:
-        Dict with 'global' and 'local' keys, each a single pinned tensor.
+        Dict with 'global' and 'local' keys, each a single tensor
+        (pinned if CUDA is available, plain CPU otherwise).
 
     """
+    pin = _can_pin()
+
     def _buf(size: int) -> torch.Tensor:
-        return torch.zeros(batch_size, 3, size, size, dtype=dtype).pin_memory()
+        t = torch.zeros(batch_size, 3, size, size, dtype=dtype)
+        return t.pin_memory() if pin else t
 
     return {
         "global": _buf(aug_cfg.max_global_crop_size),

@@ -29,7 +29,7 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from dino_loader.config import DINOAugConfig
+from dino_loader.config import DINOAugConfig, NormStats
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NormSource — thread-safe copy-on-write [M2]
@@ -209,10 +209,28 @@ class TestBuildPipelineDispatch:
             from dino_loader.augmentation import AugmentationSpec
             from dino_loader.pipeline import build_pipeline
 
+            # [FIX] Implement all 4 abstract methods so the class can be
+            # instantiated.  The TypeError we want is from the match/case
+            # dispatch inside build_pipeline, not from ABC instantiation.
             class _UnknownSpec(AugmentationSpec):
                 @property
                 def output_map(self) -> list[str]:
                     return ["view_0"]
+
+                @property
+                def norm_stats(self) -> NormStats:
+                    return NormStats.imagenet()
+
+                @property
+                def initial_global_size(self) -> int:
+                    return 224
+
+                @property
+                def initial_local_size(self) -> int:
+                    return 96
+
+                def split_views(self, views: list) -> tuple[list, list]:
+                    return views, []
 
             with pytest.raises(TypeError, match="Unknown augmentation spec"):
                 build_pipeline(

@@ -31,10 +31,11 @@ if _SRC not in sys.path:
 
 from dino_datasets import DatasetSpec
 
+from dino_loader.augmentation import SampleMeta, SampleRecord
 from dino_loader.backends.cpu import InProcessShardCache
 from dino_loader.config import SharedExtractionPoolConfig
 from dino_loader.sources import MixingSource, MixingWeights, ResolutionSource
-from dino_loader.sources.hpc_source import SampleRecord, ShardIterator
+from dino_loader.sources.hpc_source import ShardIterator
 from tests.fixtures import scaffold_dataset_dir, write_shard
 
 
@@ -105,7 +106,6 @@ class TestMixingWeights:
         assert abs(mw.get()[0] - 0.70) < 1e-6
 
     def test_set_by_name_documented_behaviour(self):
-        """set_by_name updates the weight of one dataset and renormalises."""
         mw = MixingWeights(["a", "b"], [1.0, 1.0])
         mw.set_by_name("a", 3.0)
         w = mw.get()
@@ -143,6 +143,30 @@ class TestMixingWeights:
         mw = MixingWeights.from_specs(specs)
         assert mw.names == ["x", "y"]
         assert abs(mw.get()[0] - 0.75) < 1e-6
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SampleRecord — importé depuis augmentation.py
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestSampleRecordIsFromAugmentation:
+    """SampleRecord doit être importé depuis augmentation, pas depuis hpc_source."""
+
+    def test_import_from_augmentation(self):
+        from dino_loader.augmentation import SampleRecord as SR  # noqa: F401
+        assert SR is SampleRecord
+
+    def test_sample_record_slots(self):
+        rec = SampleRecord(jpeg=b"test", metadata={"k": "v"}, key="000")
+        assert rec.jpeg == b"test"
+        assert rec.metadata == {"k": "v"}
+        assert rec.key == "000"
+
+    def test_sample_record_none_metadata(self):
+        rec = SampleRecord(jpeg=b"x")
+        assert rec.metadata is None
+        assert rec.key == ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -185,8 +209,6 @@ class TestPassesPredicate:
         assert it._passes_predicate(rec, "s.tar") is True
 
     def test_sample_predicate_called(self, tmp_path):
-        from dino_loader.augmentation import SampleMeta
-
         calls: list = []
 
         def _pred(meta: SampleMeta) -> bool:
@@ -333,8 +355,6 @@ class TestMixingSourceIntegration:
         assert all(isinstance(r, np.ndarray) for r in result)
 
     def test_pop_last_metadata_returns_empty_list(self, mixing_source_fixture):
-        """MixingSource.pop_last_metadata() returns [] — metadata alignment
-        is handled by _ReaderAdapter in loader.py."""
         mixing_source_fixture()
         assert mixing_source_fixture.pop_last_metadata() == []
 
@@ -345,7 +365,6 @@ class TestMixingSourceIntegration:
         assert mixing_source_fixture.dataset_names == ["ds"]
 
     def test_shared_pool_closed_once(self, tmp_path):
-        """[POOL] close() must call shutdown() only once."""
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2)
         spec = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
         ms = MixingSource(specs=[spec], batch_size=4,
@@ -356,7 +375,6 @@ class TestMixingSourceIntegration:
         executor.shutdown(wait=False, cancel_futures=True)  # must not raise
 
     def test_two_dataset_mixing(self, tmp_path):
-        """[POOL] Shared pool with two datasets."""
         specs = [
             DatasetSpec(
                 name="alpha",
@@ -377,7 +395,6 @@ class TestMixingSourceIntegration:
         ms.close()
 
     def test_callback_receives_indices(self, tmp_path):
-        """register_dataset_index_callback must receive valid dataset indices."""
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2, n_samples_per_shard=8)
         spec = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)
         ms = MixingSource(specs=[spec], batch_size=4,
@@ -392,7 +409,6 @@ class TestMixingSourceIntegration:
         assert all(i == 0 for i in received[0])
 
     def test_current_weights_after_set(self, tmp_path):
-        """set_weights updates current_weights on MixingSource."""
         specs = [
             DatasetSpec(name="a", shards=scaffold_dataset_dir(root=tmp_path / "a", n_shards=1), weight=1.0),
             DatasetSpec(name="b", shards=scaffold_dataset_dir(root=tmp_path / "b", n_shards=1), weight=1.0),

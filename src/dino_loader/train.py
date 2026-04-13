@@ -143,7 +143,7 @@ def main() -> None:
         input_size           = (aug_cfg.max_global_crop_size // patch_size,
                                 aug_cfg.max_global_crop_size // patch_size),
         num_masking_patches  = int(
-            0.5 * (aug_cfg.max_global_crop_size // patch_size) ** 2
+            0.5 * (aug_cfg.max_global_crop_size // patch_size) ** 2,
         ),
     )
 

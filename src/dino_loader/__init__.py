@@ -12,12 +12,12 @@ Public API
 
     loader = DINODataLoader(specs, batch_size=512, config=LoaderConfig())
 
-    # Composer des transforms post-DALI dans un graphe stateful et checkpointable :
+    # Pipeline post-DALI composable et stateful :
     pipeline = (
         wrap_loader(loader)
-        .map(apply_ibot_masks)          # fn(Batch) → Batch
-        .select(quality_ok)             # predicate(Batch) → bool
-        .with_epoch(steps_per_epoch)    # limite les steps par époque
+        .map(apply_ibot_masks)
+        .select(quality_ok)
+        .with_epoch(steps_per_epoch)
     )
 
     for epoch in range(100):
@@ -25,27 +25,23 @@ Public API
         for batch in pipeline:
             ...
 
-Phase 1 — intégration torchdata.nodes
---------------------------------------
-::
-
-    from dino_loader.shard_reader import ShardReaderNode, build_reader_graph
-
-    loader, reader = build_reader_graph(specs, batch_size=512, cache=cache, ...)
-    for epoch in range(100):
-        reader.set_epoch(epoch)
-        for jpegs, meta in loader:
-            my_augment(jpegs)
-
 Sources
 -------
 ::
 
     from dino_loader.sources import MixingSource, WDSSource, SourceProtocol
 
-    # MixingSource : optimisée HPC, cache /dev/shm, multi-nœuds (défaut)
-    # WDSSource    : basée webdataset, plus simple, NVMe / Lustre rapide
-    # SourceProtocol : interface commune pour les sources custom
+Graph I/O (stages 1-2)
+-----------------------
+::
+
+    from dino_loader.shard_reader import ShardReaderNode, build_reader_graph
+
+    loader, reader = build_reader_graph(specs, batch_size=512, cache=cache, ...)
+    reader.set_epoch(0)
+    for jpegs, meta in loader:
+        my_augment(jpegs)
+
 """
 
 import logging
@@ -53,7 +49,7 @@ import logging
 from dino_loader.config import DINOAugConfig, LoaderConfig, NormStats
 from dino_loader.loader import DINODataLoader
 from dino_loader.memory import Batch
-from dino_loader.pipeline_graph import (  # noqa: F401
+from dino_loader.pipeline_graph import (
     BatchFilterNode,
     BatchMapNode,
     MaskMapNode,

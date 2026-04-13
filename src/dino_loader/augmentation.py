@@ -4,24 +4,39 @@ Augmentation pipeline abstraction for dino_loader.
 
 Architecture
 ------------
-``AugmentationSpec`` is the configuration object describing the augmentation
-strategy. ``AugmentationPipeline`` is the runtime object built from it.
+``AugmentationSpec`` est le pur objet de configuration décrivant la stratégie
+d'augmentation.  ``AugmentationPipeline`` est l'objet runtime construit à
+partir de celui-ci.
 
-The clean separation enables preset strategies (``DinoV2AugSpec``,
-``EvalAugSpec``, ``LeJEPAAugSpec``) and user-defined strategies
-(``UserAugSpec``) without modifying the loader or backend.
+La séparation nette permet des stratégies prédéfinies (``DinoV2AugSpec``,
+``EvalAugSpec``, ``LeJEPAAugSpec``) et des stratégies utilisateur
+(``UserAugSpec``) sans modifier le loader ou les backends.
 
-Early filtering
----------------
-``SamplePredicate`` is called by ``ShardIterator`` before a sample enters
-the DALI pipeline, eliminating GPU decode cost for rejected samples.
+Types partagés sources/augmentation
+-------------------------------------
+``SampleRecord``, ``SampleMeta`` et ``SamplePredicate`` sont définis ici car
+ils constituent le contrat entre le stage de lecture (sources) et le stage de
+filtrage/augmentation.  Les sources produisent des ``SampleRecord`` ; les
+prédicats les évaluent via ``SampleMeta`` avant tout décodage JPEG.
+
+Responsabilité étendue des specs
+----------------------------------
+Chaque spec connaît comment :
+
+- Nommer ses vues (``output_map``).
+- Déclarer ses dimensions initiales de crop (``initial_global_size``,
+  ``initial_local_size``).
+- Séparer une liste plate de vues en ``(global_crops, local_crops)``
+  (``split_views``).
+
+Cela concentre le dispatch par sous-type dans les specs elles-mêmes,
+éliminant les chaînes ``isinstance`` répétées dans ``loader.py``.
 
 Normalisation
 -------------
-All ``AugmentationSpec`` subclasses expose a ``norm_stats`` property that
-returns a ``NormStats`` instance in [0, 1] scale.  Consumers (pipeline.py,
-cpu.py, dynamic_pipeline.py) call ``norm_stats.to_dali_scale()`` to get
-[0, 255] values — no ad-hoc ``× 255`` conversions elsewhere.
+Toutes les sous-classes exposent ``norm_stats`` en échelle [0, 1].  Les
+consommateurs (``pipeline.py``, ``cpu.py``, ``dynamic_pipeline.py``) appellent
+``norm_stats.to_dali_scale()`` — aucune multiplication ad-hoc par 255.
 """
 
 import logging
@@ -36,17 +51,48 @@ from dino_loader.config import DINOAugConfig, NormStats
 log = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class SampleMeta:
-    """Lightweight sample descriptor available before JPEG decoding.
+# ---------------------------------------------------------------------------
+# Types partagés : contrat source → filtrage → augmentation
+# ---------------------------------------------------------------------------
 
-    Passed to SamplePredicate callables so filtering can happen at zero
-    image-decode cost.
+
+class SampleRecord:
+    """Sample décodé prêt pour le pipeline d'augmentation.
+
+    Produit par les sources (``hpc_source``, ``wds_source``) après extraction
+    depuis un shard WebDataset.  Consommé par les ``ShardIterator`` et filtré
+    via ``SamplePredicate`` avant d'entrer dans le pipeline DALI.
 
     Attributes:
-        key: WebDataset sample key (e.g. "000042").
-        shard_path: Absolute path to the .tar shard file.
-        metadata: Parsed JSON sidecar dict, or None if absent.
+        jpeg: Bytes JPEG bruts.
+        metadata: Dict JSON sidecar, ou ``None`` si absent.
+        key: Clé WebDataset (e.g. ``"sample_000042"``).
+
+    """
+
+    __slots__ = ("jpeg", "key", "metadata")
+
+    def __init__(
+        self,
+        jpeg:     bytes,
+        metadata: dict | None = None,
+        key:      str         = "",
+    ) -> None:
+        self.jpeg     = jpeg
+        self.metadata = metadata
+        self.key      = key
+
+
+@dataclass(frozen=True)
+class SampleMeta:
+    """Descripteur léger disponible avant le décodage JPEG.
+
+    Passé aux ``SamplePredicate`` pour que le filtrage se fasse sans décodage.
+
+    Attributes:
+        key:        Clé WebDataset (e.g. ``"000042"``).
+        shard_path: Chemin absolu vers le fichier ``.tar``.
+        metadata:   Dict JSON sidecar, ou ``None`` si absent.
 
     """
 
@@ -57,25 +103,32 @@ class SampleMeta:
 
 @runtime_checkable
 class SamplePredicate(Protocol):
-    """Callable protocol for early sample filtering.
+    """Callable protocol pour le filtrage anticipé des samples.
 
-    Return True to keep the sample, False to discard it before JPEG decode.
-    Must be thread-safe (called from extraction worker threads).
+    Retourner ``True`` pour garder le sample, ``False`` pour le rejeter avant
+    le décodage JPEG.  Doit être thread-safe (appelé depuis les workers
+    d'extraction).
 
-    Example — keep only samples with quality_score ≥ 0.5::
+    Example::
 
         def quality_filter(meta: SampleMeta) -> bool:
             if meta.metadata is None:
                 return True
             return meta.metadata.get("quality_score", 1.0) >= 0.5
+
     """
 
     def __call__(self, meta: SampleMeta) -> bool: ...
 
 
+# ---------------------------------------------------------------------------
+# Runtime pipeline protocol
+# ---------------------------------------------------------------------------
+
+
 @runtime_checkable
 class AugmentationPipeline(Protocol):
-    """Runtime augmentation pipeline consumed by loader backends."""
+    """Pipeline d'augmentation runtime consommé par les backends."""
 
     @property
     def output_map(self) -> list[str]: ...
@@ -87,11 +140,24 @@ class AugmentationPipeline(Protocol):
     def reset(self) -> None: ...
 
 
-class AugmentationSpec(ABC):
-    """Base class for augmentation strategy specifications.
+# ---------------------------------------------------------------------------
+# AugmentationSpec — base
+# ---------------------------------------------------------------------------
 
-    A spec is a pure configuration object with no runtime state. The backend's
-    build_aug_pipeline() factory turns it into a live AugmentationPipeline.
+
+class AugmentationSpec(ABC):
+    """Classe de base pour les specs de stratégie d'augmentation.
+
+    Une spec est un pur objet de configuration sans état runtime.  La factory
+    ``BackendProtocol.build_pipeline`` la transforme en pipeline live.
+
+    Chaque sous-classe doit implémenter :
+    - ``output_map`` — noms ordonnés des vues produites.
+    - ``norm_stats`` — statistiques de normalisation en [0, 1].
+    - ``initial_global_size`` — taille initiale du crop global.
+    - ``initial_local_size`` — taille initiale du crop local.
+    - ``split_views`` — sépare une liste plate de vues en (global, local).
+
     """
 
     @property
@@ -101,36 +167,68 @@ class AugmentationSpec(ABC):
     @property
     @abstractmethod
     def norm_stats(self) -> NormStats:
-        """Normalisation statistics for this spec in [0, 1] scale."""
+        """Statistiques de normalisation en [0, 1]."""
+        ...
+
+    @property
+    @abstractmethod
+    def initial_global_size(self) -> int:
+        """Taille initiale du crop global en pixels."""
+        ...
+
+    @property
+    @abstractmethod
+    def initial_local_size(self) -> int:
+        """Taille initiale du crop local en pixels."""
+        ...
+
+    @abstractmethod
+    def split_views(
+        self,
+        views: list[Any],
+    ) -> tuple[list[Any], list[Any]]:
+        """Sépare une liste plate de vues en ``(global_crops, local_crops)``.
+
+        Args:
+            views: Liste de tenseurs issus du pipeline d'augmentation, dans
+                l'ordre défini par ``output_map``.
+
+        Returns:
+            Tuple ``(global_crops, local_crops)``.
+
+        """
         ...
 
     @property
     def n_views(self) -> int:
-        """Total number of output views."""
+        """Nombre total de vues de sortie."""
         return len(self.output_map)
 
     @property
     def uses_dali(self) -> bool:
-        """True if this spec can be fully fused into a DALI pipeline graph."""
+        """True si cette spec peut être fusionnée dans un graphe DALI."""
         return True
 
     def __repr__(self) -> str:
-        """Return a compact string representation."""
         return f"{type(self).__name__}(n_views={self.n_views})"
+
+
+# ---------------------------------------------------------------------------
+# Specs concrètes
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class DinoV2AugSpec(AugmentationSpec):
-    """DINOv2-style multi-crop augmentation.
+    """Augmentation multi-crop style DINOv2.
 
-    Default spec used when DINODataLoader is constructed without an explicit
-    aug_spec argument. Wraps the existing DINOAugConfig for backward
-    compatibility.
+    Spec par défaut quand ``DINODataLoader`` est construit sans ``aug_spec``
+    explicite.  Enveloppe ``DINOAugConfig`` pour la rétrocompatibilité.
 
     Attributes:
-        aug_cfg: Full DINOv2 augmentation configuration.
-        fuse_normalization: Fuse per-dataset mean/std into the DALI graph.
-        fp8_output: Emit FP8-cast tensors directly from the DALI graph.
+        aug_cfg:            Configuration complète DINOv2.
+        fuse_normalization: Fusionner mean/std par-dataset dans le graphe DALI.
+        fp8_output:         Émettre des tenseurs FP8 directement depuis DALI.
 
     """
 
@@ -140,26 +238,34 @@ class DinoV2AugSpec(AugmentationSpec):
 
     @property
     def output_map(self) -> list[str]:
-        """Ordered view names produced by this spec."""
         return [f"view_{i}" for i in range(self.aug_cfg.n_views)]
 
     @property
     def norm_stats(self) -> NormStats:
-        """Global normalisation statistics from the augmentation config."""
         return self.aug_cfg.norm_stats
+
+    @property
+    def initial_global_size(self) -> int:
+        return self.aug_cfg.global_crop_size
+
+    @property
+    def initial_local_size(self) -> int:
+        return self.aug_cfg.local_crop_size
+
+    def split_views(self, views: list[Any]) -> tuple[list[Any], list[Any]]:
+        n = self.aug_cfg.n_global_crops
+        return views[:n], views[n:]
 
 
 @dataclass
 class EvalAugSpec(AugmentationSpec):
-    """Evaluation augmentation: resize-then-centre-crop, no stochastic ops.
-
-    Suitable for val/test loops and fine-tuning phases.
+    """Augmentation d'évaluation : resize + centre-crop, sans stochastique.
 
     Attributes:
-        crop_size: Output spatial resolution in pixels.
-        mean: Per-channel normalisation mean in [0, 1].
-        std: Per-channel normalisation std in [0, 1].
-        interpolation: Resize interpolation mode ("bicubic" or "bilinear").
+        crop_size:     Résolution de sortie en pixels.
+        mean:          Moyenne de normalisation par canal en [0, 1].
+        std:           Écart-type de normalisation par canal en [0, 1].
+        interpolation: Mode de redimensionnement (``"bicubic"`` ou ``"bilinear"``).
 
     """
 
@@ -170,16 +276,24 @@ class EvalAugSpec(AugmentationSpec):
 
     @property
     def output_map(self) -> list[str]:
-        """Ordered view names produced by this spec."""
         return ["view_0"]
 
     @property
     def norm_stats(self) -> NormStats:
-        """Normalisation statistics for this spec."""
         return NormStats(mean=self.mean, std=self.std)
 
+    @property
+    def initial_global_size(self) -> int:
+        return self.crop_size
+
+    @property
+    def initial_local_size(self) -> int:
+        return self.crop_size
+
+    def split_views(self, views: list[Any]) -> tuple[list[Any], list[Any]]:
+        return views, []
+
     def __post_init__(self) -> None:
-        """Validate the interpolation mode."""
         valid = {"bicubic", "bilinear"}
         if self.interpolation not in valid:
             msg = (
@@ -191,24 +305,20 @@ class EvalAugSpec(AugmentationSpec):
 
 @dataclass
 class LeJEPAAugSpec(AugmentationSpec):
-    """LeJEPA-style augmentation: context + target patch views.
+    """Augmentation LeJEPA : crop contexte + crops cibles.
 
-    Produces two views per sample:
-    - ``context``: large crop (encoder input).
-    - ``target_N``: smaller crops (predictor targets).
-
-    Patch masking required by JEPA is applied after the pipeline on CPU using
-    MaskingGenerator — identical to DINOv2 iBOT masks (DALI cannot express
-    patch-index operations).
+    Produit ``1 + n_target_views`` vues par sample :
+    - ``context`` : grand crop (entrée encodeur).
+    - ``target_N`` : petits crops (cibles du prédicteur).
 
     Attributes:
-        context_crop_size: Context view spatial resolution.
-        target_crop_size: Target view spatial resolution.
-        n_target_views: Number of independent target crops per sample.
-        context_scale: RandomResizedCrop scale range for the context view.
-        target_scale: RandomResizedCrop scale range for target views.
-        mean: Per-channel normalisation mean in [0, 1].
-        std: Per-channel normalisation std in [0, 1].
+        context_crop_size: Résolution du crop contexte.
+        target_crop_size:  Résolution des crops cibles.
+        n_target_views:    Nombre de crops cibles indépendants par sample.
+        context_scale:     Plage de scale RandomResizedCrop pour le contexte.
+        target_scale:      Plage de scale pour les cibles.
+        mean:              Moyenne de normalisation par canal en [0, 1].
+        std:               Écart-type par canal en [0, 1].
 
     """
 
@@ -222,16 +332,24 @@ class LeJEPAAugSpec(AugmentationSpec):
 
     @property
     def output_map(self) -> list[str]:
-        """Ordered view names produced by this spec."""
         return ["context", *[f"target_{i}" for i in range(self.n_target_views)]]
 
     @property
     def norm_stats(self) -> NormStats:
-        """Normalisation statistics for this spec."""
         return NormStats(mean=self.mean, std=self.std)
 
+    @property
+    def initial_global_size(self) -> int:
+        return self.context_crop_size
+
+    @property
+    def initial_local_size(self) -> int:
+        return self.target_crop_size
+
+    def split_views(self, views: list[Any]) -> tuple[list[Any], list[Any]]:
+        return [views[0]], views[1:]
+
     def __post_init__(self) -> None:
-        """Validate crop scales and target count."""
         if self.n_target_views < 1:
             msg = f"LeJEPAAugSpec.n_target_views must be ≥ 1, got {self.n_target_views}."
             raise ValueError(msg)
@@ -243,36 +361,33 @@ class LeJEPAAugSpec(AugmentationSpec):
             raise ValueError(msg)
 
 
-# Type alias for user-provided augmentation functions.
+# Type alias pour les fonctions d'augmentation utilisateur.
 UserAugFn = Callable[
-    ["torch.Tensor"],          # noqa: F821
-    "dict[str, torch.Tensor]", # noqa: F821
+    ["torch.Tensor"],           # noqa: F821
+    "dict[str, torch.Tensor]",  # noqa: F821
 ]
 
 
 @dataclass
 class UserAugSpec(AugmentationSpec):
-    """User-provided augmentation function applied to decoded GPU tensors.
+    """Fonction d'augmentation utilisateur appliquée aux tenseurs GPU décodés.
 
-    JPEG decoding is always performed by DALI's hardware nvjpeg pipeline.
-    The user function receives already-decoded float16 tensors on GPU
-    (shape [B, C, H, W]) and never sees raw bytes.
+    Le décodage JPEG est toujours effectué par le pipeline DALI nvjpeg.  La
+    fonction utilisateur reçoit des tenseurs float16 déjà décodés sur GPU.
 
     Attributes:
-        aug_fn: Callable (Tensor[B,C,H,W]) → dict[str, Tensor[B,C,H,W]].
-            Input tensor is decoded, normalised to [0,1] float16.
-            Keys must match output_map.
-        output_map: Names of views returned by aug_fn.
-        decode_size: Resolution at which DALI decodes before calling aug_fn.
-            Should be the largest crop size your function may produce.
-        mean: Per-channel normalisation mean in [0, 1] applied before aug_fn.
-        std: Per-channel normalisation std in [0, 1].
-        warn_not_dali: Emit a non-DALI performance warning (default True).
+        aug_fn:        ``(Tensor[B,C,H,W]) → dict[str, Tensor[B,C,H,W]]``.
+        _output_map:    Noms des vues retournées par ``aug_fn``.
+        decode_size:   Résolution à laquelle DALI décode avant d'appeler
+                       ``aug_fn``.  Doit être la plus grande taille produite.
+        mean:          Moyenne de normalisation en [0, 1] appliquée avant.
+        std:           Écart-type en [0, 1].
+        warn_not_dali: Émettre un warning de performance (défaut True).
 
     """
 
     aug_fn:        UserAugFn
-    output_map:    list[str]
+    _output_map:    list[str]
     decode_size:   int                         = 256
     mean:          tuple[float, float, float]  = (0.485, 0.456, 0.406)
     std:           tuple[float, float, float]  = (0.229, 0.224, 0.225)
@@ -280,23 +395,36 @@ class UserAugSpec(AugmentationSpec):
 
     @property
     def uses_dali(self) -> bool:
-        """False — the user aug_fn runs outside the DALI graph."""
         return False
 
     @property
+    def output_map(self) -> list[str]:
+        return self._output_map
+
+    @property
     def n_views(self) -> int:
-        """Total number of output views."""
         return len(self.output_map)
 
     @property
     def norm_stats(self) -> NormStats:
-        """Normalisation statistics for this spec."""
         return NormStats(mean=self.mean, std=self.std)
 
+    @property
+    def initial_global_size(self) -> int:
+        return self.decode_size
+
+    @property
+    def initial_local_size(self) -> int:
+        return self.decode_size
+
+    def split_views(self, views: list[Any]) -> tuple[list[Any], list[Any]]:
+        mid = max(1, len(views) // 2)
+        return views[:mid], views[mid:]
+
     def __post_init__(self) -> None:
-        """Validate fields and emit performance warning."""
         if not callable(self.aug_fn):
-            raise TypeError("UserAugSpec.aug_fn must be callable.")
+            msg = "UserAugSpec.aug_fn must be callable."
+            raise TypeError(msg)
         if not self.output_map:
             msg = "UserAugSpec.output_map must be a non-empty list of view names."
             raise ValueError(msg)

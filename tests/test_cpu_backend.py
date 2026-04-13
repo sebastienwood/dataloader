@@ -9,7 +9,7 @@ test_loader_cpu.py.
 Coverage
 --------
 - InProcessShardCache  : get, get_view, LRU eviction, utilisation
-- CPUAugPipeline       : output shapes, dtype, value range
+- CPUAugPipeline       : output shapes, dtype, value range, close()
 - CPUPipelineIterator  : DALI-compatible iteration protocol
 - NullH2DStream        : passthrough context manager
 - NullFP8Formatter     : identity quantise
@@ -38,10 +38,11 @@ from dino_loader.backends.cpu import (
     NullH2DStream,
     StubClusterTopology,
     StubDistribEnv,
+    _ViewAugParams,
     _augment_one,
 )
 from dino_loader.config import DINOAugConfig, PipelineConfig
-from dino_loader.mixing_source import ResolutionSource
+from dino_loader.sources.resolution import ResolutionSource
 from tests.fixtures import write_shard
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -83,7 +84,6 @@ class TestInProcessShardCache:
         assert 0.0 < cache.utilisation < 1.0
 
     def test_lru_eviction_respects_budget(self, tmp_path):
-        """With a tiny budget, the oldest entry should be evicted."""
         tar_path1, _ = write_shard(tmp_path, shard_idx=0, n_samples=8)
         tar_path2, _ = write_shard(tmp_path, shard_idx=1, n_samples=8)
 
@@ -105,7 +105,7 @@ class TestInProcessShardCache:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# _augment_one
+# _augment_one — utilise _ViewAugParams
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -119,43 +119,43 @@ class TestAugmentOne:
         from tests.fixtures import make_jpeg_bytes
         return make_jpeg_bytes(64, 64)
 
-    def test_output_shape(self):
-        t = _augment_one(
-            self._sample_jpeg(), self.cfg,
-            crop_size=32, scale=(0.5, 1.0),
-            blur_prob=0.0, sol_prob=0.0,
+    def _global_params(self, crop_size: int = 32, sol_prob: float = 0.0) -> _ViewAugParams:
+        return _ViewAugParams(
+            crop_size = crop_size,
+            scale     = (0.5, 1.0),
+            blur_prob = 0.0,
+            sol_prob  = sol_prob,
         )
+
+    def _local_params(self, crop_size: int = 16) -> _ViewAugParams:
+        return _ViewAugParams(
+            crop_size = crop_size,
+            scale     = (0.05, 0.32),
+            blur_prob = 0.5,
+            sol_prob  = 0.0,
+        )
+
+    def test_output_shape(self):
+        t = _augment_one(self._sample_jpeg(), self.cfg, self._global_params(32))
         assert t.shape == (3, 32, 32), f"Unexpected shape: {t.shape}"
 
     def test_output_dtype_float(self):
-        t = _augment_one(
-            self._sample_jpeg(), self.cfg,
-            crop_size=32, scale=(0.5, 1.0),
-            blur_prob=0.0, sol_prob=0.0,
-        )
-        assert t.dtype in (torch.float32, torch.float16)
+        t = _augment_one(self._sample_jpeg(), self.cfg, self._global_params(32))
+        assert t.dtype in (torch.float32, torch.float16, torch.bfloat16)
 
     def test_corrupt_jpeg_returns_zeros(self):
-        t = _augment_one(
-            b"not a valid jpeg", self.cfg,
-            crop_size=32, scale=(0.5, 1.0),
-            blur_prob=0.0, sol_prob=0.0,
-        )
+        params = self._global_params(32)
+        t = _augment_one(b"not a valid jpeg", self.cfg, params)
         assert t.shape == (3, 32, 32)
         assert torch.all(t == 0)
 
     def test_solarize_enabled(self):
-        jpeg = self._sample_jpeg()
-        t = _augment_one(jpeg, self.cfg, crop_size=32, scale=(0.5, 1.0),
-                         blur_prob=0.0, sol_prob=1.0)
+        params = _ViewAugParams(crop_size=32, scale=(0.5, 1.0), blur_prob=0.0, sol_prob=1.0)
+        t = _augment_one(self._sample_jpeg(), self.cfg, params)
         assert t.shape == (3, 32, 32)
 
     def test_local_crop_size(self):
-        t = _augment_one(
-            self._sample_jpeg(), self.cfg,
-            crop_size=16, scale=(0.05, 0.32),
-            blur_prob=0.5, sol_prob=0.0,
-        )
+        t = _augment_one(self._sample_jpeg(), self.cfg, self._local_params(16))
         assert t.shape == (3, 16, 16)
 
 
@@ -167,7 +167,6 @@ class TestAugmentOne:
 class TestCPUAugPipeline:
 
     def _make_source(self, batch_size: int):
-        """A minimal MixingSource-compatible callable."""
         from tests.fixtures import make_jpeg_bytes
 
         def _source(info=None):
@@ -197,6 +196,8 @@ class TestCPUAugPipeline:
             t = result[f"view_{i}"]
             assert t.shape == (batch_size, 3, 16, 16), f"view_{i}: {t.shape}"
 
+        pipe.close()
+
     def test_dynamic_resolution(self, small_aug_cfg):
         batch_size = 2
         res_src    = ResolutionSource(32, 16)
@@ -208,6 +209,7 @@ class TestCPUAugPipeline:
 
         t = result["view_0"]
         assert t.shape == (batch_size, 3, 64, 64), f"Expected 64x64, got {t.shape}"
+        pipe.close()
 
     def test_values_are_finite(self, small_aug_cfg):
         batch_size = 2
@@ -218,6 +220,7 @@ class TestCPUAugPipeline:
         result = pipe.run_one_batch()
         for k, v in result.items():
             assert torch.isfinite(v).all(), f"Non-finite values in {k}"
+        pipe.close()
 
     def test_all_views_present(self, small_aug_cfg):
         batch_size = 2
@@ -228,6 +231,21 @@ class TestCPUAugPipeline:
 
         expected_keys = {f"view_{i}" for i in range(small_aug_cfg.n_views)}
         assert set(result.keys()) == expected_keys
+        pipe.close()
+
+    def test_close_is_idempotent(self, small_aug_cfg):
+        """Calling close() multiple times must not raise."""
+        res_src = ResolutionSource(32, 16)
+        pipe    = CPUAugPipeline(self._make_source(2), small_aug_cfg, 2, res_src, seed=0)
+        pipe.close()
+        pipe.close()  # second call must be safe
+
+    def test_run_after_close_raises(self, small_aug_cfg):
+        res_src = ResolutionSource(32, 16)
+        pipe    = CPUAugPipeline(self._make_source(2), small_aug_cfg, 2, res_src, seed=0)
+        pipe.close()
+        with pytest.raises(RuntimeError, match="close"):
+            pipe.run_one_batch()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -387,7 +405,6 @@ class TestCPUBackend:
         assert isinstance(cache, InProcessShardCache)
 
     def test_build_pipeline_with_pipeline_cfg(self, cpu_backend, small_aug_cfg, tmp_path):
-        """build_pipeline accepte désormais PipelineConfig au lieu de kwargs individuels."""
         from tests.fixtures import make_jpeg_bytes
         from dino_loader.augmentation import DinoV2AugSpec
 
@@ -399,7 +416,6 @@ class TestCPUBackend:
                 np.frombuffer(make_jpeg_bytes(64, 64), dtype=np.uint8)
                 for _ in range(batch_size)
             ]
-        # Expose les attributs attendus par CPUBackend.build_pipeline.
         _source._resolution_src = res_src
         _source._batch_size     = batch_size
 
@@ -412,6 +428,7 @@ class TestCPUBackend:
             pipeline_cfg = pipeline_cfg,
         )
         assert isinstance(pipe, CPUAugPipeline)
+        pipe.close()
 
     def test_build_pipeline_iterator(self, cpu_backend, small_aug_cfg):
         from tests.fixtures import make_jpeg_bytes
@@ -441,6 +458,7 @@ class TestCPUBackend:
             batch_size = batch_size,
         )
         assert isinstance(it, CPUPipelineIterator)
+        pipe.close()
 
     def test_build_h2d_stream(self, cpu_backend):
         h2d = cpu_backend.build_h2d_stream(
@@ -459,6 +477,5 @@ class TestCPUBackend:
         assert env.rank == 0
 
     def test_protocol_compliance(self, cpu_backend):
-        """Verify CPUBackend satisfies BackendProtocol at runtime."""
         from dino_loader.backends.protocol import BackendProtocol
         assert isinstance(cpu_backend, BackendProtocol)

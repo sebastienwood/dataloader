@@ -30,16 +30,19 @@ from dino_loader.loader import DINODataLoader
 from dino_loader.memory import Batch
 from dino_loader.pipeline_graph import NodePipeline
 from dino_loader.shard_reader import ShardReaderNode
-from tests.conftest import make_spec
+from tests.fixtures import make_spec
 
 
 def _cfg(tmp_path, stateful=False):
     return LoaderConfig(
-        node_shm_gb=0.1, shard_prefetch_window=2, shard_extraction_workers=2,
-        shuffle_buffer_size=4, use_fp8_output=False,
+        node_shm_gb=0.1,
+        shard_prefetch_window=2,
+        shuffle_buffer_size=4,
+        use_fp8_output=False,
         stateful_dataloader=stateful,
         checkpoint_dir=str(tmp_path / "ckpt") if stateful else "",
-        checkpoint_every_steps=2, stall_timeout_s=0,
+        checkpoint_every_steps=2,
+        stall_timeout_s=0,
     )
 
 
@@ -125,7 +128,6 @@ class TestLoaderBasic:
 
 
 class TestLoaderInternalArchitecture:
-    """Verify the internal structure introduced by Phase 1/3 migration."""
 
     def test_reader_is_shard_reader_node(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
         _, paths = tmp_dataset_dir
@@ -148,10 +150,16 @@ class TestLoaderInternalArchitecture:
         assert loader._reader._epoch == 5
 
     def test_dali_node_exists(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
-        """_dali_node is required for wrap_loader and NodePipeline composition."""
         _, paths = tmp_dataset_dir
         loader = _loader(paths, tmp_path, aug_cfg=small_aug_cfg)
         assert hasattr(loader, "_dali_node")
+
+    def test_reader_adapter_is_in_shard_reader(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
+        """_ReaderAdapter must live in shard_reader, not loader."""
+        from dino_loader.shard_reader import _ReaderAdapter
+        _, paths = tmp_dataset_dir
+        loader = _loader(paths, tmp_path, aug_cfg=small_aug_cfg)
+        assert isinstance(loader._dali_source, _ReaderAdapter)
 
 
 # ═══════════════════ Composition API ═══════════════════
@@ -209,10 +217,8 @@ class TestLoaderComposition:
         assert pipeline.aug_spec is loader.aug_spec
 
     def test_select_filters_batches(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
-        """select() must pass through only matching batches."""
         _, paths = tmp_dataset_dir
         accepted: list[Batch] = []
-        rejected_count = [0]
 
         def _track(b: Batch) -> Batch:
             accepted.append(b)
@@ -364,15 +370,17 @@ class TestLoaderCheckpoint:
     def test_checkpoint_saves_json(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
         _, paths = tmp_dataset_dir
         ckpt_dir = str(tmp_path / "ckpts")
-        cfg = LoaderConfig(node_shm_gb=0.1, shard_prefetch_window=2, shard_extraction_workers=2,
-                           shuffle_buffer_size=4, use_fp8_output=False, stateful_dataloader=True,
-                           checkpoint_dir=ckpt_dir, checkpoint_every_steps=2)
+        cfg = LoaderConfig(
+            node_shm_gb=0.1, shard_prefetch_window=2,
+            shuffle_buffer_size=4, use_fp8_output=False,
+            stateful_dataloader=True,
+            checkpoint_dir=ckpt_dir, checkpoint_every_steps=2,
+        )
         loader = _loader(paths, tmp_path, aug_cfg=small_aug_cfg, loader_cfg=cfg)
         loader.checkpoint(step=2)
         files = list(Path(ckpt_dir).glob("dl_state_*.json"))
         assert len(files) == 1
         raw = json.load(open(files[0]))
-        # Supports both envelope format and legacy flat format.
         payload = raw.get("payload", raw)
         assert payload["step"] == 2
 
@@ -392,8 +400,9 @@ class TestLoaderCheckpoint:
     def test_resume(self, tmp_dataset_dir, small_aug_cfg, tmp_path):
         _, paths = tmp_dataset_dir
         ckpt_dir = str(tmp_path / "resume")
-        cfg = LoaderConfig(node_shm_gb=0.1, shard_prefetch_window=2, shard_extraction_workers=2,
-                           shuffle_buffer_size=4, use_fp8_output=False, stateful_dataloader=True,
+        cfg = LoaderConfig(node_shm_gb=0.1, shard_prefetch_window=2,
+                           shuffle_buffer_size=4, use_fp8_output=False,
+                           stateful_dataloader=True,
                            checkpoint_dir=ckpt_dir, checkpoint_every_steps=4)
         _loader(paths, tmp_path, aug_cfg=small_aug_cfg, loader_cfg=cfg).checkpoint(step=4)
         loader2 = DINODataLoader(specs=[make_spec("test_ds", paths)], batch_size=4,
@@ -417,15 +426,15 @@ class TestLoaderQualityFilter:
 
     def test_min_quality_filters(self, shard_with_low_quality, small_aug_cfg, tmp_path):
         tar_path, _, _ = shard_with_low_quality
-        spec = DatasetSpec(name="f", shards=[tar_path], weight=1.0, min_sample_quality=0.5, metadata_key="json")
+        spec = DatasetSpec(name="f", shards=[tar_path], weight=1.0, min_sample_quality=0.5)
         loader = DINODataLoader(specs=[spec], batch_size=2, aug_cfg=small_aug_cfg,
                                 config=_cfg(tmp_path), backend="cpu")
         loader.set_epoch(0)
         assert isinstance(next(iter(loader)), Batch)
 
-    def test_no_metadata_key(self, shard_without_metadata, small_aug_cfg, tmp_path):
+    def test_no_metadata_shard(self, shard_without_metadata, small_aug_cfg, tmp_path):
         tar_path, _ = shard_without_metadata
-        spec = DatasetSpec(name="nm", shards=[tar_path], weight=1.0, metadata_key=None)
+        spec = DatasetSpec(name="nm", shards=[tar_path], weight=1.0)
         loader = DINODataLoader(specs=[spec], batch_size=2, aug_cfg=small_aug_cfg,
                                 config=_cfg(tmp_path), backend="cpu")
         loader.set_epoch(0)

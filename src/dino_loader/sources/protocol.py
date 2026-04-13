@@ -38,7 +38,7 @@ concrètes doivent donc exposer cet attribut.
 """
 
 from collections.abc import Callable, Sequence
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 

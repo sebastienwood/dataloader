@@ -41,6 +41,8 @@ Corrections
 [FIX-SIGNAL] _register_signals chaîne les handlers SIGTERM/SIGINT existants
              (installés par PyTorch distributed / NCCL) plutôt que de les
              écraser, évitant les deadlocks NCCL à la terminaison.
+[FIX-STALE] heartbeat_stale_s transmis à _init_shm/_purge_orphaned_shm
+            (était ignoré : _init_shm utilisait la constante _HB_STALE_S).
 [PERF-1]    No fsync on tmpfs.
 [PERF-2]    Persistent mmap pool.
 [LOG-1]     INFO→DEBUG demotion for per-shard logs.
@@ -414,6 +416,9 @@ class NodeSharedShardCache:
         budget total, sans attendre _EVICT_RETRIES itérations.
     [FIX-SIGNAL] _register_signals chaîne les handlers existants (PyTorch
         distributed / NCCL) pour éviter les deadlocks NCCL à la terminaison.
+    [FIX-STALE] heartbeat_stale_s est maintenant transmis à _init_shm, qui
+        l'utilise lors de l'appel à _purge_orphaned_shm au lieu d'utiliser
+        la constante globale _HB_STALE_S.
 
     Args:
         node_master: True for local rank 0 — this process fills the cache.
@@ -436,13 +441,14 @@ class NodeSharedShardCache:
         shm_warn_threshold: float = 0.85,
         heartbeat_stale_s:  float = _HB_STALE_S,
     ) -> None:
-        self._node_master    = node_master
-        self._job_id         = job_id
-        self._max_bytes      = int(max_shm_gb * (1 << 30))
-        self._base           = Path(f"/dev/shm/{job_id}")
-        self._timeout        = shard_timeout_s
-        self._warn_threshold = shm_warn_threshold
-        self._last_warn_ts:  float = 0.0
+        self._node_master      = node_master
+        self._job_id           = job_id
+        self._max_bytes        = int(max_shm_gb * (1 << 30))
+        self._base             = Path(f"/dev/shm/{job_id}")
+        self._timeout          = shard_timeout_s
+        self._warn_threshold   = shm_warn_threshold
+        self._heartbeat_stale  = heartbeat_stale_s
+        self._last_warn_ts:    float = 0.0
 
         self._lru:         OrderedDict[str, int] = OrderedDict()
         self._total_bytes: int                   = 0
@@ -453,8 +459,8 @@ class NodeSharedShardCache:
         self._mmap_pool = _MmapPool(max_entries=_MMAP_POOL_MAX)
 
         if node_master:
-            _purge_orphaned_shm(job_id, hb_stale_s=heartbeat_stale_s)
-            self._init_shm()
+            # [FIX-STALE] Pass heartbeat_stale_s through to _init_shm.
+            self._init_shm(heartbeat_stale_s)
             self._metrics = get_registry()
             self._loop    = asyncio.new_event_loop()
             self._sem     = asyncio.Semaphore(prefetch_window)
@@ -661,9 +667,13 @@ class NodeSharedShardCache:
                     self._max_bytes / (1 << 30), self._total_bytes / (1 << 30),
                 )
 
-    def _init_shm(self) -> None:
-        """Initialise the /dev/shm directory for this job."""
-        _purge_orphaned_shm(self._base.name, hb_stale_s=_HB_STALE_S)
+    def _init_shm(self, heartbeat_stale_s: float = _HB_STALE_S) -> None:
+        """Initialise the /dev/shm directory for this job.
+
+        [FIX-STALE] Uses the provided heartbeat_stale_s instead of the
+        global constant, so the constructor parameter is actually honoured.
+        """
+        _purge_orphaned_shm(self._base.name, hb_stale_s=heartbeat_stale_s)
         if self._base.exists():
             log.info("Removing stale shard cache at %s", self._base)
             shutil.rmtree(self._base, ignore_errors=True)

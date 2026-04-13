@@ -1,49 +1,44 @@
 """dino_loader.config
 ==================
-All loader-level configuration lives here.  No logic — pure dataclasses.
-Serialised to / from JSON for checkpointing (no pickle fragility).
+Toute la configuration du loader vit ici.  Pas de logique — des dataclasses
+pures.  Sérialisées vers/depuis JSON pour le checkpointing (pas de pickle).
 
-Corrections
------------
-[FIX-DEPRECATION] LoaderConfig.shard_extraction_workers émet un
-    DeprecationWarning si la valeur non-défaut est fournie explicitement.
-[FIX-CHECKSUM] CheckpointState.save() et load() utilisent sort_keys=True dans
-    json.dumps() pour garantir un checksum déterministe indépendamment de
-    l'ordre d'insertion des clés dict (garanti depuis Python 3.7 mais non
-    spécifié par la norme JSON).
-[FIX-CONTEXTLIB] import contextlib ajouté au niveau module — il était
-    référencé dans CheckpointState.save() sans être importé, transformant
-    toute erreur d'I/O en NameError secondaire.
-[FIX-DTYPE] PipelineConfig expose output_dtype ("bf16" | "fp32") et le
-    propage depuis LoaderConfig.  Les backends lisent ce champ pour choisir
-    le dtype DALI/torch effectif, rendant ainsi la config publique cohérente
-    avec l'exécution.
+Règle stricte
+-------------
+Ce module n'importe rien de ``dino_loader``.  Il peut importer de
+``dino_datasets`` uniquement pour le ré-export de ``DatasetSpec``.
+``CheckpointState`` est un pur dataclass sans méthodes d'I/O — la logique
+de sauvegarde/chargement avec SHA-256 vit dans ``checkpoint.py``.
+
+Corrections intégrées
+---------------------
+[FIX-DTYPE]       PipelineConfig expose ``output_dtype`` et le propage
+                  depuis LoaderConfig.
+[FIX-CHECKSUM]    Supprimé de ce module — dans checkpoint.py.
+[FIX-CONTEXTLIB]  Supprimé de ce module — dans checkpoint.py.
+[FIX-STATEFUL]    stateful_dataloader default → False pour permettre
+                  LoaderConfig() sans checkpoint_dir (utile en tests/CI).
 """
 
-import contextlib
-import json
-import warnings
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
-# NormStats — canonical per-dataset normalisation statistics
+# NormStats — statistiques de normalisation canoniques
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class NormStats:
-    """Per-channel normalisation statistics in [0, 1] float32 scale.
+    """Statistiques de normalisation par canal en [0, 1] float32.
 
-    All internal storage uses the [0, 1] convention.  Conversions to other
-    scales happen only at the point of use via the helper methods below.
+    Tout le stockage interne utilise la convention [0, 1].  Les conversions
+    vers d'autres échelles se font uniquement au point d'utilisation.
 
     Attributes:
-        mean: Per-channel mean in [0, 1].  Shape: (3,).
-        std: Per-channel std in [0, 1].  Positive values only.
+        mean: Moyenne par canal en [0, 1].  Shape: (3,).
+        std:  Écart-type par canal en [0, 1].  Doit être strictement positif.
 
     Example::
 
@@ -57,30 +52,18 @@ class NormStats:
     std:  tuple[float, float, float]
 
     def __post_init__(self) -> None:
-        """Validate that std values are strictly positive."""
         if any(s <= 0.0 for s in self.std):
             msg = f"NormStats.std must be strictly positive, got {self.std}."
             raise ValueError(msg)
 
     def to_dali_scale(self) -> tuple[list[float], list[float]]:
-        """Return (mean, std) converted to [0, 255] scale for DALI pipelines.
-
-        Returns:
-            A pair ``(mean_255, std_255)`` where each element is a list of
-            three floats in [0, 255].
-
-        """
+        """Retourne ``(mean, std)`` en échelle [0, 255] pour les pipelines DALI."""
         mean_arr = np.array(self.mean, dtype=np.float32) * 255.0
         std_arr  = np.array(self.std,  dtype=np.float32) * 255.0
         return mean_arr.tolist(), std_arr.tolist()
 
     def to_numpy(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return (mean, std) as float32 numpy arrays in [0, 1] scale.
-
-        Returns:
-            A pair ``(mean_arr, std_arr)`` of shape ``(3,)`` float32 arrays.
-
-        """
+        """Retourne ``(mean, std)`` comme tableaux float32 numpy en [0, 1]."""
         return (
             np.array(self.mean, dtype=np.float32),
             np.array(self.std,  dtype=np.float32),
@@ -88,7 +71,7 @@ class NormStats:
 
     @classmethod
     def imagenet(cls) -> "NormStats":
-        """Standard ImageNet normalisation statistics."""
+        """Statistiques de normalisation ImageNet standard."""
         return cls(
             mean=(0.485, 0.456, 0.406),
             std=(0.229, 0.224, 0.225),
@@ -97,22 +80,19 @@ class NormStats:
     @classmethod
     def from_config(
         cls,
-        mean: tuple[float, float, float] | None,
-        std:  tuple[float, float, float] | None,
+        mean:     tuple[float, float, float] | None,
+        std:      tuple[float, float, float] | None,
         fallback: "NormStats | None" = None,
     ) -> "NormStats":
-        """Build a ``NormStats`` from optional per-dataset overrides.
+        """Construit depuis des overrides optionnels par dataset.
 
         Args:
-            mean: Per-channel mean or ``None`` to use the fallback.
-            std: Per-channel std or ``None`` to use the fallback.
-            fallback: Stats to use when no per-dataset values are provided.
-
-        Returns:
-            A ``NormStats`` instance with the resolved values.
+            mean:     Moyenne par canal, ou ``None`` pour utiliser le fallback.
+            std:      Écart-type, ou ``None`` pour utiliser le fallback.
+            fallback: Stats à utiliser quand aucune valeur n'est fournie.
 
         """
-        base = fallback if fallback is not None else cls.imagenet()
+        base          = fallback if fallback is not None else cls.imagenet()
         resolved_mean = mean if mean is not None else base.mean
         resolved_std  = std  if std  is not None else base.std
         return cls(mean=resolved_mean, std=resolved_std)
@@ -128,16 +108,15 @@ class SharedExtractionPoolConfig:
     """Configuration du pool d'extraction partagé entre les ShardIterators.
 
     Attributes:
-        max_workers: Nombre maximum de threads d'extraction simultanés.
+        max_workers:           Nombre maximum de threads d'extraction.
         queue_depth_per_shard: Profondeur de la file de samples par shard.
 
     """
 
-    max_workers:          int = 16
+    max_workers:           int = 16
     queue_depth_per_shard: int = 256
 
     def __post_init__(self) -> None:
-        """Validate pool configuration."""
         if self.max_workers < 1:
             msg = f"SharedExtractionPoolConfig.max_workers must be ≥ 1, got {self.max_workers}."
             raise ValueError(msg)
@@ -153,15 +132,11 @@ class SharedExtractionPoolConfig:
 # PipelineConfig
 # ---------------------------------------------------------------------------
 
-# Mapping from the public string token to a torch dtype string understood by
-# backends.  New dtypes can be added here without touching LoaderConfig.
 _DTYPE_TO_TORCH: dict[str, str] = {
     "bf16": "bfloat16",
     "fp32": "float32",
 }
 
-# Mapping to the DALI types string name; resolved lazily inside the DALI
-# backend to avoid importing nvidia.dali at config parse time.
 _DTYPE_TO_DALI: dict[str, str] = {
     "bf16": "FLOAT16",
     "fp32": "FLOAT",
@@ -173,17 +148,15 @@ class PipelineConfig:
     """Paramètres de construction du pipeline d'augmentation.
 
     Attributes:
-        num_threads: DALI CPU worker threads for pre-decode operations.
-        device_id: Target CUDA device index.
-        hw_decoder_load: Fraction of JPEG decode routed to nvjpeg HW ASIC.
-        cpu_queue: DALI CPU-side prefetch queue depth.
-        gpu_queue: DALI GPU-side prefetch queue depth.
-        seed: Pipeline RNG seed (rank offset applied by the caller).
-        fuse_normalization: Fuse per-dataset mean/std into the DALI kernel.
-        dali_fp8_output: Fuse FP8 cast into the DALI graph (no TE metadata).
-        output_dtype: Intermediate normalisation dtype — ``"bf16"`` or
-            ``"fp32"``.  Consumed by both the DALI and CPU backends so that
-            ``LoaderConfig.output_dtype`` actually affects execution.
+        num_threads:        Threads CPU DALI pour les opérations pré-décodage.
+        device_id:          Index GPU cible.
+        hw_decoder_load:    Fraction du décodage JPEG envoyée au HW nvjpeg.
+        cpu_queue:          Profondeur de la file de prefetch CPU DALI.
+        gpu_queue:          Profondeur de la file GPU DALI.
+        seed:               Seed RNG du pipeline (offset par rank appliqué).
+        fuse_normalization: Fusionner mean/std par-dataset dans le kernel DALI.
+        dali_fp8_output:    Fusionner le cast FP8 dans le graphe DALI.
+        output_dtype:       Dtype de normalisation — ``"bf16"`` ou ``"fp32"``.
 
     """
 
@@ -199,25 +172,27 @@ class PipelineConfig:
 
     @property
     def torch_dtype_str(self) -> str:
-        """Return the torch dtype string for this config (e.g. ``"bfloat16"``)."""
+        """Retourne le nom du dtype torch (ex. ``"bfloat16"``)."""
         return _DTYPE_TO_TORCH.get(self.output_dtype, "bfloat16")
 
     @property
     def dali_dtype_str(self) -> str:
-        """Return the DALI type name for this config (e.g. ``"FLOAT16"``)."""
+        """Retourne le nom du type DALI (ex. ``"FLOAT16"``)."""
         return _DTYPE_TO_DALI.get(self.output_dtype, "FLOAT16")
 
     @classmethod
-    def from_loader_config(cls, cfg: "LoaderConfig", device_id: int, rank: int) -> "PipelineConfig":
-        """Build a ``PipelineConfig`` from a ``LoaderConfig`` and runtime values.
+    def from_loader_config(
+        cls,
+        cfg:       "LoaderConfig",
+        device_id: int,
+        rank:      int,
+    ) -> "PipelineConfig":
+        """Construit depuis un ``LoaderConfig`` et les valeurs runtime.
 
         Args:
-            cfg: Loader-level configuration.
-            device_id: Local GPU index.
-            rank: Global rank (used to derive the per-rank seed offset).
-
-        Returns:
-            A ``PipelineConfig`` ready to pass to ``BackendProtocol.build_pipeline``.
+            cfg:       Configuration niveau loader.
+            device_id: Index GPU local.
+            rank:      Rang global (utilisé pour le seed par-rank).
 
         """
         return cls(
@@ -240,28 +215,28 @@ class PipelineConfig:
 
 @dataclass
 class DINOAugConfig:
-    """DINOv2/v3 multi-crop augmentation configuration.
+    """Configuration d'augmentation multi-crop DINOv2/v3.
 
     Attributes:
-        global_crop_size: Initial global crop resolution in pixels.
-        local_crop_size: Initial local crop resolution in pixels.
-        n_global_crops: Number of large crops per image.
-        n_local_crops: Number of small crops per image.
-        global_crops_scale: RandomResizedCrop scale range for global views.
-        local_crops_scale: RandomResizedCrop scale range for local views.
-        blur_prob_global1: Gaussian blur probability for first global crop.
-        blur_prob_global2: Gaussian blur probability for second global crop.
-        blur_prob_local: Gaussian blur probability for local crops.
-        solarize_prob: Solarization probability (second global crop only).
-        color_jitter_prob: Color jitter application probability.
-        grayscale_prob: Grayscale conversion probability.
-        preserve_aspect_ratio: Resize shorter side then centre-crop.
-        resolution_schedule: List of (epoch, global_crop_size) for progressive
-            resolution. Applied automatically by set_epoch().
-        max_global_crop_size: nvjpeg pre-allocation ceiling.
-        max_local_crop_size: nvjpeg pre-allocation ceiling.
-        mean: Per-channel normalisation mean in [0, 1] (ImageNet defaults).
-        std: Per-channel normalisation std in [0, 1] (ImageNet defaults).
+        global_crop_size:   Résolution initiale du crop global en pixels.
+        local_crop_size:    Résolution initiale du crop local en pixels.
+        n_global_crops:     Nombre de grands crops par image.
+        n_local_crops:      Nombre de petits crops par image.
+        global_crops_scale: Plage de scale RandomResizedCrop pour les vues globales.
+        local_crops_scale:  Plage de scale pour les vues locales.
+        blur_prob_global1:  Probabilité de flou gaussien pour le 1er crop global.
+        blur_prob_global2:  Probabilité pour le 2e crop global.
+        blur_prob_local:    Probabilité pour les crops locaux.
+        solarize_prob:      Probabilité de solarisation (2e crop global uniquement).
+        color_jitter_prob:  Probabilité d'application du color jitter.
+        grayscale_prob:     Probabilité de conversion en niveaux de gris.
+        preserve_aspect_ratio: Resize le côté court puis centre-crop.
+        resolution_schedule: Liste de ``(epoch, global_crop_size)`` pour la
+            résolution progressive.  Appliquée automatiquement par ``set_epoch()``.
+        max_global_crop_size: Plafond de pré-allocation nvjpeg.
+        max_local_crop_size:  Plafond de pré-allocation nvjpeg.
+        mean: Moyenne de normalisation par canal en [0, 1] (défauts ImageNet).
+        std:  Écart-type par canal en [0, 1].
 
     """
 
@@ -297,7 +272,6 @@ class DINOAugConfig:
     std:  tuple[float, float, float] = (0.229, 0.224, 0.225)
 
     def __post_init__(self) -> None:
-        """Validate and normalise fields after construction."""
         if self.max_global_crop_size == 0:
             self.max_global_crop_size = self.global_crop_size
         if self.max_local_crop_size == 0:
@@ -315,22 +289,19 @@ class DINOAugConfig:
 
     @property
     def n_views(self) -> int:
-        """Total number of crops (global + local)."""
+        """Nombre total de crops (global + local)."""
         return self.n_global_crops + self.n_local_crops
 
     @property
     def norm_stats(self) -> NormStats:
-        """Global normalisation statistics as a ``NormStats`` instance."""
+        """Statistiques de normalisation globales sous forme de ``NormStats``."""
         return NormStats(mean=self.mean, std=self.std)
 
     def crop_size_at_epoch(self, epoch: int) -> int:
-        """Return the global crop size dictated by the resolution schedule.
+        """Retourne la taille de crop global dictée par le schedule de résolution.
 
         Args:
-            epoch: Current training epoch (0-indexed).
-
-        Returns:
-            The global crop size in pixels for this epoch.
+            epoch: Époque d'entraînement courante (index 0).
 
         """
         if not self.resolution_schedule:
@@ -349,95 +320,81 @@ class DINOAugConfig:
 
 @dataclass
 class LoaderConfig:
-    """All runtime knobs for DINODataLoader.
+    """Tous les paramètres runtime de DINODataLoader.
 
     Attributes:
-        node_shm_gb: /dev/shm budget per node in GB.
-        shard_prefetch_window: Max concurrent Lustre → /dev/shm downloads.
-        shard_timeout_s: Max seconds a non-master rank waits for a shard.
-        shard_extraction_workers: **Deprecated** — use extraction_pool.max_workers.
-            Emits a DeprecationWarning if a non-default value is provided.
-        heartbeat_stale_s: Seconds without heartbeat before orphan detection.
-        extraction_pool: Shared extraction thread pool config.
-        dali_cpu_queue: DALI CPU-side prefetch queue depth (default 16).
-        dali_gpu_queue: DALI GPU-side prefetch queue depth.
-        dali_num_threads: DALI CPU worker threads.
-        hw_decoder_load: Fraction of JPEG decode via nvjpeg HW ASIC.
-        shuffle_buffer_size: In-memory sample reservoir depth per ShardIterator.
-        use_fp8_output: Quantise output to FP8 E4M3. Requires transformer-engine.
-        dali_fp8_output: Fuse FP8 cast into DALI graph. Requires use_fp8_output.
-        fuse_normalization: Fuse per-dataset normalisation into the DALI kernel.
-        output_dtype: Intermediate normalisation dtype before optional FP8 cast.
-            ``"bf16"`` maps to BF16/FLOAT16; ``"fp32"`` maps to FP32.
-            Both the DALI and CPU backends honour this setting.
-        stateful_dataloader: Enable state_dict() / load_state_dict() interface.
-        checkpoint_dir: Where JSON checkpoint files are written.
-        checkpoint_every_steps: Checkpoint frequency (rank 0 only).
-        force_topology: Override topology detection: "pcie" | None.
-        seed: Base random seed.
-        debug_log_keys: Path to per-sample key audit log.
-        stall_timeout_s: Seconds before raising on no batches. 0 = disabled.
-        shm_warn_threshold: /dev/shm utilisation fraction that triggers a warning.
-        prometheus_port: If set, start a prometheus_client HTTP server on this port.
-        adaptive_prefetch: Enable adaptive prefetch window PID controller.
-        adaptive_prefetch_target_util: Target /dev/shm utilisation (0, 1].
+        node_shm_gb:              Budget /dev/shm par nœud en Go.
+        shard_prefetch_window:    Max de téléchargements Lustre → /dev/shm simultanés.
+        shard_timeout_s:          Max secondes qu'un rang non-master attend un shard.
+        heartbeat_stale_s:        Secondes sans heartbeat avant détection d'orphelin.
+        extraction_pool:          Config du pool d'extraction partagé.
+        dali_cpu_queue:           Profondeur de la file CPU DALI (≥ 16).
+        dali_gpu_queue:           Profondeur de la file GPU DALI.
+        dali_num_threads:         Threads CPU DALI.
+        hw_decoder_load:          Fraction du décodage JPEG via le HW nvjpeg.
+        shuffle_buffer_size:      Profondeur du réservoir de shuffle par ShardIterator.
+        use_fp8_output:           Quantiser la sortie en FP8 E4M3. Nécessite TE.
+        dali_fp8_output:          Fusionner le cast FP8 dans le graphe DALI.
+        fuse_normalization:       Fusionner la normalisation par-dataset dans DALI.
+        output_dtype:             Dtype de normalisation (``"bf16"`` ou ``"fp32"``).
+        stateful_dataloader:      Active state_dict() / load_state_dict().
+                                  Défaut ``False`` — passer ``True`` pour les runs
+                                  de production avec ``checkpoint_dir`` renseigné.
+        checkpoint_dir:           Répertoire d'écriture des checkpoints JSON.
+        checkpoint_every_steps:   Fréquence de checkpoint (rank 0 uniquement).
+        force_topology:           Override de la détection topology.
+        seed:                     Seed RNG de base.
+        debug_log_keys:           Chemin vers le log d'audit par sample.
+        stall_timeout_s:          Secondes avant levée sur absence de batch. 0 = désactivé.
+        shm_warn_threshold:       Fraction d'utilisation /dev/shm déclenchant un warning.
+        prometheus_port:          Si défini, démarre un serveur HTTP Prometheus.
+        adaptive_prefetch:        Active le contrôleur PID de prefetch adaptatif.
+        adaptive_prefetch_target_util: Cible d'utilisation /dev/shm (0, 1].
 
     """
 
     # I/O
-    node_shm_gb:              float = 128.0
-    shard_prefetch_window:    int   = 64
-    shard_timeout_s:          float = 300.0
-    # [FIX-DEPRECATION] Kept for backward compat — emits DeprecationWarning.
-    shard_extraction_workers: int   = 4
+    node_shm_gb:           float = 128.0
+    shard_prefetch_window: int   = 64
+    shard_timeout_s:       float = 300.0
 
-    heartbeat_stale_s:        float = 300.0
+    heartbeat_stale_s: float = 300.0
 
     extraction_pool: SharedExtractionPoolConfig = field(
         default_factory=SharedExtractionPoolConfig,
     )
 
-    dali_cpu_queue:           int   = 16
-    dali_gpu_queue:           int   = 6
-    dali_num_threads:         int   = 8
-    hw_decoder_load:          float = 0.90
+    dali_cpu_queue:    int   = 16
+    dali_gpu_queue:    int   = 6
+    dali_num_threads:  int   = 8
+    hw_decoder_load:   float = 0.90
 
-    shuffle_buffer_size:      int   = 512
+    shuffle_buffer_size: int  = 512
 
-    use_fp8_output:           bool  = False
-    dali_fp8_output:          bool  = False
-    fuse_normalization:       bool  = True
-    output_dtype:             str   = "bf16"
+    use_fp8_output:     bool = False
+    dali_fp8_output:    bool = False
+    fuse_normalization: bool = True
+    output_dtype:       str  = "bf16"
 
-    stateful_dataloader:      bool  = True
-    checkpoint_dir:           str   = ""
-    checkpoint_every_steps:   int   = 500
+    # [FIX-STATEFUL] Default False so LoaderConfig() works without checkpoint_dir.
+    # Production runs must pass stateful_dataloader=True with a valid checkpoint_dir.
+    stateful_dataloader:    bool = False
+    checkpoint_dir:         str  = ""
+    checkpoint_every_steps: int  = 500
 
-    force_topology:           str | None = None
-    seed:                     int   = 0
+    force_topology: str | None = None
+    seed:           int        = 0
 
-    debug_log_keys:           str | None = None
+    debug_log_keys: str | None = None
 
-    stall_timeout_s:          float = 600.0
-    shm_warn_threshold:       float = 0.90
-    prometheus_port:          int | None = None
+    stall_timeout_s:    float      = 600.0
+    shm_warn_threshold: float      = 0.90
+    prometheus_port:    int | None = None
 
-    adaptive_prefetch:              bool  = False
-    adaptive_prefetch_target_util:  float = 0.80
+    adaptive_prefetch:             bool  = False
+    adaptive_prefetch_target_util: float = 0.80
 
     def __post_init__(self) -> None:
-        """Validate all fields at construction time."""
-        # [FIX-DEPRECATION] Avertir si shard_extraction_workers est utilisé
-        # explicitement (valeur différente de la valeur par défaut = 4).
-        if self.shard_extraction_workers != 4:
-            warnings.warn(
-                "LoaderConfig.shard_extraction_workers is deprecated and ignored. "
-                "Use extraction_pool=SharedExtractionPoolConfig(max_workers=N) instead. "
-                "Example: LoaderConfig(extraction_pool=SharedExtractionPoolConfig(max_workers=8))",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
         if self.use_fp8_output:
             try:
                 import transformer_engine.pytorch  # noqa: F401, PLC0415
@@ -520,32 +477,38 @@ class LoaderConfig:
             raise ValueError(msg)
 
     def to_dict(self) -> dict:
-        """Serialise to a plain dict."""
+        """Sérialise en dict plat."""
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "LoaderConfig":
-        """Deserialise from a plain dict, ignoring unknown keys.
-
-        Args:
-            d: Dictionary previously produced by ``to_dict()``.
-
-        Returns:
-            A ``LoaderConfig`` instance with the values from *d*.
-
-        """
+        """Désérialise depuis un dict, en ignorant les clés inconnues."""
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
 
 
 # ---------------------------------------------------------------------------
-# CheckpointState
+# CheckpointState — pur dataclass, sans logique I/O
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class CheckpointState:
-    """Persisted dataloader state — JSON-serialisable."""
+    """État persisté du dataloader — sérialisable en JSON.
+
+    Ce dataclass est volontairement sans méthodes d'I/O.  La logique de
+    sauvegarde/chargement avec SHA-256 et écriture atomique vit dans
+    ``DataLoaderCheckpointer`` (``checkpoint.py``).
+
+    Attributes:
+        step:             Étape globale courante.
+        epoch:            Époque courante.
+        dataset_names:    Noms ordonnés des datasets.
+        mixing_weights:   Poids de mixage normalisés courants.
+        global_crop_size: Taille de crop global active.
+        local_crop_size:  Taille de crop local active.
+
+    """
 
     step:             int
     epoch:            int
@@ -554,95 +517,12 @@ class CheckpointState:
     global_crop_size: int = 224
     local_crop_size:  int = 96
 
-    def save(self, path: Path) -> None:
-        """Write atomically via a .tmp file with SHA-256 integrity envelope.
-
-        [FIX-CHECKSUM] json.dumps utilise sort_keys=True pour garantir un
-        checksum déterministe indépendamment de l'ordre d'insertion des clés.
-        La même option est utilisée dans load() pour la vérification, ce qui
-        garantit que save() et load() produisent toujours la même représentation
-        JSON pour un payload identique.
-
-        [FIX-CONTEXTLIB] contextlib est maintenant importé au niveau module.
-        L'ancienne version référençait contextlib.suppress() sans import,
-        masquant l'erreur I/O originale derrière un NameError secondaire.
-
-        Args:
-            path: Destination file path.
-
-        """
-        import hashlib  # noqa: PLC0415
-
-        payload = asdict(self)
-        # [FIX-CHECKSUM] sort_keys=True pour un checksum reproductible.
-        payload_json = json.dumps(payload, indent=2, sort_keys=True)
-        checksum     = hashlib.sha256(payload_json.encode()).hexdigest()
-        envelope     = {"payload": payload, "sha256": checksum}
-        tmp          = path.with_suffix(".tmp")
-        try:
-            tmp.write_text(json.dumps(envelope, indent=2, sort_keys=True), encoding="utf-8")
-            tmp.rename(path)
-        except Exception:
-            # [FIX-CONTEXTLIB] contextlib imported at module level — the
-            # previous code used contextlib.suppress() without any import,
-            # converting every I/O failure into a secondary NameError.
-            with contextlib.suppress(Exception):
-                tmp.unlink(missing_ok=True)
-            raise
-
     def to_dict(self) -> dict:
-        """Serialise to a plain dict."""
+        """Sérialise en dict plat."""
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "CheckpointState":
-        """Deserialise from a plain dict, ignoring unknown keys."""
+        """Désérialise depuis un dict, en ignorant les clés inconnues."""
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
-
-    @classmethod
-    def load(cls, path: Path) -> "CheckpointState":
-        """Load and verify checkpoint, supporting both envelope and legacy formats.
-
-        [FIX-CHECKSUM] Utilise sort_keys=True pour reproduire exactement la même
-        représentation JSON que save(), garantissant la cohérence du checksum.
-
-        Args:
-            path: Path to the JSON checkpoint file.
-
-        Returns:
-            A ``CheckpointState`` instance.
-
-        Raises:
-            ValueError: If the SHA-256 integrity check fails.
-
-        """
-        import hashlib  # noqa: PLC0415
-        import logging  # noqa: PLC0415
-
-        log = logging.getLogger(__name__)
-        raw = json.loads(path.read_text(encoding="utf-8"))
-
-        if "payload" in raw and "sha256" in raw:
-            # [FIX-CHECKSUM] sort_keys=True pour cohérence avec save().
-            payload_json = json.dumps(raw["payload"], indent=2, sort_keys=True)
-            expected     = hashlib.sha256(payload_json.encode()).hexdigest()
-            if raw["sha256"] != expected:
-                msg = (
-                    f"Checkpoint {path} failed integrity check: "
-                    f"stored sha256={raw['sha256']!r}, computed={expected!r}. "
-                    "File may be corrupt or truncated."
-                )
-                raise ValueError(msg)
-            data = raw["payload"]
-        else:
-            log.warning(
-                "Checkpoint %s uses legacy flat format (no SHA-256 envelope). "
-                "Resave with the current code to upgrade the format.",
-                path,
-            )
-            data = raw
-
-        data.setdefault("global_crop_size", 224)
-        data.setdefault("local_crop_size",  96)
-        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})

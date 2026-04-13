@@ -142,7 +142,7 @@ class NormSource:
                     mean     = spec.mean,
                     std      = spec.std,
                     fallback = global_stats,
-                )
+                ),
             )
 
         self._indices: list[int] = [0]

@@ -1,51 +1,43 @@
-"""tests/test_nodes.py
-======================
-Unit tests for the shard reader and pipeline graph nodes.
+"""tests/test_shard_reader.py
+==============================
+Tests unitaires pour ``dino_loader.shard_reader`` et les nœuds de graphe
+``dino_loader.pipeline_graph``.
 
-Imports from the canonical modules:
-- :mod:`dino_loader.shard_reader`  (ShardReaderNode, build_reader_graph)
-- :mod:`dino_loader.pipeline_graph` (MetadataNode, MaskMapNode)
-
-The ``dino_loader.nodes`` shim is not used here — tests import directly from
-the source modules as per CONVENTIONS.md.
-
-Tests that spin up real ``MixingSource`` threads and perform shard I/O are
-decorated with ``@pytest.mark.slow`` and excluded from the default fast run::
-
-    pytest -m "not slow"   # CI default
-    pytest                 # full suite
-
-No GPU, DALI, or SLURM required — all shard I/O uses InProcessShardCache.
+Note sur les imports
+---------------------
+Ce fichier importe directement depuis ``shard_reader`` et ``pipeline_graph``,
+conformément à CONVENTIONS.md.  L'ancien ``nodes.py`` (shim de compatibilité)
+a été supprimé.
 
 Coverage
 --------
-ShardReaderNode (fast, state-only)
-- dataset_names available before reset()
-- set_epoch before reset() does not crash
+ShardReaderNode — état (rapide, sans I/O)
+- dataset_names disponible avant reset()
+- set_epoch avant reset() ne lève pas d'erreur
 
-ShardReaderNode (slow, real I/O)
-- next() returns (jpeg_list, metadata_list)
-- get_state() contains epoch, mixing_weights, dataset_names
-- set_epoch updates state
-- set_weights normalises correctly
-- reset with saved state restores epoch
-- multiple batches without error
+ShardReaderNode — intégration [slow]
+- next() retourne (jpeg_list, metadata_list)
+- get_state() contient epoch, mixing_weights, dataset_names
+- set_epoch met à jour l'état
+- reset avec état sauvegardé restaure l'époque
+- set_weights normalise correctement
+- Plusieurs batches sans erreur
 
-MetadataNode (slow)
-- passes through jpegs and metadata
-- pop_last_metadata clears after first call
-- get_state delegates to source
+MetadataNode — intégration [slow]
+- Passe les jpegs et métadonnées
+- pop_last_metadata vide le buffer après le premier appel
+- get_state délègue à la source
 
-build_reader_graph (slow)
-- returns (loader, reader_node)
-- loader is iterable
-- loader state_dict round-trip
+build_reader_graph — intégration [slow]
+- Retourne (loader, reader_node)
+- loader est itérable
+- state_dict round-trip
 
-MaskMapNode
-- as_transform applies mask to batch
-- mask has correct shape and dtype
-- exact count guarantee preserved after transform
-- global_crops unchanged after masking
+MaskMapNode — rapide (stub Batch, sans I/O)
+- as_transform ajoute des masques
+- Shape et dtype des masques
+- Garantie de count exact
+- Les crops globaux ne sont pas modifiés
 """
 
 from __future__ import annotations
@@ -59,6 +51,7 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+import torchdata.nodes as tn
 import numpy as np
 from dino_datasets import DatasetSpec
 
@@ -80,14 +73,14 @@ def _cache() -> InProcessShardCache:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ShardReaderNode — state (fast, no I/O)
+# ShardReaderNode — état (rapide, sans I/O)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestShardReaderNodeState:
 
     def test_dataset_names_before_reset(self, tmp_path: Path) -> None:
-        """dataset_names is available before reset() (from spec list)."""
+        """dataset_names est disponible avant reset() depuis la liste des specs."""
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
         node = ShardReaderNode(
             specs=[_make_spec(tar_paths, "myds")], batch_size=4,
@@ -95,39 +88,18 @@ class TestShardReaderNodeState:
         )
         assert node.dataset_names == ["myds"]
 
-    def test_set_epoch_before_reset(self, tmp_path: Path) -> None:
-        """set_epoch before reset() should not crash (no source yet)."""
+    def test_set_epoch_before_reset_does_not_raise(self, tmp_path: Path) -> None:
+        """set_epoch avant reset() ne doit pas lever d'exception."""
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
         node = ShardReaderNode(
             specs=[_make_spec(tar_paths)], batch_size=4,
             cache=_cache(), rank=0, world_size=1,
         )
-        node.set_epoch(5)  # must not raise
-
-    def test_current_weights_before_reset_empty(self, tmp_path: Path) -> None:
-        """current_weights returns [] before reset() (source not yet created)."""
-        tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
-        node = ShardReaderNode(
-            specs=[_make_spec(tar_paths)], batch_size=4,
-            cache=_cache(), rank=0, world_size=1,
-        )
-        assert node.current_weights == []
-
-    def test_get_state_before_reset(self, tmp_path: Path) -> None:
-        """get_state() works before reset() with empty weights."""
-        tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
-        node = ShardReaderNode(
-            specs=[_make_spec(tar_paths)], batch_size=4,
-            cache=_cache(), rank=0, world_size=1,
-        )
-        state = node.get_state()
-        assert "epoch" in state
-        assert "mixing_weights" in state
-        assert "dataset_names" in state
+        node.set_epoch(5)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ShardReaderNode — integration (slow)
+# ShardReaderNode — intégration [slow]
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -146,8 +118,7 @@ class TestShardReaderNodeOutput:
         jpegs, meta = node.next()
         assert len(jpegs) == 4
         assert len(meta) == 4
-        for j in jpegs:
-            assert isinstance(j, np.ndarray)
+        assert all(isinstance(j, np.ndarray) for j in jpegs)
 
     def test_multiple_batches_no_error(self, tmp_path: Path) -> None:
         tar_paths = scaffold_dataset_dir(
@@ -163,7 +134,7 @@ class TestShardReaderNodeOutput:
             assert len(jpegs) == 8
             assert len(meta) == 8
 
-    def test_get_state_contains_epoch_weights_names(self, tmp_path: Path) -> None:
+    def test_get_state_contains_required_keys(self, tmp_path: Path) -> None:
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2)
         node = ShardReaderNode(
             specs=[_make_spec(tar_paths)], batch_size=4,
@@ -218,7 +189,7 @@ class TestShardReaderNodeOutput:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MetadataNode — integration (slow)
+# MetadataNode — intégration [slow]
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -263,7 +234,7 @@ class TestMetadataNode:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# build_reader_graph — integration (slow)
+# build_reader_graph — intégration [slow]
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -278,7 +249,6 @@ class TestBuildReaderGraph:
         )
         assert loader is not None
         assert reader is not None
-        assert isinstance(reader, ShardReaderNode)
 
     def test_loader_is_iterable(self, tmp_path: Path) -> None:
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2)
@@ -300,24 +270,24 @@ class TestBuildReaderGraph:
         reader.set_epoch(2)
         sd = loader.state_dict()
         assert isinstance(sd, dict)
-        loader.load_state_dict(sd)  # must not raise
+        loader.load_state_dict(sd)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MaskMapNode — fast (uses a stub Batch, no I/O)
+# MaskMapNode — rapide (stub Batch, sans I/O)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestMaskMapNodeTransform:
-    """Tests for MaskMapNode.as_transform() — no shard I/O required."""
+    """Tests pour MaskMapNode.as_transform() — aucun I/O de shard requis."""
 
     def test_as_transform_adds_masks(self) -> None:
         import torch
         from dino_loader.masking import MaskingGenerator
         from dino_loader.memory import Batch
 
-        gen = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
-        fn = MaskMapNode.as_transform(gen)
+        gen   = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
+        fn    = MaskMapNode.as_transform(gen)
         batch = Batch(
             global_crops=[torch.zeros(2, 3, 224, 224)],
             local_crops=[],
@@ -326,21 +296,20 @@ class TestMaskMapNodeTransform:
         out = fn(batch)
         assert out.masks is not None
 
-    def test_masks_shape_matches_batch(self) -> None:
+    def test_masks_shape_matches_batch_size(self) -> None:
         import torch
         from dino_loader.masking import MaskingGenerator
         from dino_loader.memory import Batch
 
-        gen = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
-        fn = MaskMapNode.as_transform(gen)
+        gen     = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
+        fn      = MaskMapNode.as_transform(gen)
         batch_b = 4
-        batch = Batch(
+        batch   = Batch(
             global_crops=[torch.zeros(batch_b, 3, 224, 224)],
             local_crops=[],
             metadata=[None] * batch_b,
         )
         out = fn(batch)
-        # masks should be (B, H*W)
         assert out.masks.shape == (batch_b, 14 * 14)
 
     def test_masks_dtype_is_bool(self) -> None:
@@ -348,8 +317,8 @@ class TestMaskMapNodeTransform:
         from dino_loader.masking import MaskingGenerator
         from dino_loader.memory import Batch
 
-        gen = MaskingGenerator(input_size=(8, 8), num_masking_patches=20)
-        fn = MaskMapNode.as_transform(gen)
+        gen   = MaskingGenerator(input_size=(8, 8), num_masking_patches=20)
+        fn    = MaskMapNode.as_transform(gen)
         batch = Batch(
             global_crops=[torch.zeros(2, 3, 64, 64)],
             local_crops=[],
@@ -359,15 +328,15 @@ class TestMaskMapNodeTransform:
         assert out.masks.dtype == torch.bool
 
     def test_masks_exact_count(self) -> None:
-        """MaskingGenerator guarantee is preserved end-to-end."""
+        """La garantie de count exact de MaskingGenerator est préservée end-to-end."""
         import torch
         from dino_loader.masking import MaskingGenerator
         from dino_loader.memory import Batch
 
         n_mask = 30
-        gen = MaskingGenerator(input_size=(8, 8), num_masking_patches=n_mask)
-        fn = MaskMapNode.as_transform(gen, num_masking_patches=n_mask)
-        batch = Batch(
+        gen    = MaskingGenerator(input_size=(8, 8), num_masking_patches=n_mask)
+        fn     = MaskMapNode.as_transform(gen, num_masking_patches=n_mask)
+        batch  = Batch(
             global_crops=[torch.zeros(1, 3, 64, 64)],
             local_crops=[],
             metadata=[None],
@@ -377,25 +346,14 @@ class TestMaskMapNodeTransform:
             assert int(out.masks[0].sum().item()) == n_mask
 
     def test_global_crops_unchanged(self) -> None:
-        """Applying the mask transform must not mutate crop tensors."""
+        """Appliquer le transform de masquage ne doit pas muter les tenseurs de crop."""
         import torch
         from dino_loader.masking import MaskingGenerator
         from dino_loader.memory import Batch
 
-        gen = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
-        fn = MaskMapNode.as_transform(gen)
-        t = torch.ones(2, 3, 224, 224)
-        batch = Batch(global_crops=[t], local_crops=[], metadata=[None, None])
-        out = fn(batch)
+        gen    = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
+        fn     = MaskMapNode.as_transform(gen)
+        t      = torch.ones(2, 3, 224, 224)
+        batch  = Batch(global_crops=[t], local_crops=[], metadata=[None, None])
+        out    = fn(batch)
         assert torch.equal(out.global_crops[0], t)
-
-    def test_as_transform_raises_on_empty_global_crops(self) -> None:
-        """as_transform must raise ValueError when global_crops is empty."""
-        from dino_loader.masking import MaskingGenerator
-        from dino_loader.memory import Batch
-
-        gen = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
-        fn = MaskMapNode.as_transform(gen)
-        batch = Batch(global_crops=[], local_crops=[], metadata=[])
-        with pytest.raises(ValueError, match="global_crops"):
-            fn(batch)

@@ -15,6 +15,10 @@ Implementation notes
 - ``heartbeat_ts`` is a Unix timestamp (seconds, c_int64) written by the loader
   on every batch.  The CLI uses it to distinguish a live-but-idle loader from a
   dead process.
+- ``self.data`` is a ctypes Structure overlaid on the shared-memory buffer via
+  ``from_buffer``.  This holds a reference into the mmap, so ``self.data``
+  must be set to ``None`` before ``shm.close()`` — otherwise Python raises
+  ``BufferError: cannot close exported pointers exist``.
 
 Fixes applied
 -------------
@@ -28,6 +32,8 @@ Fixes applied
             int→float truncation on c_int64 fields. set_float() is for the
             single c_float field (shard_cache_utilization_pct); inc() handles
             all integer counters.
+[FIX-CLOSE] self.data set to None before shm.close() to release the ctypes
+            from_buffer reference and avoid BufferError on Python 3.12.
 """
 
 import ctypes
@@ -125,6 +131,13 @@ class MetricsRegistry:
 
     The split between inc() and set_float() prevents silent float→int truncation
     when writing to c_int64 fields, and int→float precision loss on large counters.
+
+    Lifecycle note
+    --------------
+    ``self.data`` is a ctypes Structure overlaid on the shared-memory mmap via
+    ``from_buffer``.  It must be released (set to None) before ``shm.close()``
+    is called, otherwise CPython raises ``BufferError: cannot close exported
+    pointers exist``.  ``close()`` handles this automatically.
     """
 
     def __init__(
@@ -233,7 +246,16 @@ class MetricsRegistry:
         return self.data
 
     def close(self) -> None:
-        """Detach from shared memory (does not unlink the block)."""
+        """Detach from shared memory (does not unlink the block).
+
+        [FIX-CLOSE] Releases ``self.data`` (the ctypes from_buffer overlay)
+        before calling ``shm.close()``.  Without this, Python 3.12 raises
+        ``BufferError: cannot close exported pointers exist`` because the
+        ctypes structure holds a live reference into the mmap buffer.
+        """
+        if self.data is not None:
+            # Drop the ctypes overlay so the mmap has no exported pointers.
+            self.data = None
         if self.shm is not None:
             self.shm.close()
 

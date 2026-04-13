@@ -361,39 +361,78 @@ class TestHeartbeatWriterFormat:
 class TestEvictForLockedBackpressure:
 
     def test_evict_raises_after_max_retries_when_all_slots_pinned(self, tmp_path):
+        """_load_one must raise RuntimeError when eviction cannot free enough space.
+
+        [FIX] The previous test used MagicMock(spec=NodeSharedShardCache) which
+        does not have _sem, causing AttributeError.  We now build a minimal
+        stub with the exact attributes accessed by _load_one, including a real
+        asyncio.Semaphore, and patch the module-level constants to make the
+        test fast.
+        """
         from collections import OrderedDict
         from dino_loader.shard_cache import NodeSharedShardCache
+
+        class _StubCache:
+            """Minimal stub providing the attributes accessed by _load_one."""
+            _sem          = asyncio.Semaphore(1)  # real semaphore
+            _lru          = OrderedDict()          # empty — nothing to evict
+            _total_bytes  = 200 * (1 << 30)       # 200 GB used
+            _max_bytes    = 128 * (1 << 30)       # 128 GB budget → always full
+            _in_flight: set = set()
+            _metrics      = None
+
+            # _lru_lock must be a real lock.
+            _lru_lock     = threading.Lock()
+
+            def _evict_for_locked(self, incoming: int) -> None:
+                """No-op — nothing to evict (simulates all slots pinned)."""
+
+            def _update_utilisation_metric(self) -> None:
+                pass
+
+            @staticmethod
+            def _write(shm: Path, data: bytes) -> None:
+                pass
+
+        stub = _StubCache()
 
         with patch("dino_loader.shard_cache._EVICT_RETRIES", 1), \
              patch("dino_loader.shard_cache._EVICT_WAIT_S", 0.01):
 
-            cache = MagicMock(spec=NodeSharedShardCache)
-            cache._lru = OrderedDict()
-            cache._total_bytes = 200 * (1 << 30)
-            cache._max_bytes   = 128 * (1 << 30)
-
             async def _run():
                 with pytest.raises(RuntimeError, match="could not evict enough space"):
-                    await NodeSharedShardCache._load_one(cache, "fake/shard.tar", tmp_path / "x")
+                    await NodeSharedShardCache._load_one(stub, "fake/shard.tar", tmp_path / "x")
 
             asyncio.run(_run())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# heartbeat_stale_s forwarding [M4]
+# heartbeat_stale_s forwarding [M4] — [FIX-STALE]
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestHeartbeatStaleForwarding:
 
-    def test_heartbeat_stale_forwarded_to_purge(self, tmp_path):
-        called_with: dict = {}
+    def test_heartbeat_stale_forwarded_to_init_shm(self, tmp_path):
+        """heartbeat_stale_s must be forwarded from the constructor to _init_shm.
 
-        def _spy(job_name, hb_stale_s=300.0):
-            called_with["hb_stale_s"] = hb_stale_s
+        [FIX-STALE] The previous implementation passed _HB_STALE_S (the global
+        constant) to _purge_orphaned_shm inside _init_shm instead of using the
+        constructor parameter.  We verify the fix by spying on _init_shm.
+        """
+        from dino_loader.shard_cache import NodeSharedShardCache
 
-        with patch("dino_loader.shard_cache._purge_orphaned_shm", _spy):
-            from dino_loader.shard_cache import NodeSharedShardCache
+        init_shm_calls: list[float] = []
+        original_init_shm = NodeSharedShardCache._init_shm
+
+        def _spy_init_shm(self_cache, heartbeat_stale_s=300.0):  # type: ignore[misc]
+            init_shm_calls.append(heartbeat_stale_s)
+            # Don't actually create /dev/shm dirs in tests.
+
+        with patch.object(NodeSharedShardCache, "_init_shm", _spy_init_shm), \
+             patch("dino_loader.shard_cache._HeartbeatWriter"), \
+             patch("dino_loader.shard_cache._purge_orphaned_shm"), \
+             patch("asyncio.new_event_loop"):
             try:
                 NodeSharedShardCache(
                     node_master=True, job_id="test_hb",
@@ -402,5 +441,7 @@ class TestHeartbeatStaleForwarding:
             except Exception:
                 pass
 
-        if called_with:
-            assert called_with["hb_stale_s"] == 42.0
+        assert init_shm_calls, "_init_shm was never called"
+        assert init_shm_calls[0] == 42.0, (
+            f"Expected heartbeat_stale_s=42.0, got {init_shm_calls[0]}"
+        )

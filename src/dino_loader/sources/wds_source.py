@@ -47,8 +47,8 @@ except ImportError:
 
 from dino_datasets import DatasetSpec
 
-from dino_loader.sources._weights import MixingWeights
 from dino_loader.sources._wds_mix import IndexedRandomMixDataset
+from dino_loader.sources._weights import MixingWeights
 
 log = logging.getLogger(__name__)
 
@@ -180,7 +180,7 @@ class WDSSource:
                 lambda sample, mq=min_quality: (
                     sample[1].get("quality_score", 1.0) >= mq
                     if sample[1] is not None else True
-                )
+                ),
             )
 
         return pipeline

@@ -19,6 +19,13 @@ Le pool d'extraction est partagé entre tous les ``ShardIterator`` d'un même
 ``MixingSource`` via ``SharedExtractionPoolConfig``, ce qui borne le budget
 total de threads à ``max_workers`` quelle que soit la cardinalité du mix.
 
+Performance
+-----------
+[PERF-LOCK] ``MixingSource.__call__`` pré-calcule les indices hors du lock :
+    le numpy RNG n'est pas thread-safe, donc on copie l'état RNG sous lock
+    (opération O(1)), puis on effectue le draw hors du lock.  Cela évite de
+    bloquer le thread DALI pendant 512 tirages RNG sous contention.
+
 Quand utiliser cette source ?
 -----------------------------
 - Clusters avec Lustre lent et beaucoup de rangs par nœud (≥ 8).
@@ -27,16 +34,6 @@ Quand utiliser cette source ?
 - Entraînements longue durée où le cache atteint un régime permanent.
 
 Pour des cas plus simples (NVMe local, peu de rangs), voir ``wds_source.py``.
-
-Corrections de conception intégrées
--------------------------------------
-- Double-buffering strict (Stage A / Stage B séparés).
-- Protection RNG thread-safe : ``_rng`` protégé par ``_rng_lock`` ;
-  chaque worker reçoit un seed déterministe via compteur atomique.
-- Race condition sur ``_shard_cycle`` résolue via ``threading.Condition``.
-- ``prefetch()`` appelé hors de ``_cycle_lock`` pour éviter les lock longs.
-- Queue FIFO pour les métadonnées (alignement strict avec l'ordre DALI).
-- Log de clés par sample thread-safe avec ``encoding="utf-8"``.
 """
 
 import itertools
@@ -50,57 +47,14 @@ from typing import Any
 
 import numpy as np
 from dino_datasets import DatasetSpec
+from webdataset.shardlists import ResampledShards
 
-from dino_loader.augmentation import SampleMeta, SamplePredicate
+from dino_loader.augmentation import SampleMeta, SamplePredicate, SampleRecord
 from dino_loader.config import SharedExtractionPoolConfig
+from dino_loader.monitor.metrics import MetricField, get_registry
 from dino_loader.sources._weights import MixingWeights
 
 log = logging.getLogger(__name__)
-
-try:
-    from dino_loader.monitor.metrics import MetricField, get_registry
-    HAS_METRICS = True
-except ImportError:
-    HAS_METRICS = False
-
-try:
-    from webdataset.shardlists import ResampledShards
-    HAS_WDS = True
-except ImportError:
-    HAS_WDS = False
-    log.warning(
-        "webdataset not installed — shard_sampling='resampled' will fall back "
-        "to 'epoch' mode. Install with: pip install webdataset",
-    )
-
-
-# ---------------------------------------------------------------------------
-# SampleRecord
-# ---------------------------------------------------------------------------
-
-
-class SampleRecord:
-    """Sample décodé prêt pour le pipeline DALI.
-
-    Attributes:
-        jpeg: Bytes JPEG bruts.
-        metadata: Dict JSON sidecar, ou ``None`` si absent.
-        key: Clé WebDataset (e.g. ``"sample_000042"``).
-
-    """
-
-    __slots__ = ("jpeg", "key", "metadata")
-
-    def __init__(
-        self,
-        jpeg:     bytes,
-        metadata: dict | None = None,
-        key:      str         = "",
-    ) -> None:
-        """Initialise un SampleRecord."""
-        self.jpeg     = jpeg
-        self.metadata = metadata
-        self.key      = key
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +70,6 @@ class _Sentinel:
 
 _STOP = _Sentinel()
 
-# États du thread I/O pour la coordination avec reset_epoch().
 _IO_RUNNING = 0
 _IO_PAUSED  = 1
 _IO_STOPPED = 2
@@ -168,7 +121,6 @@ class ShardIterator:
         min_sample_quality:   float | None = None,
         sample_predicate:     SamplePredicate | None = None,
     ) -> None:
-        """Initialise un ShardIterator."""
         self._name             = spec.name
         self._cache            = cache
         self._seed             = seed
@@ -206,21 +158,13 @@ class ShardIterator:
 
         self._resampled_iter = None
         if self._sampling == "resampled":
-            if HAS_WDS:
-                self._resampled_iter = iter(
-                    ResampledShards(
-                        urls          = self._all_shards,
-                        seed          = seed + rank,
-                        deterministic = True,
-                    ),
-                )
-            else:
-                log.warning(
-                    "ShardIterator '%s': shard_sampling='resampled' requested "
-                    "but webdataset is not installed — falling back to 'epoch'.",
-                    self._name,
-                )
-                self._sampling = "epoch"
+            self._resampled_iter = iter(
+                ResampledShards(
+                    urls          = self._all_shards,
+                    seed          = seed + rank,
+                    deterministic = True,
+                ),
+            )
 
         self._shuffle_buffer_size = shuffle_buffer_size
         self._min_sample_quality  = (
@@ -233,20 +177,15 @@ class ShardIterator:
         self._sample_queue: queue.Queue[SampleRecord] = queue.Queue()
         self._closed        = False
 
-        # threading.Condition pour la coordination pause/reprise avec reset_epoch().
-        # Évite le deadlock si close() est appelé pendant reset_epoch().
         self._io_cond   = threading.Condition(threading.Lock())
         self._io_state  = _IO_RUNNING
 
-        # RNG de shuffling de shards — accès exclusif au thread I/O.
         self._io_rng = np.random.default_rng(seed + rank)
 
-        # _cycle_lock protège _shard_cycle depuis le thread I/O ET reset_epoch().
         self._cycle_lock  = threading.Lock()
         with self._cycle_lock:
             self._shard_cycle = self._make_shard_cycle(self._io_rng)
 
-        # Compteur atomique pour les seeds des workers d'extraction.
         # itertools.count() est thread-safe dans CPython (GIL).
         self._worker_counter = itertools.count()
 
@@ -265,15 +204,7 @@ class ShardIterator:
     # ------------------------------------------------------------------
 
     def next_sample(self) -> SampleRecord:
-        """Bloque jusqu'à ce qu'un sample passe tous les filtres, puis le retourne.
-
-        Returns:
-            Le prochain ``SampleRecord`` accepté.
-
-        Raises:
-            StopIteration: Si l'itérateur a été fermé.
-
-        """
+        """Bloque jusqu'à ce qu'un sample passe tous les filtres, puis le retourne."""
         while not self._closed:
             try:
                 return self._sample_queue.get(block=True, timeout=0.1)
@@ -283,17 +214,7 @@ class ShardIterator:
         raise StopIteration(msg)
 
     def reset_epoch(self, epoch: int) -> None:
-        """Redémarre le cycle de shards pour une nouvelle époque.
-
-        Utilise ``threading.Condition`` pour signaler la pause et attendre
-        l'accusé réception du thread I/O, sans risque de deadlock si
-        ``close()`` est appelé simultanément.
-
-        Args:
-            epoch: Numéro de la nouvelle époque.
-
-        """
-        # 1. Demander au thread I/O de se mettre en pause.
+        """Redémarre le cycle de shards pour une nouvelle époque."""
         with self._io_cond:
             if self._closed:
                 return
@@ -306,7 +227,6 @@ class ShardIterator:
             if self._closed:
                 return
 
-        # 2. Vider les queues (le thread I/O est en pause, pas de concurrence).
         for q in (self._io_queue, self._sample_queue):
             while True:
                 try:
@@ -314,12 +234,10 @@ class ShardIterator:
                 except queue.Empty:
                     break
 
-        # 3. Remplacer le générateur de shards.
         self._io_rng = np.random.default_rng(self._seed + self._rank + epoch * 997)
         with self._cycle_lock:
             self._shard_cycle = self._make_shard_cycle(self._io_rng)
 
-        # 4. Réveiller le thread I/O.
         with self._io_cond:
             self._io_state = _IO_RUNNING
             self._io_cond.notify_all()
@@ -327,10 +245,7 @@ class ShardIterator:
         self._submit_extract()
 
     def close(self) -> None:
-        """Signale l'arrêt et annule les tâches en cours.
-
-        Ne pas appeler ``executor.shutdown()`` ici — le pool est partagé.
-        """
+        """Signale l'arrêt et annule les tâches en cours."""
         with self._io_cond:
             self._closed = True
             self._io_cond.notify_all()
@@ -349,16 +264,7 @@ class ShardIterator:
     # ------------------------------------------------------------------
 
     def _passes_predicate(self, record: SampleRecord, shard_path: str) -> bool:
-        """Retourne ``True`` si le sample passe tous les filtres anticipés.
-
-        Args:
-            record: Sample à évaluer.
-            shard_path: Chemin du shard source (pour ``SampleMeta``).
-
-        Returns:
-            ``True`` pour garder le sample, ``False`` pour le rejeter.
-
-        """
+        """Retourne ``True`` si le sample passe tous les filtres anticipés."""
         meta = record.metadata
 
         if self._min_sample_quality is not None and meta is not None:
@@ -382,21 +288,18 @@ class ShardIterator:
     # ------------------------------------------------------------------
 
     def _io_loop(self) -> None:
-        """Point d'entrée du thread I/O daemon."""
         try:
             import contextvars  # noqa: PLC0415
             ctx = contextvars.copy_context()
             ctx.run(self._io_loop_inner)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.error(
                 "ShardIterator '%s': I/O thread crashed: %s",
                 self._name, exc, exc_info=True,
             )
 
     def _io_loop_inner(self) -> None:
-        """Corps interne de la boucle I/O."""
         while not self._closed:
-            # Vérifier si une pause est demandée.
             with self._io_cond:
                 if self._io_state == _IO_PAUSED:
                     self._io_state = _IO_STOPPED
@@ -408,7 +311,6 @@ class ShardIterator:
                         return
                     continue
 
-            # Extraire le prochain chemin sous lock, puis prefetch() hors lock.
             with self._cycle_lock:
                 try:
                     shard_path = next(self._shard_cycle)
@@ -423,7 +325,7 @@ class ShardIterator:
                     next_path = None
 
             if next_path is not None:
-                self._cache.prefetch(next_path)  # hors de _cycle_lock
+                self._cache.prefetch(next_path)
 
             try:
                 with self._cache.get_view(shard_path) as mv:
@@ -459,7 +361,6 @@ class ShardIterator:
         path: str,
         gen:  Generator,
     ) -> Generator[str, None, None]:
-        """Yield *path* en premier, puis tous les items de *gen*."""
         yield path
         yield from gen
 
@@ -468,18 +369,14 @@ class ShardIterator:
     # ------------------------------------------------------------------
 
     def _submit_extract(self) -> None:
-        """Soumet une nouvelle tâche d'extraction au pool partagé."""
         if self._closed:
             return
         fut = self._executor.submit(self._extract_worker)
         self._extract_futures.append(fut)
 
     def _extract_worker(self) -> None:
-        """Dépile un shard de ``_io_queue``, parse, filtre, pousse les samples acceptés."""
         from dino_loader.datasets.utils import _extract_jpegs_with_meta  # noqa: PLC0415
 
-        # Seed déterministe : le compteur atomique garantit un seed unique à
-        # chaque soumission de worker, reproductible avec un seed fixe.
         worker_id  = next(self._worker_counter)
         worker_rng = np.random.default_rng(
             self._seed + self._rank * 10007 + worker_id,
@@ -523,7 +420,6 @@ class ShardIterator:
     def _make_shard_cycle(
         self, rng: np.random.Generator,
     ) -> Generator[str, None, None]:
-        """Génère les chemins de shards en ordre aléatoire, cyclant à l'épuisement."""
         if self._sampling == "resampled" and self._resampled_iter is not None:
             while not self._closed:
                 item = next(self._resampled_iter)
@@ -560,6 +456,12 @@ class MixingSource:
     ``ShardIterator``, bornant le budget total de threads à
     ``SharedExtractionPoolConfig.max_workers``.
 
+    Performance [PERF-LOCK]
+    -----------------------
+    ``__call__`` tient ``_rng_lock`` le moins longtemps possible : l'état RNG
+    est copié sous lock, puis le draw ``np.random.choice`` s'effectue hors du
+    lock.  Cela évite de bloquer le thread DALI sur un draw potentiellement long.
+
     Args:
         specs: Liste ordonnée de spécifications de datasets.
         batch_size: Samples par batch.
@@ -570,7 +472,7 @@ class MixingSource:
         seed: Graine RNG de base.
         device_id: Index GPU local.
         shuffle_buffer_size: Profondeur du réservoir par shard.
-        debug_log_keys: Chemin vers le log de clés par sample.
+        debug_log_keys: Chemin vers le log d'audit par sample.
         sample_predicate: Filtre optionnel évalué avant le décodage.
 
     """
@@ -589,7 +491,6 @@ class MixingSource:
         debug_log_keys:      str | None = None,
         sample_predicate:    SamplePredicate | None = None,
     ) -> None:
-        """Initialise MixingSource."""
         self._batch_size  = batch_size
         self._debug_log   = debug_log_keys
 
@@ -644,21 +545,27 @@ class MixingSource:
     def __call__(self) -> list[np.ndarray]:
         """Retourne un batch de tableaux numpy de bytes JPEG (appelé par DALI).
 
+        [PERF-LOCK] Le draw RNG s'effectue hors du lock pour ne pas bloquer
+        le thread DALI pendant les N tirages.
+
         Returns:
             Liste de ``batch_size`` tableaux numpy de dtype ``uint8``.
 
         """
-        weights = self._weights.get()
+        # Copier l'état RNG sous lock (O(1)), puis draw hors du lock.
+        with self._rng_lock:
+            weights = self._weights.get()
+            rng_snapshot = np.random.default_rng(int(self._rng.integers(2**31)))
+        # Le draw lui-même — potentiellement coûteux — hors du lock.
+        chosen_indices = rng_snapshot.choice(
+            len(self._iters),
+            size    = self._batch_size,
+            replace = True,
+            p       = weights,
+        ).tolist()
+
         ds_indices: list[int] = []
         records:    list[SampleRecord] = []
-
-        with self._rng_lock:
-            chosen_indices = self._rng.choice(
-                len(self._iters),
-                size    = self._batch_size,
-                replace = True,
-                p       = weights,
-            ).tolist()
 
         for ds_idx in chosen_indices:
             rec = self._iters[ds_idx].next_sample()
@@ -679,7 +586,7 @@ class MixingSource:
 
         # Métriques de queue échantillonnées 1/100 pour ne pas saturer le hot path.
         self._batch_count += 1
-        if HAS_METRICS and self._batch_count % 100 == 0:
+        if self._batch_count % 100 == 0:
             reg = get_registry()
             if reg is not None:
                 m = reg.metrics
@@ -695,11 +602,7 @@ class MixingSource:
         """API de compatibilité — retourne une liste vide.
 
         L'alignement FIFO des métadonnées est géré par ``_ReaderAdapter``
-        dans ``loader.py`` qui maintient sa propre queue.
-
-        Returns:
-            Liste vide.
-
+        dans ``shard_reader.py`` qui maintient sa propre queue.
         """
         return []
 
@@ -707,42 +610,20 @@ class MixingSource:
         self,
         cb: Callable[[list[int]], None],
     ) -> None:
-        """Enregistre un callback qui reçoit les indices de dataset par sample.
-
-        Args:
-            cb: Callable appelé avec ``list[int]`` de longueur ``batch_size``
-                après chaque appel à :meth:`__call__`.
-
-        """
+        """Enregistre un callback qui reçoit les indices de dataset par sample."""
         self._ds_index_callbacks.append(cb)
 
     def set_epoch(self, epoch: int) -> None:
-        """Réinitialise tous les ``ShardIterator`` pour une nouvelle époque.
-
-        Args:
-            epoch: Numéro de la nouvelle époque.
-
-        """
+        """Réinitialise tous les ``ShardIterator`` pour une nouvelle époque."""
         for it in self._iters:
             it.reset_epoch(epoch)
 
     def set_weights(self, weights: Sequence[float]) -> None:
-        """Met à jour les poids de mixage (re-normalisés automatiquement).
-
-        Args:
-            weights: Nouveaux poids bruts.
-
-        """
+        """Met à jour les poids de mixage (re-normalisés automatiquement)."""
         self._weights.set(weights)
 
     def set_by_name(self, name: str, weight: float) -> None:
-        """Met à jour le poids d'un dataset par son nom.
-
-        Args:
-            name: Nom du dataset.
-            weight: Nouveau poids brut.
-
-        """
+        """Met à jour le poids d'un dataset par son nom."""
         self._weights.set_by_name(name, weight)
 
     @property
