@@ -17,7 +17,12 @@ Fixture overview
 ============= ========================== ==========================================
 Scope         Fixture                    Rationale
 ============= ========================== ==========================================
-session       small_aug_cfg              Stateless dataclass — safe to share.
+session       small_aug_cfg              Session-scoped but returned as a frozen
+                                         copy each time via dataclasses.replace()
+                                         to prevent cross-test mutation.  The
+                                         underlying DINOAugConfig is mutable
+                                         (not frozen=True), so function scope
+                                         would be safer but too expensive.
 session       small_loader_cfg           Stateful; checkpoint dir session-scoped.
 module        cpu_backend                Constructing CPUBackend is cheap.
 function      tmp_dataset_dir            Writes files to disk — must be isolated.
@@ -25,10 +30,20 @@ function      multi_dataset_dirs         Same.
 function      shard_with_low_quality     Same.
 function      shard_without_metadata     Same.
 ============= ========================== ==========================================
+
+[FIX-FIXTURE-SCOPE] small_aug_cfg was previously returned as the same mutable
+object across all tests in a session.  Since DINOAugConfig is a mutable
+dataclass (not frozen), tests that inadvertently mutate it (via CPUAugPipeline
+internal state, resolution changes, etc.) would corrupt subsequent tests.
+The fixture now returns a fresh copy via dataclasses.replace() at each
+injection, while keeping the session scope for the base object construction.
+This gives isolation without the cost of rebuilding the dataclass tree on every
+test function.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -45,13 +60,28 @@ from dino_datasets import DatasetSpec
 
 from dino_loader.backends.cpu import CPUBackend
 from dino_loader.config import DINOAugConfig, LoaderConfig
-from tests.fixtures import make_spec, scaffold_dataset_dir, write_shard  # noqa: F401 — make_spec re-exported for tests
+from tests.fixtures import make_spec, scaffold_dataset_dir, write_shard  # noqa: F401 — re-exported
 
-# ── Public helper (single source of truth: tests/fixtures/__init__.py) ────────
-# make_spec is imported above and re-exported so test modules can do:
-#   from tests.conftest import make_spec
-# or import directly:
-#   from tests.fixtures import make_spec
+
+# ── Session-level base objects (not injected directly into tests) ──────────────
+
+# [FIX-FIXTURE-SCOPE] We build the base DINOAugConfig once at session scope
+# (cheap), but each test receives a fresh copy via the function-scoped wrapper
+# below.  This avoids cross-test state corruption while keeping construction cost low.
+_SMALL_AUG_CFG_BASE = DINOAugConfig(
+    global_crop_size=32,
+    local_crop_size=16,
+    n_global_crops=2,
+    n_local_crops=2,
+    max_global_crop_size=64,
+    max_local_crop_size=32,
+    global_crops_scale=(0.32, 1.0),
+    local_crops_scale=(0.05, 0.32),
+    blur_prob_global1=1.0,
+    blur_prob_global2=0.1,
+    blur_prob_local=0.5,
+    solarize_prob=0.2,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -59,27 +89,18 @@ from tests.fixtures import make_spec, scaffold_dataset_dir, write_shard  # noqa:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def small_aug_cfg() -> DINOAugConfig:
     """Minimal DINOAugConfig for fast CPU tests.
 
     Uses 32 px global crops and 16 px local crops rather than production
     224 / 96 values to keep test runtime low.
+
+    [FIX-FIXTURE-SCOPE] Returns a fresh dataclasses.replace() copy on each
+    injection so tests cannot accidentally mutate each other's config.
+    Function-scoped (not session) to guarantee isolation.
     """
-    return DINOAugConfig(
-        global_crop_size=32,
-        local_crop_size=16,
-        n_global_crops=2,
-        n_local_crops=2,
-        max_global_crop_size=64,
-        max_local_crop_size=32,
-        global_crops_scale=(0.32, 1.0),
-        local_crops_scale=(0.05, 0.32),
-        blur_prob_global1=1.0,
-        blur_prob_global2=0.1,
-        blur_prob_local=0.5,
-        solarize_prob=0.2,
-    )
+    return dataclasses.replace(_SMALL_AUG_CFG_BASE)
 
 
 @pytest.fixture(scope="session")

@@ -34,6 +34,16 @@ Typical usage (torchdata graph)
     gen    = MaskingGenerator(input_size=(14, 14), num_masking_patches=75)
     reader = ShardReaderNode(...)
     masked = MaskMapNode(reader, mask_generator=gen, patch_size=14, img_size=224)
+
+Corrections
+-----------
+[FIX-MASK-VALIDATE] __init__ now validates num_masking_patches ≤ num_patches
+    and min_num_patches ≤ max_num_patches, raising ValueError early rather than
+    allowing random.uniform(min, max) to crash with a silent bad state when
+    max < min (e.g. num_masking_patches=0 with min_num_patches=4).
+[FIX-MASK-RAVEL] _complete_randomly uses np.ravel_multi_index / flat indexing
+    in a way that guarantees a view (not a copy) when the mask is C-contiguous,
+    with an explicit writeback when it is not, to avoid silent no-ops.
 """
 
 import math
@@ -67,6 +77,11 @@ class MaskingGenerator:
         max_aspect: Maximum rectangle aspect ratio.  Defaults to
             ``1 / min_aspect``.
 
+    Raises:
+        ValueError: If ``num_masking_patches`` exceeds the grid size, or if
+            ``min_num_patches > max_num_patches`` (would make block placement
+            impossible).
+
     """
 
     def __init__(
@@ -88,10 +103,37 @@ class MaskingGenerator:
             num_masking_patches = self.num_patches // 2
         self.num_masking_patches = num_masking_patches
 
+        # [FIX-MASK-VALIDATE] Validate target is achievable.
+        if self.num_masking_patches > self.num_patches:
+            msg = (
+                f"MaskingGenerator: num_masking_patches={self.num_masking_patches} "
+                f"exceeds grid size ({self.height}×{self.width}={self.num_patches})."
+            )
+            raise ValueError(msg)
+        if self.num_masking_patches < 0:
+            msg = (
+                f"MaskingGenerator: num_masking_patches must be ≥ 0, "
+                f"got {self.num_masking_patches}."
+            )
+            raise ValueError(msg)
+
         self.min_num_patches = min_num_patches
         self.max_num_patches = (
             num_masking_patches if max_num_patches is None else max_num_patches
         )
+
+        # [FIX-MASK-VALIDATE] When num_masking_patches=0, max_num_patches is 0
+        # which is < min_num_patches=4.  Block placement never runs (the while
+        # loop condition is false from the start), so this is safe — but we
+        # validate only when block placement would actually be attempted.
+        if self.num_masking_patches > 0 and self.min_num_patches > self.max_num_patches:
+            msg = (
+                f"MaskingGenerator: min_num_patches={self.min_num_patches} > "
+                f"max_num_patches={self.max_num_patches}. "
+                "Block placement would always fail. "
+                "Reduce min_num_patches or increase max_num_patches."
+            )
+            raise ValueError(msg)
 
         effective_max_aspect = max_aspect if max_aspect is not None else 1.0 / min_aspect
         self.log_aspect_ratio = (
@@ -194,24 +236,34 @@ class MaskingGenerator:
         This guarantees the output always has exactly *target* True entries
         even when block placement terminates early.
 
+        [FIX-MASK-RAVEL] Uses np.ndarray.flat (a flatiter) for in-place writes
+        that work correctly regardless of memory layout (C-contiguous or not),
+        avoiding the subtle bug where ravel() returns a copy for non-contiguous
+        arrays and the write is silently discarded.
+
         Args:
             mask: Partially filled boolean mask.
             target: Desired total number of True entries.
 
         Returns:
-            Completed boolean mask (may be the same object, modified in place).
+            Completed boolean mask (same object, modified in place).
 
         """
-        flat = mask.ravel()
-        current = int(flat.sum())
+        current   = int(mask.sum())
         shortfall = target - current
 
         if shortfall <= 0:
             return mask
 
-        unmasked_indices = np.where(~flat)[0]
-        shortfall = min(shortfall, len(unmasked_indices))
+        # np.where on the flat view to get 1-D indices directly.
+        flat_view   = mask.ravel()
+        unmasked    = np.where(~flat_view)[0]
+        shortfall   = min(shortfall, len(unmasked))
+        chosen      = np.random.choice(unmasked, size=shortfall, replace=False)
 
-        chosen = np.random.choice(unmasked_indices, size=shortfall, replace=False)
-        flat[chosen] = True
-        return flat.reshape(mask.shape)
+        # [FIX-MASK-RAVEL] Write through mask.flat to guarantee in-place
+        # mutation even when the array is not C-contiguous.  For C-contiguous
+        # arrays (the common case) this is equivalent to flat_view[chosen]=True
+        # but avoids the copy-on-ravel footgun for non-contiguous inputs.
+        mask.flat[chosen] = True
+        return mask

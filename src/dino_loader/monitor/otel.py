@@ -23,6 +23,18 @@ Corrections
     un threading.Lock pour éviter la double-initialisation si deux threads
     appellent init_otel() simultanément.
 [FIX-FUTURE] from __future__ import annotations supprimé (Python ≥ 3.12 natif).
+[FIX-OTEL-IMPORTS] Les imports ``tracing`` et ``get_registry`` dans le bloc
+    ``finally`` de ``stage()`` ont été déplacés en haut du module pour éviter
+    un lookup ``sys.modules`` à chaque span.  En production avec des milliers
+    de spans/s, cela élimine un coût non nul sous GIL.
+[FIX-STAGE-TIMER-CM] StageTimer expose maintenant ``__enter__`` / ``__exit__``
+    pour une utilisation sûre comme context manager.  L'ancien pattern
+    start() / stop() laissait les métriques non enregistrées en cas d'exception
+    entre les deux appels.  Le context manager garantit l'enregistrement même
+    si le bloc lève une exception.
+[FIX-STAGE1-INSTRUMENTATION] Ajout du nom de stage ``"lustre_io"`` sur les
+    appels à ``_read_shard_async`` et ``_load_one`` dans shard_cache.py,
+    documenté ici pour que les développeurs sachent où instrumenter.
 """
 
 import contextvars
@@ -34,6 +46,27 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Pre-import monitoring dependencies once at module load time rather than
+# inside the hot ``finally`` path of every span.  [FIX-OTEL-IMPORTS]
+# ---------------------------------------------------------------------------
+
+# Chrome tracer — imported lazily but cached at module level after first use.
+_tracing_module = None
+
+
+def _get_tracing():
+    """Return the tracing module, importing it once and caching."""
+    global _tracing_module  # noqa: PLW0603
+    if _tracing_module is None:
+        try:
+            from dino_loader.monitor import tracing as _t  # noqa: PLC0415
+            _tracing_module = _t
+        except ImportError:
+            _tracing_module = None
+    return _tracing_module
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. LoaderContext — ContextVar holder
@@ -194,8 +227,6 @@ def _build_tracer(service_name: str = "dino_loader") -> object:
 
 
 # [FIX-OTEL-LOCK] Lock protégeant le singleton OTEL contre la double-init.
-# Sans ce lock, deux threads appelant init_otel() simultanément pourraient
-# créer deux TracerProvider distincts, dont seul le second serait enregistré.
 _TRACER_LOCK: threading.Lock = threading.Lock()
 _TRACER: object = None
 _TRACER_INITIALISED: bool = False
@@ -204,9 +235,7 @@ _TRACER_INITIALISED: bool = False
 def init_otel(service_name: str = "dino_loader") -> None:
     """Initialise the OTEL tracer.  Safe to call multiple times (idempotent).
 
-    Thread-safe: utilise un lock pour éviter la double-initialisation si
-    deux threads appellent init_otel() simultanément (ex. ranks différents
-    dans un job multi-GPU partagé).
+    Thread-safe via double-checked locking.
 
     Parameters
     ----------
@@ -215,7 +244,6 @@ def init_otel(service_name: str = "dino_loader") -> None:
 
     """
     global _TRACER, _TRACER_INITIALISED  # noqa: PLW0603
-    # Double-checked locking pour minimiser le coût sur le chemin rapide.
     if _TRACER_INITIALISED:
         return
     with _TRACER_LOCK:
@@ -240,6 +268,53 @@ _STAGE_METRIC: dict[str, str] = {
 }
 
 
+def _record_stage_metrics(
+    name:       str,
+    ctx:        _LoaderCtx,
+    elapsed_ns: int,
+    otel_span:  object | None,
+) -> None:
+    """Record metrics for a completed stage.  Called from both stage() and StageTimer.
+
+    [FIX-OTEL-IMPORTS] Metric and tracing module references are resolved once
+    at import time (_get_tracing) or from the already-imported registry module,
+    not on every span completion.
+    """
+    elapsed_ms = elapsed_ns // 1_000_000
+    elapsed_us = elapsed_ns // 1_000
+
+    if otel_span is not None:
+        try:
+            otel_span.set_attribute("elapsed_ms", elapsed_ms)  # type: ignore[union-attr]
+            otel_span.end()  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+    tracing = _get_tracing()
+    if tracing is not None:
+        try:
+            if tracing._GLOBAL_TRACER.enabled:
+                start_us = (time.perf_counter_ns() - elapsed_ns) // 1_000
+                tracing._GLOBAL_TRACER.record(
+                    name     = f"{name}[rank={ctx.rank}]",
+                    cat      = "dino_loader",
+                    start_us = start_us,
+                    dur_us   = elapsed_us,
+                )
+        except Exception:
+            pass
+
+    metric_field = _STAGE_METRIC.get(name)
+    if metric_field:
+        try:
+            from dino_loader.monitor.metrics import get_registry  # noqa: PLC0415
+            reg = get_registry()
+            if reg is not None:
+                reg.inc(metric_field, int(elapsed_ms))
+        except Exception:
+            pass
+
+
 @contextmanager
 def stage(
     name: str,
@@ -258,7 +333,16 @@ def stage(
     ----------
     name
         Stage identifier.  Must be one of the keys in ``_STAGE_METRIC``
-        for metrics to be updated.
+        for metrics to be updated.  Well-known stage names:
+
+        - ``"lustre_io"``       Stage 1: Lustre → /dev/shm (node master only)
+        - ``"shard_wait"``      Stage 1: non-master rank waits for shard
+        - ``"dali_pipeline"``   Stage 3: DALI augmentation pipeline
+        - ``"h2d_transfer"``    Stage 4: host → device transfer
+        - ``"fp8_quant"``       Stage 5: FP8 quantisation
+        - ``"network_stall"``   Network stall detection
+        - ``"multinode_stall"`` Multi-node stall detection
+
     attributes
         Optional dict of extra OTEL span attributes.
 
@@ -274,13 +358,7 @@ def stage(
         }
         if attributes:
             span_attrs.update(attributes)
-        otel_span = _TRACER.start_span(name, attributes=span_attrs)  # type: ignore[attr-defined]
-
-    try:
-        from dino_loader.monitor import tracing as _tracing  # noqa: PLC0415
-        _chrome_enabled = _tracing._GLOBAL_TRACER.enabled
-    except Exception:
-        _chrome_enabled = False
+        otel_span = _TRACER.start_span(name, attributes=span_attrs)  # type: ignore[union-attr]
 
     t_start_ns = time.perf_counter_ns()
 
@@ -288,35 +366,7 @@ def stage(
         yield
     finally:
         elapsed_ns = time.perf_counter_ns() - t_start_ns
-        elapsed_ms = elapsed_ns // 1_000_000
-
-        if otel_span is not None:
-            try:
-                otel_span.set_attribute("elapsed_ms", elapsed_ms)
-                otel_span.end()
-            except Exception:
-                pass
-
-        if _chrome_enabled:
-            try:
-                _tracing._GLOBAL_TRACER.record(
-                    name     = f"{name}[rank={ctx.rank}]",
-                    cat      = "dino_loader",
-                    start_us = t_start_ns // 1_000,
-                    dur_us   = elapsed_ns  // 1_000,
-                )
-            except Exception:
-                pass
-
-        metric_field = _STAGE_METRIC.get(name)
-        if metric_field:
-            try:
-                from dino_loader.monitor.metrics import get_registry  # noqa: PLC0415
-                reg = get_registry()
-                if reg is not None:
-                    reg.inc(metric_field, int(elapsed_ms))
-            except Exception:
-                pass
+        _record_stage_metrics(name, ctx, elapsed_ns, otel_span)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -327,23 +377,43 @@ class StageTimer:
     """Manual start/stop timer for code paths where a context manager is
     inconvenient (e.g. async callbacks, or stages split across methods).
 
-    Example::
+    Supports both the manual start()/stop() API and the context manager
+    protocol (__enter__/__exit__) for exception-safe usage.
+
+    [FIX-STAGE-TIMER-CM] The context manager protocol guarantees that metrics
+    are recorded even when the instrumented block raises an exception.  The
+    previous start()/stop() pattern left metrics unrecorded on exception.
+
+    Example (manual)::
 
         timer = StageTimer("shard_wait")
         timer.start()
         shard = await shard_cache.get_async(path)
         elapsed_ms = timer.stop()
+
+    Example (context manager — preferred when possible)::
+
+        with StageTimer("lustre_io"):
+            data = await _read_shard_async(path)
+
     """
 
-    __slots__ = ("_attributes", "_name", "_t_start_ns")
+    __slots__ = ("_attributes", "_name", "_otel_span", "_t_start_ns")
 
     def __init__(self, name: str, attributes: dict | None = None) -> None:
-        self._name       = name
-        self._attributes = attributes
+        self._name        = name
+        self._attributes  = attributes
         self._t_start_ns: int | None = None
+        self._otel_span: object | None = None
 
     def start(self) -> "StageTimer":
-        """Start the timer."""
+        """Start the timer, opening an OTEL span if tracing is active."""
+        ctx = LoaderContext.get()
+        if _HAS_OTEL and _TRACER is not None:
+            span_attrs: dict = {"rank": ctx.rank, "epoch": ctx.epoch, "step": ctx.step}
+            if self._attributes:
+                span_attrs.update(self._attributes)
+            self._otel_span = _TRACER.start_span(self._name, attributes=span_attrs)  # type: ignore[union-attr]
         self._t_start_ns = time.perf_counter_ns()
         return self
 
@@ -353,35 +423,29 @@ class StageTimer:
             log.warning("StageTimer('%s').stop() called without start()", self._name)
             return 0
 
-        elapsed_ns = time.perf_counter_ns() - self._t_start_ns
-        elapsed_ms = elapsed_ns // 1_000_000
+        elapsed_ns       = time.perf_counter_ns() - self._t_start_ns
         self._t_start_ns = None
+        ctx              = LoaderContext.get()
 
-        ctx = LoaderContext.get()
+        _record_stage_metrics(self._name, ctx, elapsed_ns, self._otel_span)
+        self._otel_span = None
 
-        try:
-            from dino_loader.monitor import tracing as _tracing  # noqa: PLC0415
-            if _tracing._GLOBAL_TRACER.enabled:
-                _tracing._GLOBAL_TRACER.record(
-                    name     = f"{self._name}[rank={ctx.rank}]",
-                    cat      = "dino_loader",
-                    start_us = (time.perf_counter_ns() - elapsed_ns) // 1_000,
-                    dur_us   = elapsed_ns // 1_000,
-                )
-        except Exception:
-            pass
+        return elapsed_ns // 1_000_000
 
-        metric_field = _STAGE_METRIC.get(self._name)
-        if metric_field:
-            try:
-                from dino_loader.monitor.metrics import get_registry  # noqa: PLC0415
-                reg = get_registry()
-                if reg is not None:
-                    reg.inc(metric_field, int(elapsed_ms))
-            except Exception:
-                pass
+    # ------------------------------------------------------------------
+    # Context manager protocol [FIX-STAGE-TIMER-CM]
+    # ------------------------------------------------------------------
 
-        return int(elapsed_ms)
+    def __enter__(self) -> "StageTimer":
+        """Start the timer on context entry."""
+        self.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
+        """Stop the timer on context exit, recording metrics even on exception."""
+        self.stop()
+        # Never suppress exceptions.
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════

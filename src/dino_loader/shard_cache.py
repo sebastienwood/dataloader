@@ -43,6 +43,14 @@ Corrections
              écraser, évitant les deadlocks NCCL à la terminaison.
 [FIX-STALE] heartbeat_stale_s transmis à _init_shm/_purge_orphaned_shm
             (était ignoré : _init_shm utilisait la constante _HB_STALE_S).
+[FIX-MMAP-REFS] _MmapPool.invalidate() différé : les entrées avec refs > 0
+             sont marquées "à invalider" et fermées seulement quand tous les
+             lecteurs ont appelé release(), évitant une SIGBUS sur mmap actif.
+[FIX-INOTIFY-PRECHECK] _inotify_wait vérifie _is_ready() avant d'installer
+             le watch, éliminant la race condition si le rename s'est produit
+             avant add_watch.
+[FIX-HB-PID-CACHE] _HeartbeatWriter met le PID en cache dans __init__ pour
+             éviter un appel système os.getpid() à chaque battement.
 [PERF-1]    No fsync on tmpfs.
 [PERF-2]    Persistent mmap pool.
 [LOG-1]     INFO→DEBUG demotion for per-shard logs.
@@ -97,17 +105,26 @@ _INOTIFY_AVAILABLE: bool = True
 
 
 class _MmapEntry:
-    __slots__ = ("data_len", "fd", "mm", "refs")
+    __slots__ = ("data_len", "fd", "mm", "refs", "pending_invalidate")
 
     def __init__(self, fd: int, mm: mmap.mmap, data_len: int) -> None:
-        self.fd       = fd
-        self.mm       = mm
-        self.data_len = data_len
-        self.refs     = 0
+        self.fd                = fd
+        self.mm                = mm
+        self.data_len          = data_len
+        self.refs              = 0
+        # [FIX-MMAP-REFS] Marked True when eviction wants to close this entry
+        # but active readers still hold references.  The last release() call
+        # will close the entry instead.
+        self.pending_invalidate: bool = False
 
 
 class _MmapPool:
-    """Thread-safe pool of persistent memory-mapped shard files."""
+    """Thread-safe pool of persistent memory-mapped shard files.
+
+    [FIX-MMAP-REFS] invalidate() now defers the actual close when refs > 0,
+    setting a pending_invalidate flag instead.  The final release() call closes
+    the entry, preventing SIGBUS on active mmap consumers.
+    """
 
     def __init__(self, max_entries: int = _MMAP_POOL_MAX) -> None:
         self._max   = max_entries
@@ -134,28 +151,58 @@ class _MmapPool:
                     raise RuntimeError(
                         f"Shard {path} has corrupt header (magic={magic:#x})",
                     )
-                entry      = _MmapEntry(fd, mm, data_len)
-                entry.refs = 1
-                self._pool[key] = entry
+                entry                    = _MmapEntry(fd, mm, data_len)
+                entry.refs               = 1
+                self._pool[key]          = entry
                 return entry
             except Exception:
                 os.close(fd)
                 raise
 
     def release(self, path: Path) -> None:
-        """Decrement the reference count for *path*."""
+        """Decrement the reference count for *path*.
+
+        [FIX-MMAP-REFS] If the entry has been marked for deferred invalidation
+        and this is the last reference, close it now.
+        """
         key = str(path)
+        entry_to_close: _MmapEntry | None = None
         with self._lock:
-            if key in self._pool:
-                self._pool[key].refs = max(0, self._pool[key].refs - 1)
+            if key not in self._pool:
+                return
+            entry      = self._pool[key]
+            entry.refs = max(0, entry.refs - 1)
+            if entry.refs == 0 and entry.pending_invalidate:
+                del self._pool[key]
+                entry_to_close = entry
+        if entry_to_close is not None:
+            self._close_entry(entry_to_close)
 
     def invalidate(self, path: Path) -> None:
-        """Remove *path* from the pool and close its file descriptors."""
+        """Remove *path* from the pool and close its file descriptors.
+
+        [FIX-MMAP-REFS] If active readers hold references (refs > 0), defer
+        the close by setting pending_invalidate=True.  The last release() call
+        will perform the actual close, preventing SIGBUS on active mmaps.
+        """
         key = str(path)
+        entry_to_close: _MmapEntry | None = None
         with self._lock:
-            entry = self._pool.pop(key, None)
-        if entry is not None:
-            self._close_entry(entry)
+            entry = self._pool.get(key)
+            if entry is None:
+                return
+            if entry.refs > 0:
+                # Deferred: mark for close but keep in pool so release() finds it.
+                entry.pending_invalidate = True
+                log.debug(
+                    "_MmapPool.invalidate: deferred close for %s (refs=%d)",
+                    path, entry.refs,
+                )
+            else:
+                del self._pool[key]
+                entry_to_close = entry
+        if entry_to_close is not None:
+            self._close_entry(entry_to_close)
 
     def close_all(self) -> None:
         """Close all entries in the pool."""
@@ -166,11 +213,11 @@ class _MmapPool:
             self._close_entry(entry)
 
     def _evict_unreferenced(self) -> None:
-        """Evict LRU entries with ref==0. Caller holds lock."""
+        """Evict LRU entries with ref==0 and no pending_invalidate. Caller holds lock."""
         while len(self._pool) >= self._max:
             evicted = False
             for key, entry in self._pool.items():
-                if entry.refs == 0:
+                if entry.refs == 0 and not entry.pending_invalidate:
                     del self._pool[key]
                     self._close_entry(entry)
                     evicted = True
@@ -193,24 +240,29 @@ class _HeartbeatWriter:
     [FIX-HB] File content is "pid:job_id" rather than just PID. OS PID
     recycling cannot cause a live unrelated process to be mistaken for a
     live dataloader heartbeat when both PID and job_id must match.
+
+    [FIX-HB-PID-CACHE] PID is cached at construction time to avoid an
+    os.getpid() syscall on every heartbeat tick.
     """
 
     def __init__(self, hb_path: Path, job_id: str) -> None:
-        self._path   = hb_path
-        self._job_id = job_id
-        self._stop   = threading.Event()
+        self._path    = hb_path
+        self._job_id  = job_id
+        self._stop    = threading.Event()
+        # [FIX-HB-PID-CACHE] Cache PID once — it never changes for a process.
+        self._pid_str = str(os.getpid())
         self._write()
-        self._thread = threading.Thread(
+        self._thread  = threading.Thread(
             target=self._run, name="shm-heartbeat", daemon=True,
         )
         self._thread.start()
-        log.debug("HeartbeatWriter started: %s (pid=%d)", hb_path, os.getpid())
+        log.debug("HeartbeatWriter started: %s (pid=%s)", hb_path, self._pid_str)
 
     def _write(self) -> None:
         """Write the heartbeat file atomically."""
         tmp = self._path.with_suffix(".tmp")
         try:
-            tmp.write_text(f"{os.getpid()}:{self._job_id}", encoding="utf-8")
+            tmp.write_text(f"{self._pid_str}:{self._job_id}", encoding="utf-8")
             tmp.rename(self._path)
         except Exception as exc:
             log.warning("HeartbeatWriter: could not write %s: %s", self._path, exc)
@@ -308,10 +360,9 @@ def _check_shm_headroom(incoming: int) -> None:
 def _read_file_sync(path: str) -> bytes:
     """Synchronous fallback for shard reads when aiofiles is unavailable.
 
-    [FIX-READ] Utilise pathlib.Path.read_bytes() pour une lecture correcte sur
-    tous les filesystems.  L'ancienne version utilisait os.read(fd, st_size)
-    qui n'est pas garanti de lire tous les octets en un seul appel sur NFS/Lustre
-    avec certaines options de montage.
+    [FIX-READ] Uses pathlib.Path.read_bytes() for correct reads on all
+    filesystems.  The previous os.read(fd, st_size) was not guaranteed to
+    read all bytes in a single call on NFS/Lustre with some mount options.
     """
     try:
         return Path(path).read_bytes()
@@ -322,11 +373,23 @@ def _read_file_sync(path: str) -> bytes:
 def _inotify_wait(shm: Path, timeout_s: float) -> None:
     """Block until shm is ready, using inotify on Linux or stat-poll elsewhere.
 
-    [FS-2] Détection automatique de la disponibilité d'inotify.
+    [FIX-INOTIFY-PRECHECK] Checks _is_ready() before installing the inotify
+    watch to eliminate the race condition where the rename occurs between the
+    add_watch call and the select(), which would cause the event to be missed
+    and the wait to block unnecessarily until the 1-second select timeout.
+
+    [FS-2] Automatic detection of inotify availability.
     """
     global _INOTIFY_AVAILABLE  # noqa: PLW0603
 
     deadline = time.monotonic() + timeout_s
+
+    # [FIX-INOTIFY-PRECHECK] Fast path: file may already be ready before we
+    # install any watch.  This also handles the race between rename() and
+    # inotify_add_watch() — if the file appeared between those two calls,
+    # we would have missed the IN_MOVED_TO event.
+    if _is_ready(shm):
+        return
 
     if _INOTIFY_AVAILABLE:
         try:
@@ -356,6 +419,9 @@ def _inotify_wait(shm: Path, timeout_s: float) -> None:
                     os.close(ifd)
                     raise OSError("inotify_add_watch failed")
                 try:
+                    # [FIX-INOTIFY-PRECHECK] Re-check after installing the watch
+                    # to close the race window between the pre-check above and
+                    # add_watch().  If ready now, skip the select loop entirely.
                     while not _is_ready(shm):
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
@@ -419,6 +485,7 @@ class NodeSharedShardCache:
     [FIX-STALE] heartbeat_stale_s est maintenant transmis à _init_shm, qui
         l'utilise lors de l'appel à _purge_orphaned_shm au lieu d'utiliser
         la constante globale _HB_STALE_S.
+    [FIX-MMAP-REFS] Eviction defers mmap close when readers are active.
 
     Args:
         node_master: True for local rank 0 — this process fills the cache.
@@ -503,9 +570,13 @@ class NodeSharedShardCache:
                     self._load_one(shard_path, shm), self._loop,
                 ).result()
             return self._read(shm)
-        t_wait  = time.perf_counter()
+        # [FIX-STAGE1-INSTRUMENTATION] Instrument non-master shard wait time
+        # with both OTEL span and legacy metric counter in a single measurement.
+        from dino_loader.monitor.otel import StageTimer  # noqa: PLC0415
+        _wait_timer = StageTimer("shard_wait", attributes={"shard": shard_path})
+        _wait_timer.start()
         _inotify_wait(shm, self._timeout)
-        wait_ms = int((time.perf_counter() - t_wait) * 1000)
+        wait_ms = _wait_timer.stop()
         if self._metrics is not None and wait_ms > 0:
             self._metrics.inc(MetricField.SHARD_CACHE_WAIT_MS, wait_ms)
         return self._read(shm)
@@ -523,9 +594,11 @@ class NodeSharedShardCache:
                     self._load_one(shard_path, shm), self._loop,
                 ).result()
         else:
-            t_wait  = time.perf_counter()
+            from dino_loader.monitor.otel import StageTimer  # noqa: PLC0415
+            _wait_timer = StageTimer("shard_wait", attributes={"shard": shard_path})
+            _wait_timer.start()
             _inotify_wait(shm, self._timeout)
-            wait_ms = int((time.perf_counter() - t_wait) * 1000)
+            wait_ms = _wait_timer.stop()
             if self._metrics is not None and wait_ms > 0:
                 self._metrics.inc(MetricField.SHARD_CACHE_WAIT_MS, wait_ms)
 
@@ -553,12 +626,20 @@ class NodeSharedShardCache:
 
         [FIX-EVICT-EARLY] Si le shard dépasse structurellement le budget total,
         on lève immédiatement sans attendre les _EVICT_RETRIES itérations.
+        [FIX-STAGE1-INSTRUMENTATION] Wraps the Lustre read with a StageTimer
+        ("lustre_io") so OTEL and Chrome traces capture Stage 1 latency.
         """
         async with self._sem:
             try:
-                t0   = time.perf_counter()
-                data = await _read_shard_async(shard_path)
-                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                # [FIX-STAGE1-INSTRUMENTATION] Instrument the actual I/O read
+                # so operators can pinpoint Lustre vs /dev/shm latency.
+                from dino_loader.monitor.otel import StageTimer  # noqa: PLC0415
+                _timer = StageTimer("lustre_io", attributes={"shard": shard_path})
+                _timer.start()
+                try:
+                    data = await _read_shard_async(shard_path)
+                finally:
+                    elapsed_ms = _timer.stop()
 
                 if self._metrics is not None:
                     self._metrics.inc(MetricField.LUSTRE_READ_TIME_MS, elapsed_ms)
@@ -634,10 +715,14 @@ class NodeSharedShardCache:
         """Evict LRU shards to make room. Caller must hold _lru_lock.
 
         [FIX-EVICT] _total_bytes is only decremented after a successful unlink.
+        [FIX-MMAP-REFS] Uses pool.invalidate() which safely defers close when
+        active readers still hold references on the mmap.
         """
         while self._total_bytes + incoming > self._max_bytes and self._lru:
             path_str, sz = self._lru.popitem(last=False)
             p = Path(path_str)
+            # [FIX-MMAP-REFS] invalidate() defers the fd/mmap close when
+            # refs > 0, so active get_view() callers are never SIGBUS'd.
             self._mmap_pool.invalidate(p)
             try:
                 p.unlink(missing_ok=True)
@@ -682,26 +767,17 @@ class NodeSharedShardCache:
     def _register_signals(self) -> None:
         """Register SIGTERM/SIGINT handlers to trigger a clean shutdown.
 
-        [FIX-SIGNAL] Chaîne les handlers existants (PyTorch distributed / NCCL)
-        plutôt que de les écraser.  Écraser SIGTERM quand torch.distributed est
-        déjà initialisé provoque des deadlocks NCCL lors de la terminaison du job.
-
-        Ce handler n'est enregistré que sur le node master (local_rank == 0),
-        le seul processus qui possède un cache /dev/shm à nettoyer.
+        [FIX-SIGNAL] Chains existing handlers (PyTorch distributed / NCCL)
+        rather than overwriting them.
         """
-        def _make_handler(
-            old_handler: Any,
-        ) -> Any:
-            """Retourne un handler qui appelle l'ancien handler après nettoyage."""
-            def _handler(signum: int, frame: Any) -> None:
+        def _make_handler(old_handler: object) -> object:
+            def _handler(signum: int, frame: object) -> None:
                 self._shutdown_event.set()
-                # Chaîner l'ancien handler s'il était un callable Python.
                 if callable(old_handler):
-                    old_handler(signum, frame)
+                    old_handler(signum, frame)  # type: ignore[call-arg]
                 elif old_handler == signal.SIG_DFL:
                     signal.signal(signum, signal.SIG_DFL)
                     os.kill(os.getpid(), signum)
-                # SIG_IGN : on ignore (rare pour SIGTERM, impossible pour SIGINT).
             return _handler
 
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -709,7 +785,6 @@ class NodeSharedShardCache:
             try:
                 signal.signal(sig, _make_handler(old))
             except (OSError, ValueError) as exc:
-                # Peut échouer si on n'est pas dans le thread principal.
                 log.debug("Could not register signal %s handler: %s", sig, exc)
 
     def _cleanup(self) -> None:

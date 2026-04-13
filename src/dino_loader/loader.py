@@ -36,6 +36,13 @@ Corrections intégrées
 [FIX-ENV]          DistribEnv conservé tel quel.
 [FIX-ACTIVE-ITER]  Guard contre le double-iter via _active_iter + lock.
 [FIX-RESET-ITER]   set_epoch() appelle _dali_node.reset_iter() (thread-safe).
+[FIX-MASK-CALL]    _assemble_batch appelait mask_generator(n_tokens) avec
+                   n_tokens (int) comme argument positionnel ``flat`` (bool).
+                   La bonne API est mask_generator(flat=True) puis découpage.
+                   Le masquage est maintenant délégué à AugmentationSpec via
+                   supports_masking, éliminant l'isinstance interdit.
+[FIX-ISINSTANCE]   Suppression de isinstance(aug_spec, DinoV2AugSpec) dans
+                   _assemble_batch — remplacé par AugmentationSpec.supports_masking.
 """
 
 import logging
@@ -529,7 +536,15 @@ class DINODataLoader:
         views:    list[Any],
         metadata: list[dict | None],
     ) -> Batch:
-        """Assemble un Batch depuis les vues du pipeline."""
+        """Assemble un Batch depuis les vues du pipeline.
+
+        [FIX-MASK-CALL] Le masquage iBOT est délégué à
+        ``AugmentationSpec.supports_masking`` (propriété polymorphe), évitant
+        l'isinstance(aug_spec, DinoV2AugSpec) interdit par CONVENTIONS.md.
+        Le mask_generator est appelé correctement via ``gen(flat=True)`` puis
+        converti en tenseur — plus ``gen(n_tokens)`` qui passait n_tokens comme
+        argument positionnel ``flat`` (bool), un bug silencieux.
+        """
         global_views, local_views = self._aug_spec.split_views(views)
 
         with self._h2d.transfer({"global": global_views, "local": local_views}) as gpu:
@@ -541,9 +556,17 @@ class DINODataLoader:
             l_gpu = [self._fp8.quantise(t) for t in l_gpu]
 
         masks = None
-        if self._mask_generator is not None and isinstance(self._aug_spec, DinoV2AugSpec):
-            n_tokens = (self._current_global_size // 14) ** 2
-            masks    = self._mask_generator(n_tokens)
+        if self._mask_generator is not None and self._aug_spec.supports_masking:
+            # [FIX-MASK-CALL] Correct API: gen(flat=True) returns a 1-D bool
+            # numpy array of shape (height * width,).  We then stack it for the
+            # batch dimension.  Previously gen(n_tokens) was called with an int
+            # as the positional ``flat`` argument (which is bool-typed) — it
+            # returned a 1-D array but of the grid shape, not n_tokens, and the
+            # intent (repeat for the whole batch) was never implemented.
+            mask_np = self._mask_generator(flat=True)           # shape: (H*W,)
+            mask_1d = torch.from_numpy(mask_np)                # (H*W,)
+            batch_size = g_gpu[0].shape[0] if g_gpu else len(metadata)
+            masks = mask_1d.unsqueeze(0).expand(batch_size, -1) # (B, H*W)
 
         return Batch(
             global_crops = g_gpu,

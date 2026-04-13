@@ -5,6 +5,7 @@ Unit tests for dino_loader.masking.MaskingGenerator.
 Coverage
 --------
 - Construction: defaults, square shorthand, explicit all-params
+- Validation: num_masking_patches > grid, min > max patches, negative target
 - __repr__: contains key dimensions
 - get_shape: returns (height, width)
 - __call__: shape, dtype, exact count, flat mode
@@ -12,6 +13,7 @@ Coverage
 - Completeness guarantee: shortfall always filled randomly
 - Determinism: same seed → same mask
 - Edge cases: target == 0, target == all patches, 1×1 grid
+- _complete_randomly: correct for non-C-contiguous arrays (no silent no-op)
 """
 
 import math
@@ -70,6 +72,43 @@ class TestMaskingGeneratorConstruction:
     def test_explicit_max_aspect(self) -> None:
         gen = MaskingGenerator(input_size=8, min_aspect=0.5, max_aspect=2.0)
         assert gen.log_aspect_ratio[1] == pytest.approx(math.log(2.0))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Construction validation — [FIX-MASK-VALIDATE]
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestMaskingGeneratorValidation:
+    """[FIX-MASK-VALIDATE] __init__ should catch impossible configurations early."""
+
+    def test_num_masking_patches_exceeds_grid_raises(self) -> None:
+        with pytest.raises(ValueError, match="exceeds grid size"):
+            MaskingGenerator(input_size=(4, 4), num_masking_patches=17)
+
+    def test_num_masking_patches_negative_raises(self) -> None:
+        with pytest.raises(ValueError, match="≥ 0"):
+            MaskingGenerator(input_size=(8, 8), num_masking_patches=-1)
+
+    def test_min_gt_max_patches_when_target_positive_raises(self) -> None:
+        """min_num_patches > max_num_patches with a positive target should raise."""
+        with pytest.raises(ValueError, match="min_num_patches"):
+            MaskingGenerator(
+                input_size=8,
+                num_masking_patches=10,
+                min_num_patches=8,
+                max_num_patches=4,  # max < min
+            )
+
+    def test_zero_target_with_min_gt_zero_does_not_raise(self) -> None:
+        """num_masking_patches=0 is valid even when min_num_patches=4 (block loop never runs)."""
+        gen = MaskingGenerator(input_size=(8, 8), num_masking_patches=0)
+        assert gen.num_masking_patches == 0
+
+    def test_target_equals_grid_size_valid(self) -> None:
+        """Masking all patches is a valid configuration."""
+        gen = MaskingGenerator(input_size=(4, 4), num_masking_patches=16)
+        assert gen.num_masking_patches == 16
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -132,8 +171,11 @@ class TestMaskingGeneratorCall:
         assert unique <= {True, False}
 
     def test_mask_count_zero(self) -> None:
+        """num_masking_patches=0 must produce an all-False mask."""
         gen = MaskingGenerator(input_size=(8, 8), num_masking_patches=0)
         mask = gen()
+        # Block placement loop never executes (0 < 0 is False).
+        # _complete_randomly with shortfall=0 is a no-op.
         assert int(mask.sum()) == 0
 
     def test_mask_count_all(self) -> None:
@@ -145,6 +187,51 @@ class TestMaskingGeneratorCall:
         gen = MaskingGenerator(input_size=(1, 1), num_masking_patches=1)
         mask = gen()
         assert int(mask.sum()) == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _complete_randomly — [FIX-MASK-RAVEL]
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestCompleteRandomly:
+    """[FIX-MASK-RAVEL] _complete_randomly must work correctly on non-C-contiguous arrays."""
+
+    def test_fortran_order_mask_filled_correctly(self) -> None:
+        """Non-C-contiguous (Fortran-order) mask must be filled in-place."""
+        gen  = MaskingGenerator(input_size=(8, 8), num_masking_patches=30)
+        # Create a Fortran-order array (non-C-contiguous).
+        mask = np.zeros((8, 8), dtype=bool, order="F")
+        assert not mask.flags["C_CONTIGUOUS"]
+
+        result = gen._complete_randomly(mask, target=30)
+        assert int(result.sum()) == 30
+
+    def test_sliced_non_contiguous_mask_filled_correctly(self) -> None:
+        """Sliced (strided) non-contiguous mask must be filled in-place."""
+        gen  = MaskingGenerator(input_size=(4, 4), num_masking_patches=8)
+        base = np.zeros((8, 8), dtype=bool)
+        # Take every other row and column — non-contiguous view.
+        mask = base[::2, ::2]
+        assert not mask.flags["C_CONTIGUOUS"]
+
+        result = gen._complete_randomly(mask, target=8)
+        assert int(result.sum()) == 8
+
+    def test_shortfall_zero_returns_unchanged(self) -> None:
+        gen  = MaskingGenerator(input_size=(4, 4), num_masking_patches=4)
+        mask = np.ones((4, 4), dtype=bool)
+        # Already 16 True entries; target=4 → shortfall ≤ 0 → unchanged.
+        result = gen._complete_randomly(mask, target=4)
+        assert int(result.sum()) == 16  # no entries removed
+
+    def test_complete_randomly_does_not_exceed_target(self) -> None:
+        """Shortfall clamped by available unmasked positions."""
+        gen  = MaskingGenerator(input_size=(2, 2), num_masking_patches=2)
+        mask = np.zeros((2, 2), dtype=bool)
+        # Only 4 positions available; target of 6 should be clamped to 4.
+        result = gen._complete_randomly(mask, target=6)
+        assert int(result.sum()) <= 4
 
 
 # ══════════════════════════════════════════════════════════════════════════════

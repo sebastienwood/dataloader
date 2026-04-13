@@ -13,7 +13,7 @@ allocate_buffers [FIX-BUF]
 - Returns a single pinned CPU tensor per crop type (not a list of two).
   The previous list-of-two was a leftover from AsyncPrefetchIterator.
 - Shape matches (batch_size, 3, max_size, max_size)
-- Tensors are pinned (is_pinned())
+- Tensors are pinned (is_pinned()) when CUDA is available; skipped otherwise
 - topo parameter accepted for API compatibility
 
 FP8Formatter [FIX-FP8]
@@ -27,6 +27,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 _SRC = str(Path(__file__).parent.parent / "src")
@@ -101,7 +102,6 @@ class TestAllocateBuffers:
             batch_size=4, aug_cfg=aug_cfg,
             topo=self._make_topo(), device=torch.device("cpu"),
         )
-        # Les valeurs doivent être des Tensor, pas des list[Tensor].
         assert isinstance(bufs["global"], torch.Tensor), (
             "allocate_buffers['global'] doit être un Tensor, pas une list."
         )
@@ -125,8 +125,18 @@ class TestAllocateBuffers:
         )
         assert bufs["local"].shape == (4, 3, 32, 32)
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="Pinned memory requires CUDA — skipped in CPU-only CI",
+    )
     def test_tensors_are_pinned_on_cpu(self):
-        """PCIe path must produce pinned tensors for efficient H2D DMA."""
+        """PCIe path must produce pinned tensors for efficient H2D DMA.
+
+        [FIX-FIXTURE] Skipped when CUDA is unavailable: allocate_buffers()
+        calls _can_pin() → torch.cuda.is_available() and returns a regular
+        (non-pinned) CPU tensor in that case.  Asserting is_pinned() on a
+        non-CUDA machine would always fail.
+        """
         aug_cfg = DINOAugConfig(global_crop_size=32, local_crop_size=16)
         device  = torch.device("cpu")
         bufs    = allocate_buffers(
@@ -137,6 +147,18 @@ class TestAllocateBuffers:
             t = bufs[key]
             assert t.is_pinned(), f"bufs['{key}'] must be pinned memory"
             assert t.device.type == "cpu"
+
+    def test_tensors_are_cpu_tensors(self):
+        """Tensors must always be on CPU regardless of CUDA availability."""
+        aug_cfg = DINOAugConfig(global_crop_size=32, local_crop_size=16)
+        bufs    = allocate_buffers(
+            batch_size=4, aug_cfg=aug_cfg,
+            topo=self._make_topo(), device=torch.device("cpu"),
+        )
+        for key in ("global", "local"):
+            assert bufs[key].device.type == "cpu", (
+                f"bufs['{key}'] must be a CPU tensor"
+            )
 
     def test_topo_parameter_accepted(self):
         """topo is accepted for API compatibility even though all paths are PCIe."""
@@ -175,12 +197,10 @@ class TestFP8FormatterAssert:
 
     def test_quantise_already_fp8_raises_assertion(self):
         """Passer un tenseur FP8 à quantise() doit lever AssertionError."""
-        from dino_loader.memory import FP8Formatter, HAS_TE
+        from dino_loader.memory import FP8Formatter
 
         fmt = FP8Formatter()
-        # On ne peut créer un tenseur FP8 que si torch le supporte.
         if not hasattr(torch, "float8_e4m3fn"):
-            import pytest
             pytest.skip("torch.float8_e4m3fn not available in this torch version")
 
         t_fp8 = torch.zeros(1, 3, 4, 4).to(torch.float8_e4m3fn)

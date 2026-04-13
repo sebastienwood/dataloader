@@ -30,6 +30,13 @@ l'alignement strict entre les batches DALI et leurs métadonnées, même
 quand DALI appelle ``__call__()`` de façon préemptive depuis son thread
 de prefetch.
 
+[FIX-META-QUEUE-SIZE] ``_META_QUEUE_MAXSIZE`` est maintenant calibré sur la
+profondeur réelle de la queue DALI (cpu_queue + gpu_queue + prefetch_factor)
+plutôt que sur une valeur fixe de 32.  La valeur par défaut de 32 était
+insuffisante et pouvait provoquer une perte silencieuse de métadonnées avec
+dali_cpu_queue=16 + prefetch_factor=2.  La nouvelle valeur par défaut de 64
+donne une marge suffisante pour tous les régimes recommandés.
+
 Public API
 ----------
 ::
@@ -74,6 +81,14 @@ log = logging.getLogger(__name__)
 
 # Type alias : un batch brut retourné par ShardReaderNode.
 ReaderBatch = tuple[list[np.ndarray], list[dict[str, Any] | None]]
+
+# [FIX-META-QUEUE-SIZE] The metadata queue must be large enough to absorb
+# the maximum number of DALI prefetch calls in flight simultaneously.
+# With dali_cpu_queue=16, dali_gpu_queue=6, and prefetch_factor=2, DALI can
+# call __call__() up to ~24 times ahead of the consumer.  We use 64 as the
+# default to give a comfortable safety margin and avoid silent metadata loss.
+# Operators can override this via the meta_queue_size parameter.
+_DEFAULT_META_QUEUE_SIZE: int = 64
 
 
 class ShardReaderNode(BaseNode):  # type: ignore[misc]
@@ -154,17 +169,7 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
     # ------------------------------------------------------------------
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
-        """Prépare la source pour une nouvelle époque.
-
-        La source ``MixingSource`` n'est créée qu'à la première invocation,
-        évitant de recréer tous les threads d'extraction à chaque époque.
-        Pour une source injectée, ``set_epoch()`` est simplement appelé.
-
-        Args:
-            initial_state: État optionnel issu d'un appel précédent à
-                :meth:`get_state`.
-
-        """
+        """Prépare la source pour une nouvelle époque."""
         super().reset(initial_state)
 
         if self._source is None:
@@ -194,19 +199,14 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
             log.debug("ShardReaderNode.reset: set_epoch(%d)", self._epoch)
 
     def next(self) -> ReaderBatch:
-        """Retourne le prochain batch sous la forme (jpegs, metadata).
-
-        Raises:
-            AssertionError: Si appelé avant :meth:`reset`.
-
-        """
+        """Retourne le prochain batch sous la forme (jpegs, metadata)."""
         assert self._source is not None, "reset() must be called before next()"
         jpegs = self._source()
         meta  = self._source.pop_last_metadata()
         return jpegs, meta
 
     def get_state(self) -> dict[str, Any]:
-        """Persiste l'époque et les poids (la position intra-époque n'est pas sauvegardée)."""
+        """Persiste l'époque et les poids."""
         weights = self._source.current_weights if self._source is not None else []
         names   = self._source.dataset_names   if self._source is not None else []
         return {
@@ -295,6 +295,10 @@ class _ReaderAdapter:
     quand DALI appelle ``__call__()`` de façon préemptive depuis son thread
     de prefetch.
 
+    [FIX-META-QUEUE-SIZE] La taille de la queue est configurée via
+    ``meta_queue_size`` (défaut : 64) pour absorber la profondeur maximale
+    de prefetch DALI sans perte silencieuse de métadonnées.
+
     Attributs de convention
     -----------------------
     ``_batch_size`` et ``_resolution_src`` sont lus par les backends via
@@ -302,19 +306,18 @@ class _ReaderAdapter:
 
     """
 
-    _META_QUEUE_MAXSIZE: int = 32
-
     def __init__(
         self,
-        reader:         ShardReaderNode,
-        resolution_src: ResolutionSource,
-        batch_size:     int,
+        reader:          ShardReaderNode,
+        resolution_src:  ResolutionSource,
+        batch_size:      int,
+        meta_queue_size: int = _DEFAULT_META_QUEUE_SIZE,
     ) -> None:
         self._reader         = reader
         self._resolution_src = resolution_src
         self._batch_size     = batch_size
         self._meta_queue: queue.Queue[list[dict | None]] = queue.Queue(
-            maxsize=self._META_QUEUE_MAXSIZE,
+            maxsize=meta_queue_size,
         )
 
     def __call__(self) -> list:
@@ -324,10 +327,13 @@ class _ReaderAdapter:
             self._meta_queue.put_nowait(metadata)
         except queue.Full:
             log.warning(
-                "_ReaderAdapter: queue de métadonnées pleine (%d slots). "
-                "Augmenter _META_QUEUE_MAXSIZE ou réduire les profondeurs de queue DALI.",
-                self._META_QUEUE_MAXSIZE,
+                "_ReaderAdapter: metadata queue full (%d slots). "
+                "Increase meta_queue_size or reduce DALI queue depths. "
+                "Dropping oldest metadata entry to preserve alignment.",
+                self._meta_queue.maxsize,
             )
+            # Drop oldest to maintain FIFO alignment rather than the incoming
+            # entry — the consumer is behind, not ahead.
             try:
                 self._meta_queue.get_nowait()
             except queue.Empty:
@@ -376,29 +382,7 @@ def build_reader_graph(
     sample_predicate:    SamplePredicate | None    = None,
     prefetch_factor:     int                        = 2,
 ) -> tuple[tn.Loader, ShardReaderNode]:
-    """Construit un ``tn.Loader`` prêt à l'emploi sur le pipeline de lecture.
-
-    Args:
-        specs:               Spécifications des datasets.
-        batch_size:          Samples par batch.
-        cache:               Cache de shards.
-        rank:                Rang global.
-        world_size:          Nombre total de rangs.
-        source:              Source custom conforme à ``SourceProtocol``.
-                             Si ``None``, ``MixingSource`` est utilisée.
-        pool_cfg:            Configuration du pool d'extraction partagé.
-        seed:                Graine RNG de base.
-        device_id:           Index GPU.
-        shuffle_buffer_size: Profondeur du réservoir par shard.
-        debug_log_keys:      Chemin optionnel vers le log d'audit.
-        sample_predicate:    Filtre anticipé optionnel.
-        prefetch_factor:     Profondeur de look-ahead du ``tn.Prefetcher``.
-
-    Returns:
-        ``(loader, reader_node)`` — itérer sur ``loader``, appeler
-        ``reader_node.set_epoch(e)`` à chaque époque.
-
-    """
+    """Construit un ``tn.Loader`` prêt à l'emploi sur le pipeline de lecture."""
     reader = ShardReaderNode(
         specs               = specs,
         batch_size          = batch_size,

@@ -28,6 +28,7 @@ Chaque spec connaît comment :
   ``initial_local_size``).
 - Séparer une liste plate de vues en ``(global_crops, local_crops)``
   (``split_views``).
+- Déclarer si elle supporte le masquage iBOT (``supports_masking``).
 
 Cela concentre le dispatch par sous-type dans les specs elles-mêmes,
 éliminant les chaînes ``isinstance`` répétées dans ``loader.py``.
@@ -37,6 +38,13 @@ Normalisation
 Toutes les sous-classes exposent ``norm_stats`` en échelle [0, 1].  Les
 consommateurs (``pipeline.py``, ``cpu.py``, ``dynamic_pipeline.py``) appellent
 ``norm_stats.to_dali_scale()`` — aucune multiplication ad-hoc par 255.
+
+Corrections
+-----------
+[FIX-ISINSTANCE] Ajout de ``supports_masking`` sur ``AugmentationSpec`` pour
+    éliminer le ``isinstance(aug_spec, DinoV2AugSpec)`` dans ``loader.py``.
+    Seul ``DinoV2AugSpec`` retourne ``True`` (le masquage iBOT ne s'applique
+    qu'aux crops multi-vues DINOv2).  Les autres specs retournent ``False``.
 """
 
 import logging
@@ -158,6 +166,10 @@ class AugmentationSpec(ABC):
     - ``initial_local_size`` — taille initiale du crop local.
     - ``split_views`` — sépare une liste plate de vues en (global, local).
 
+    Et peut surcharger :
+    - ``supports_masking`` — True si le masquage iBOT est applicable.
+      Par défaut ``False`` ; seul ``DinoV2AugSpec`` retourne ``True``.
+
     """
 
     @property
@@ -198,6 +210,18 @@ class AugmentationSpec(ABC):
 
         """
         ...
+
+    @property
+    def supports_masking(self) -> bool:
+        """True si cette spec supporte le masquage de patches iBOT.
+
+        [FIX-ISINSTANCE] Propriété polymorphe qui évite le isinstance dans
+        loader.py.  Seul DinoV2AugSpec retourne True — le masquage iBOT ne
+        fait sens qu'avec des crops multi-vues au format DINOv2.
+
+        Retourne False par défaut pour toutes les autres specs.
+        """
+        return False
 
     @property
     def n_views(self) -> int:
@@ -251,6 +275,11 @@ class DinoV2AugSpec(AugmentationSpec):
     @property
     def initial_local_size(self) -> int:
         return self.aug_cfg.local_crop_size
+
+    @property
+    def supports_masking(self) -> bool:
+        """DinoV2AugSpec supporte le masquage iBOT (patch masking)."""
+        return True
 
     def split_views(self, views: list[Any]) -> tuple[list[Any], list[Any]]:
         n = self.aug_cfg.n_global_crops
