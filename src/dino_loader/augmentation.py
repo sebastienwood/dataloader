@@ -12,6 +12,13 @@ La séparation nette permet des stratégies prédéfinies (``DinoV2AugSpec``,
 ``EvalAugSpec``, ``LeJEPAAugSpec``) et des stratégies utilisateur
 (``UserAugSpec``) sans modifier le loader ou les backends.
 
+Types partagés sources/augmentation
+-------------------------------------
+``SampleRecord``, ``SampleMeta`` et ``SamplePredicate`` sont définis ici car
+ils constituent le contrat entre le stage de lecture (sources) et le stage de
+filtrage/augmentation.  Les sources produisent des ``SampleRecord`` ; les
+prédicats les évaluent via ``SampleMeta`` avant tout décodage JPEG.
+
 Responsabilité étendue des specs
 ----------------------------------
 Chaque spec connaît comment :
@@ -24,12 +31,6 @@ Chaque spec connaît comment :
 
 Cela concentre le dispatch par sous-type dans les specs elles-mêmes,
 éliminant les chaînes ``isinstance`` répétées dans ``loader.py``.
-
-Filtrage anticipé
-------------------
-``SamplePredicate`` est appelé par ``ShardIterator`` avant qu'un sample
-n'entre dans le pipeline DALI, éliminant le coût GPU de décodage pour les
-samples rejetés.
 
 Normalisation
 -------------
@@ -48,6 +49,38 @@ from typing import Any, Protocol, runtime_checkable
 from dino_loader.config import DINOAugConfig, NormStats
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Types partagés : contrat source → filtrage → augmentation
+# ---------------------------------------------------------------------------
+
+
+class SampleRecord:
+    """Sample décodé prêt pour le pipeline d'augmentation.
+
+    Produit par les sources (``hpc_source``, ``wds_source``) après extraction
+    depuis un shard WebDataset.  Consommé par les ``ShardIterator`` et filtré
+    via ``SamplePredicate`` avant d'entrer dans le pipeline DALI.
+
+    Attributes:
+        jpeg: Bytes JPEG bruts.
+        metadata: Dict JSON sidecar, ou ``None`` si absent.
+        key: Clé WebDataset (e.g. ``"sample_000042"``).
+
+    """
+
+    __slots__ = ("jpeg", "key", "metadata")
+
+    def __init__(
+        self,
+        jpeg:     bytes,
+        metadata: dict | None = None,
+        key:      str         = "",
+    ) -> None:
+        self.jpeg     = jpeg
+        self.metadata = metadata
+        self.key      = key
 
 
 @dataclass(frozen=True)
@@ -88,6 +121,11 @@ class SamplePredicate(Protocol):
     def __call__(self, meta: SampleMeta) -> bool: ...
 
 
+# ---------------------------------------------------------------------------
+# Runtime pipeline protocol
+# ---------------------------------------------------------------------------
+
+
 @runtime_checkable
 class AugmentationPipeline(Protocol):
     """Pipeline d'augmentation runtime consommé par les backends."""
@@ -100,6 +138,11 @@ class AugmentationPipeline(Protocol):
     def __next__(self) -> dict[str, Any]: ...
 
     def reset(self) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# AugmentationSpec — base
+# ---------------------------------------------------------------------------
 
 
 class AugmentationSpec(ABC):
@@ -168,6 +211,11 @@ class AugmentationSpec(ABC):
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(n_views={self.n_views})"
+
+
+# ---------------------------------------------------------------------------
+# Specs concrètes
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -299,7 +347,6 @@ class LeJEPAAugSpec(AugmentationSpec):
         return self.target_crop_size
 
     def split_views(self, views: list[Any]) -> tuple[list[Any], list[Any]]:
-        # context = global, targets = local (convention loader)
         return [views[0]], views[1:]
 
     def __post_init__(self) -> None:
@@ -349,8 +396,8 @@ class UserAugSpec(AugmentationSpec):
     @property
     def uses_dali(self) -> bool:
         return False
-    
-    @property  
+
+    @property
     def output_map(self) -> list[str]:
         return self._output_map
 

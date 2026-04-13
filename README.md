@@ -259,6 +259,9 @@ tensors, allowing the DALI compiler to fuse them with the decode kernel.
 This eliminates one GPU kernel launch and one BF16 intermediate buffer per
 view per batch (`fuse_normalization=True`, default).
 
+The per-sample norm array construction is factored into `norm_utils.build_norm_arrays()`
+and shared between the static DALI pipeline and the experimental dynamic pipeline.
+
 ### Why a heartbeat file instead of `squeue` for orphan detection?
 
 Calling `squeue` from the dataloader on every rank is dangerous on large
@@ -297,9 +300,9 @@ adjust for your cluster.
 | `node_shm_gb` | `128.0` | `/dev/shm` budget per node in GB (~50% of node RAM). |
 | `shard_prefetch_window` | `64` | Max concurrent Lustre → `/dev/shm` downloads. |
 | `shard_timeout_s` | `300.0` | Max seconds a non-master rank waits for a shard. |
-| `shard_extraction_workers` | `4` | Thread-pool workers for tar → JPEG extraction. |
+| `extraction_pool` | `SharedExtractionPoolConfig()` | Shared extraction thread pool config. |
 | `shuffle_buffer_size` | `512` | In-memory shuffle reservoir depth per `ShardIterator`. |
-| `dali_cpu_queue` | `8` | DALI CPU-side prefetch queue depth. |
+| `dali_cpu_queue` | `16` | DALI CPU-side prefetch queue depth. |
 | `dali_gpu_queue` | `6` | DALI GPU-side prefetch queue depth. |
 | `dali_num_threads` | `8` | DALI CPU worker threads for pre-decode ops. |
 | `hw_decoder_load` | `0.90` | Fraction of JPEG decode sent to nvjpeg HW ASIC (0–1). |
@@ -315,6 +318,15 @@ adjust for your cluster.
 | `seed` | `0` | Base random seed for shard shuffling and augmentation. |
 | `debug_log_keys` | `None` | Path to append per-sample key audit log (disable in production). |
 | `shm_warn_threshold` | `0.90` | `/dev/shm` utilisation fraction that triggers a warning. |
+
+### `SharedExtractionPoolConfig`
+
+Controls the thread pool shared across all `ShardIterator` instances.
+
+| Field | Default | Description |
+|---|---|---|
+| `max_workers` | `16` | Total number of extraction threads (shared across all datasets). |
+| `queue_depth_per_shard` | `256` | Per-shard sample queue depth. |
 
 ### `DINOAugConfig`
 
@@ -347,7 +359,6 @@ Defaults match DINOv2 (Oquab et al., 2023, §A.1).
 | `shard_sampling` | `"epoch"` | `"epoch"` (deterministic full pass) or `"resampled"` (infinite with-replacement). |
 | `shard_quality_scores` | `None` | Per-shard quality scores; biases shard selection proportionally. |
 | `min_sample_quality` | `None` | Hard filter: drops samples whose `.json` `quality_score` is below this. |
-| `metadata_key` | `"json"` | WebDataset sidecar extension to extract. `None` disables sidecar extraction. |
 | `mean` / `std` | `None` | Per-dataset normalisation stats override (uses `DINOAugConfig` globals if `None`). |
 
 ---
@@ -561,13 +572,17 @@ pip install -e ".[dev]"
 ```
 src/dino_loader/
 ├── __init__.py              Public API surface
-├── config.py                Dataclasses: DatasetSpec (re-export), DINOAugConfig, LoaderConfig
-├── loader.py                DINODataLoader, PostProcessPipeline — main entry point
+├── config.py                Dataclasses: DINOAugConfig, LoaderConfig, NormStats, PipelineConfig, CheckpointState
+├── augmentation.py          SampleRecord, SampleMeta, SamplePredicate + AugmentationSpec hierarchy
+├── norm_utils.py            build_norm_table, build_norm_arrays — shared normalisation helpers
+├── loader.py                DINODataLoader — main entry point; orchestration only
+├── dali_node.py             _DALINode — drives backend iterator, assembles Batch
 ├── pipeline.py              DALI augmentation graph (build_pipeline, NormSource)
-├── mixing_source.py         MixingSource, ShardIterator, MixingWeights
-├── shard_cache.py           NodeSharedShardCache — /dev/shm LRU cache, mmap pool, heartbeat
-├── memory.py                Batch, H2DStream, FP8Formatter, AsyncPrefetchIterator
-├── checkpoint.py            DataLoaderCheckpointer — atomic JSON I/O, LATEST pointer
+├── pipeline_graph.py        MetadataNode, MaskMapNode, BatchMapNode, BatchFilterNode, NodePipeline, wrap_loader
+├── shard_reader.py          ShardReaderNode, _ReaderAdapter, build_reader_graph
+├── masking.py               MaskingGenerator — pure iBOT patch mask generator
+├── memory.py                Batch, H2DStream, FP8Formatter, allocate_buffers
+├── checkpoint.py            DataLoaderCheckpointer, save_checkpoint(path, state), load_checkpoint
 ├── distributed.py           slurm_init, detect_topology, configure_nccl, ClusterTopology
 ├── train.py                 Reference training script (fully annotated)
 │
@@ -591,14 +606,41 @@ src/dino_loader/
 │       ├── _registry_hash.txt
 │       └── <modality>.py    (e.g. rgb.py, multispectral.py)
 │
+├── sources/
+│   ├── __init__.py          Re-exports: MixingSource, WDSSource, MixingWeights, ResolutionSource, SourceProtocol
+│   ├── protocol.py          SourceProtocol — common interface for all data sources
+│   ├── _weights.py          MixingWeights — thread-safe normalised weight vector
+│   ├── resolution.py        ResolutionSource — thread-safe crop resolution holder
+│   ├── hpc_source.py        MixingSource, ShardIterator — HPC production source (Lustre + /dev/shm)
+│   ├── wds_source.py        WDSSource, WDSShardReaderNode — webdataset-based source
+│   └── _wds_mix.py          indexed_random_mix, IndexedRandomMixDataset
+│
 └── monitor/
+    ├── __init__.py
     ├── metrics.py           MetricsRegistry — lock-free /dev/shm counters, MetricField StrEnum
     ├── tracing.py           Chrome trace event recording
+    ├── otel.py              OpenTelemetry spans + structured logging
     └── cli.py               Live terminal monitor UI (Rich, 4 Hz)
 
 tests/
-├── fixtures.py              write_shard, scaffold_dataset_dir helpers
-├── test_mixing_source.py    ShardIterator + MixingSource unit tests
-├── test_improvements.py     Regression tests for all perf/maintainability improvements
-└── ...
+├── conftest.py              Pytest fixtures; make_spec imported from fixtures/
+├── fixtures/
+│   └── __init__.py          write_shard, scaffold_dataset_dir, make_spec, make_jpeg_bytes, …
+├── sources/
+│   ├── test_hpc_source.py   MixingSource + ShardIterator unit tests
+│   └── test_wds_mix.py      indexed_random_mix + IndexedRandomMixDataset tests
+├── test_aug_config.py       DINOAugConfig unit tests
+├── test_checkpoint.py       DataLoaderCheckpointer + save/load_checkpoint tests
+├── test_cpu_backend.py      CPUBackend component tests
+├── test_dali_queue.py       Queue sizing + end-to-end CPU pipeline tests
+├── test_loader_concurrency.py  Thread safety + guard tests
+├── test_loader_config.py    LoaderConfig + PipelineConfig + CheckpointState tests
+├── test_loader_cpu.py       End-to-end DINODataLoader (CPU backend)
+├── test_masking.py          MaskingGenerator unit tests
+├── test_memory.py           Batch + allocate_buffers + FP8Formatter tests
+├── test_metrics.py          MetricsRegistry + MetricField tests
+├── test_nodes.py            — DELETED: merged into test_shard_reader.py
+├── test_pipeline.py         NormSource + build_pipeline dispatch tests
+├── test_pipeline_graph.py   NodePipeline + BatchMapNode + BatchFilterNode tests
+└── test_shard_reader.py     ShardReaderNode + MetadataNode + build_reader_graph tests
 ```

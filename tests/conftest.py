@@ -7,6 +7,7 @@ Design principles
 - Only pytest fixtures live here. Pure helper functions belong in
   ``tests/fixtures/__init__.py``.
 - Fixtures are scoped as narrowly as possible to avoid hidden cross-test state.
+- ``make_spec`` is imported from ``tests/fixtures`` — the single source of truth.
 
 This conftest covers dino_loader tests only. dino_datasets and dino_env
 each have their own independent test suite and conftest.
@@ -44,13 +45,13 @@ from dino_datasets import DatasetSpec
 
 from dino_loader.backends.cpu import CPUBackend
 from dino_loader.config import DINOAugConfig, LoaderConfig
-from tests.fixtures import scaffold_dataset_dir, write_shard
+from tests.fixtures import make_spec, scaffold_dataset_dir, write_shard  # noqa: F401 — make_spec re-exported for tests
 
-# ── Public helper (not a fixture) ─────────────────────────────────────────────
-
-def make_spec(name: str, tar_paths: list, weight: float = 1.0, **kwargs) -> DatasetSpec:
-    """Convenience factory for DatasetSpec used in loader tests."""
-    return DatasetSpec(name=name, shards=tuple(tar_paths), weight=weight, **kwargs)
+# ── Public helper (single source of truth: tests/fixtures/__init__.py) ────────
+# make_spec is imported above and re-exported so test modules can do:
+#   from tests.conftest import make_spec
+# or import directly:
+#   from tests.fixtures import make_spec
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -83,17 +84,11 @@ def small_aug_cfg() -> DINOAugConfig:
 
 @pytest.fixture(scope="session")
 def small_loader_cfg(tmp_path_factory) -> LoaderConfig:
-    """LoaderConfig suited for CPU / no-SLURM testing.
-
-    [CFG-CKPT] checkpoint_dir est maintenant obligatoire quand
-    stateful_dataloader=True.  On utilise un répertoire temporaire
-    session-scoped pour ne pas écrire sur Lustre/CEPH pendant les tests.
-    """
+    """LoaderConfig suited for CPU / no-SLURM testing."""
     ckpt_dir = str(tmp_path_factory.mktemp("checkpoints"))
     return LoaderConfig(
         node_shm_gb=0.1,
         shard_prefetch_window=2,
-        shard_extraction_workers=2,
         shuffle_buffer_size=4,
         use_fp8_output=False,
         stateful_dataloader=True,

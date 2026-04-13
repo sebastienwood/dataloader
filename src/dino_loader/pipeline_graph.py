@@ -31,15 +31,14 @@ après la sortie du pipeline d'augmentation :
 
 Note sur ``_DALINode``
 ----------------------
-``_DALINode`` est dans ``dino_loader.batch_node`` — il pilote l'itérateur
-backend et assemble les Batch.  ``pipeline_graph`` le ré-exporte pour
-permettre aux consommateurs existants de l'importer depuis un seul endroit.
+``_DALINode`` vit dans ``dino_loader.dali_node``.  Importer directement
+depuis ce module pour un accès explicite.
 
 Séparation des responsabilités
 --------------------------------
 ::
 
-    batch_node.py        → pilote l'itérateur backend, assemble Batch
+    dali_node.py         → pilote l'itérateur backend, assemble Batch
     pipeline_graph.py    → compose des transforms post-augmentation sur Batch
     shard_reader.py      → stages I/O + mixing (pas d'import de pipeline_graph)
 
@@ -60,14 +59,11 @@ import torch
 import torchdata.nodes as tn
 from torchdata.nodes import BaseNode
 
-from dino_loader.batch_node import _DALINode  # re-export for consumers
 from dino_loader.memory import Batch
 
 log = logging.getLogger(__name__)
 
-# Re-exporter _DALINode pour que les imports existants continuent de fonctionner.
 __all__ = [
-    "_DALINode",
     "BatchFilterNode",
     "BatchMapNode",
     "MaskMapNode",

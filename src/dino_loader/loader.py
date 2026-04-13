@@ -12,7 +12,7 @@ Flux de construction ::
 
     __init__
       → _build_cache()            stage 1 : NodeSharedShardCache
-      → _build_reader()           stage 1-2 : ShardReaderNode + adapter
+      → _build_reader()           stage 1-2 : ShardReaderNode + _ReaderAdapter
       → _build_augmentation()     stage 3 : pipeline DALI/CPU + itérateur
       → _build_transfer()         stage 4-5 : H2D + FP8
       → _build_dali_node()        _DALINode : pilote le pipeline, assemble Batch
@@ -26,23 +26,20 @@ Flux d'itération ::
 Séparation des responsabilités
 --------------------------------
 - La logique de split des vues (global/local) vit dans ``AugmentationSpec``
-  via ``spec.split_views(views)`` — plus aucun ``isinstance`` dans loader.py.
+  via ``spec.split_views(views)`` — aucun ``isinstance`` dans loader.py.
 - La logique de sérialisation des checkpoints vit dans ``checkpoint.py``.
-- ``_DALINode`` (pilotage de l'itérateur backend) vit dans ``batch_node.py``.
+- ``_DALINode`` (pilotage de l'itérateur backend) vit dans ``dali_node.py``.
+- ``_ReaderAdapter`` (bridge ShardReaderNode → callable) vit dans ``shard_reader.py``.
 
 Corrections intégrées
 ---------------------
 [FIX-ENV]          DistribEnv conservé tel quel.
 [FIX-ACTIVE-ITER]  Guard contre le double-iter via _active_iter + lock.
 [FIX-RESET-ITER]   set_epoch() appelle _dali_node.reset_iter() (thread-safe).
-[FIX-META-FIFO]    _ReaderAdapter utilise queue.Queue pour l'alignement FIFO.
-[FIX-RESTORE-LOCAL] _restore() appelle set_resolution() si l'une des deux
-                    dimensions diffère (global OU local).
 """
 
 import logging
 import os
-import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
@@ -54,7 +51,6 @@ from dino_datasets import DatasetSpec
 from dino_loader.augmentation import AugmentationSpec, DinoV2AugSpec, SamplePredicate
 from dino_loader.backends import get_backend
 from dino_loader.backends.protocol import BackendProtocol
-from dino_loader.batch_node import _DALINode
 from dino_loader.checkpoint import DataLoaderCheckpointer
 from dino_loader.config import (
     CheckpointState,
@@ -62,10 +58,11 @@ from dino_loader.config import (
     LoaderConfig,
     PipelineConfig,
 )
+from dino_loader.dali_node import _DALINode
 from dino_loader.memory import Batch
 from dino_loader.monitor.metrics import init_registry
 from dino_loader.pipeline_graph import NodePipeline, wrap_loader
-from dino_loader.shard_reader import ShardReaderNode
+from dino_loader.shard_reader import ShardReaderNode, _ReaderAdapter
 from dino_loader.sources.resolution import ResolutionSource
 
 log = logging.getLogger(__name__)
@@ -131,9 +128,9 @@ class DINODataLoader:
         sample_predicate: SamplePredicate | None   = None,
         backend:          Any                      = "auto",
     ) -> None:
-        self._aug_spec       = self._resolve_aug_spec(aug_spec, aug_cfg)
-        self._cfg            = config or LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
-        self._mask_generator = mask_generator
+        self._aug_spec        = self._resolve_aug_spec(aug_spec, aug_cfg)
+        self._cfg             = config or LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
+        self._mask_generator  = mask_generator
         self._steps_per_epoch = steps_per_epoch
 
         self._step:  int = 0
@@ -167,17 +164,14 @@ class DINODataLoader:
 
         self._validate_shard_coverage(specs)
 
-        # Construction en étapes nommées pour la lisibilité.
-        shard_cache        = self._build_cache(device_id)
+        shard_cache              = self._build_cache(device_id)
         self._reader, self._dali_source = self._build_reader(
             specs, batch_size, shard_cache, device_id, sample_predicate,
         )
-        dali_iter          = self._build_augmentation(
-            specs, batch_size, device_id,
-        )
-        self._h2d, self._fp8 = self._build_transfer(device_id)
-        self._dali_node    = self._build_dali_node(dali_iter)
-        self._pipeline     = wrap_loader(self)
+        dali_iter                = self._build_augmentation(specs, batch_size, device_id)
+        self._h2d, self._fp8    = self._build_transfer(device_id)
+        self._dali_node          = self._build_dali_node(dali_iter)
+        self._pipeline           = wrap_loader(self)
 
         self._ckpt = DataLoaderCheckpointer(
             ckpt_dir      = self._cfg.checkpoint_dir if self._cfg.stateful_dataloader else "/tmp",
@@ -390,7 +384,6 @@ class DINODataLoader:
         aug_spec: AugmentationSpec | None,
         aug_cfg:  DINOAugConfig | None,
     ) -> AugmentationSpec:
-        """Résout la spec d'augmentation depuis les paramètres constructions."""
         if aug_spec is not None:
             if aug_cfg is not None:
                 log.warning(
@@ -456,7 +449,7 @@ class DINODataLoader:
         shard_cache:      Any,
         device_id:        int,
         sample_predicate: SamplePredicate | None,
-    ) -> tuple[ShardReaderNode, "_ReaderAdapter"]:
+    ) -> tuple[ShardReaderNode, _ReaderAdapter]:
         """Stages 1-2 : construit le ShardReaderNode et son adaptateur."""
         reader = ShardReaderNode(
             specs               = specs,
@@ -536,14 +529,7 @@ class DINODataLoader:
         views:    list[Any],
         metadata: list[dict | None],
     ) -> Batch:
-        """Assemble un Batch depuis les vues du pipeline.
-
-        Args:
-            views:    Liste plate de tenseurs dans l'ordre de ``output_map``.
-            metadata: Dicts JSON par sample.
-
-        """
-        # La spec sait comment séparer ses propres vues.
+        """Assemble un Batch depuis les vues du pipeline."""
         global_views, local_views = self._aug_spec.split_views(views)
 
         with self._h2d.transfer({"global": global_views, "local": local_views}) as gpu:
@@ -578,10 +564,7 @@ class DINODataLoader:
                 )
 
     def _restore(self) -> None:
-        """Charge le dernier checkpoint et applique son état.
-
-        [FIX-RESTORE-LOCAL] set_resolution() si l'une OU l'autre dimension diffère.
-        """
+        """Charge le dernier checkpoint et applique son état."""
         state = self._ckpt.load()
         if state is None:
             return
@@ -645,76 +628,3 @@ class DINODataLoader:
             if v is not None:
                 return int(v)
         return 1
-
-
-# ---------------------------------------------------------------------------
-# _ReaderAdapter — bridge ShardReaderNode → callable DALI/CPU ExternalSource
-# ---------------------------------------------------------------------------
-
-
-class _ReaderAdapter:
-    """Adaptateur exposant ``ShardReaderNode`` comme callable source DALI/CPU.
-
-    [FIX-META-FIFO] ``_meta_queue`` est une ``queue.Queue`` (FIFO) garantissant
-    l'alignement strict entre les batches DALI et leurs métadonnées, même
-    quand DALI appelle ``__call__()`` de façon préemptive depuis son thread
-    de prefetch.
-
-    Attributs de convention
-    -----------------------
-    ``_batch_size`` et ``_resolution_src`` sont lus par les backends via
-    ``getattr`` pour inférer batch_size et la source de résolution.
-
-    """
-
-    _META_QUEUE_MAXSIZE: int = 32
-
-    def __init__(
-        self,
-        reader:         ShardReaderNode,
-        resolution_src: ResolutionSource,
-        batch_size:     int,
-    ) -> None:
-        self._reader         = reader
-        self._resolution_src = resolution_src
-        self._batch_size     = batch_size
-        self._meta_queue: queue.Queue[list[dict | None]] = queue.Queue(
-            maxsize=self._META_QUEUE_MAXSIZE,
-        )
-
-    def __call__(self) -> list:
-        """Retourne un batch de tableaux JPEG (appelé par DALI à chaque step)."""
-        jpegs, metadata = self._reader.next()
-        try:
-            self._meta_queue.put_nowait(metadata)
-        except queue.Full:
-            log.warning(
-                "_ReaderAdapter: queue de métadonnées pleine (%d slots). "
-                "Augmenter _META_QUEUE_MAXSIZE ou réduire les profondeurs de queue DALI.",
-                self._META_QUEUE_MAXSIZE,
-            )
-            try:
-                self._meta_queue.get_nowait()
-            except queue.Empty:
-                pass
-            self._meta_queue.put_nowait(metadata)
-        return jpegs
-
-    def pop_last_metadata(self) -> list[dict | None]:
-        """Retourne les métadonnées du batch le plus ancien (FIFO)."""
-        try:
-            return self._meta_queue.get_nowait()
-        except queue.Empty:
-            log.debug("_ReaderAdapter.pop_last_metadata: queue vide, retour []")
-            return []
-
-    def register_dataset_index_callback(self, cb: Any) -> None:
-        """Propage les callbacks NormSource vers la MixingSource interne."""
-        source = self._reader._source  # type: ignore[attr-defined]
-        if source is not None and hasattr(source, "register_dataset_index_callback"):
-            source.register_dataset_index_callback(cb)
-        else:
-            log.warning(
-                "_ReaderAdapter: register_dataset_index_callback appelé avant "
-                "ShardReaderNode.reset() — callback non enregistré.",
-            )

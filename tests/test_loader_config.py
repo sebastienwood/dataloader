@@ -10,8 +10,9 @@ LoaderConfig
   stall_timeout_s, heartbeat_stale_s, prometheus_port
 - checkpoint_dir obligatoire si stateful_dataloader=True [CFG-CKPT]
 - FP8 requires transformer-engine at construction time [CFG-B4]
-- dali_cpu_queue default ≥ 16 (post-AsyncPrefetchIterator removal)
+- dali_cpu_queue default ≥ 16
 - adaptive_prefetch validation [ARCH2]
+- shard_extraction_workers field removed
 
 SharedExtractionPoolConfig
 - Valeurs par défaut
@@ -30,6 +31,7 @@ save_checkpoint / load_checkpoint (from checkpoint.py)
 - Tampered file raises ValueError
 - Backward-compatible flat format
 - Atomic write via .tmp → rename
+- save_checkpoint(path, state) — path is always first argument
 """
 
 from __future__ import annotations
@@ -86,6 +88,13 @@ class TestLoaderConfigDefaults:
 
     def test_prometheus_port_disabled_by_default(self):
         assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").prometheus_port is None
+
+    def test_no_shard_extraction_workers_field(self):
+        """shard_extraction_workers has been removed — use extraction_pool instead."""
+        cfg = LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
+        assert not hasattr(cfg, "shard_extraction_workers"), (
+            "shard_extraction_workers must be removed; use extraction_pool.max_workers"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -293,7 +302,7 @@ class TestAdaptivePrefetch:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CheckpointState — pure dataclass (no I/O methods)
+# CheckpointState — pur dataclass (sans méthodes I/O)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -329,7 +338,7 @@ class TestCheckpointStateDataclass:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# save_checkpoint / load_checkpoint — I/O (previously on CheckpointState)
+# save_checkpoint / load_checkpoint — path est toujours le premier argument
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -337,37 +346,37 @@ class TestCheckpointIO:
 
     def test_save_and_load_step(self, tmp_path):
         path = tmp_path / "dl_state.json"
-        save_checkpoint(_make_state(step=42), path)
+        save_checkpoint(path, _make_state(step=42))
         assert load_checkpoint(path).step == 42
 
     def test_save_and_load_epoch(self, tmp_path):
         path = tmp_path / "dl_state.json"
-        save_checkpoint(_make_state(epoch=5), path)
+        save_checkpoint(path, _make_state(epoch=5))
         assert load_checkpoint(path).epoch == 5
 
     def test_save_and_load_crop_sizes(self, tmp_path):
         path = tmp_path / "dl_state.json"
-        save_checkpoint(_make_state(), path)
+        save_checkpoint(path, _make_state())
         loaded = load_checkpoint(path)
         assert loaded.global_crop_size == 224
         assert loaded.local_crop_size  == 96
 
     def test_saved_file_is_valid_json(self, tmp_path):
         path = tmp_path / "dl_state.json"
-        save_checkpoint(_make_state(), path)
+        save_checkpoint(path, _make_state())
         data = json.loads(path.read_text())
         assert "payload" in data or "step" in data
 
     def test_envelope_sha256(self, tmp_path):
         path = tmp_path / "state.json"
-        save_checkpoint(_make_state(), path)
+        save_checkpoint(path, _make_state())
         raw      = json.loads(path.read_text())
         computed = hashlib.sha256(json.dumps(raw["payload"], indent=2, sort_keys=True).encode()).hexdigest()
         assert raw["sha256"] == computed
 
     def test_tampered_raises(self, tmp_path):
         path = tmp_path / "state.json"
-        save_checkpoint(_make_state(), path)
+        save_checkpoint(path, _make_state())
         raw = json.loads(path.read_text())
         raw["payload"]["step"] = 9999
         path.write_text(json.dumps(raw))
@@ -384,3 +393,12 @@ class TestCheckpointIO:
         loaded = load_checkpoint(path)
         assert loaded.global_crop_size == 224
         assert loaded.local_crop_size  == 96
+
+    def test_path_is_first_argument(self, tmp_path):
+        """Verify canonical call signature: save_checkpoint(path, state)."""
+        path  = tmp_path / "sig_test.json"
+        state = _make_state(step=7)
+        # Positional call — path first, state second.
+        save_checkpoint(path, state)
+        loaded = load_checkpoint(path)
+        assert loaded.step == 7

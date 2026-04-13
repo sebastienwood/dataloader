@@ -16,11 +16,8 @@ Corrections intégrées
                   depuis LoaderConfig.
 [FIX-CHECKSUM]    Supprimé de ce module — dans checkpoint.py.
 [FIX-CONTEXTLIB]  Supprimé de ce module — dans checkpoint.py.
-[FIX-DEPRECATION] LoaderConfig.shard_extraction_workers émet un
-                  DeprecationWarning si la valeur non-défaut est fournie.
 """
 
-import warnings
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
@@ -94,7 +91,7 @@ class NormStats:
             fallback: Stats à utiliser quand aucune valeur n'est fournie.
 
         """
-        base         = fallback if fallback is not None else cls.imagenet()
+        base          = fallback if fallback is not None else cls.imagenet()
         resolved_mean = mean if mean is not None else base.mean
         resolved_std  = std  if std  is not None else base.std
         return cls(mean=resolved_mean, std=resolved_std)
@@ -328,7 +325,6 @@ class LoaderConfig:
         node_shm_gb:              Budget /dev/shm par nœud en Go.
         shard_prefetch_window:    Max de téléchargements Lustre → /dev/shm simultanés.
         shard_timeout_s:          Max secondes qu'un rang non-master attend un shard.
-        shard_extraction_workers: **Deprecated** — utiliser extraction_pool.max_workers.
         heartbeat_stale_s:        Secondes sans heartbeat avant détection d'orphelin.
         extraction_pool:          Config du pool d'extraction partagé.
         dali_cpu_queue:           Profondeur de la file CPU DALI (≥ 16).
@@ -355,54 +351,45 @@ class LoaderConfig:
     """
 
     # I/O
-    node_shm_gb:              float = 128.0
-    shard_prefetch_window:    int   = 64
-    shard_timeout_s:          float = 300.0
-    shard_extraction_workers: int   = 4  # deprecated
+    node_shm_gb:           float = 128.0
+    shard_prefetch_window: int   = 64
+    shard_timeout_s:       float = 300.0
 
-    heartbeat_stale_s:        float = 300.0
+    heartbeat_stale_s: float = 300.0
 
     extraction_pool: SharedExtractionPoolConfig = field(
         default_factory=SharedExtractionPoolConfig,
     )
 
-    dali_cpu_queue:     int   = 16
-    dali_gpu_queue:     int   = 6
-    dali_num_threads:   int   = 8
-    hw_decoder_load:    float = 0.90
+    dali_cpu_queue:    int   = 16
+    dali_gpu_queue:    int   = 6
+    dali_num_threads:  int   = 8
+    hw_decoder_load:   float = 0.90
 
     shuffle_buffer_size: int  = 512
 
-    use_fp8_output:      bool = False
-    dali_fp8_output:     bool = False
-    fuse_normalization:  bool = True
-    output_dtype:        str  = "bf16"
+    use_fp8_output:     bool = False
+    dali_fp8_output:    bool = False
+    fuse_normalization: bool = True
+    output_dtype:       str  = "bf16"
 
     stateful_dataloader:    bool = True
     checkpoint_dir:         str  = ""
     checkpoint_every_steps: int  = 500
 
-    force_topology:   str | None = None
-    seed:             int        = 0
+    force_topology: str | None = None
+    seed:           int        = 0
 
-    debug_log_keys:   str | None = None
+    debug_log_keys: str | None = None
 
-    stall_timeout_s:      float      = 600.0
-    shm_warn_threshold:   float      = 0.90
-    prometheus_port:      int | None = None
+    stall_timeout_s:    float      = 600.0
+    shm_warn_threshold: float      = 0.90
+    prometheus_port:    int | None = None
 
     adaptive_prefetch:             bool  = False
     adaptive_prefetch_target_util: float = 0.80
 
     def __post_init__(self) -> None:
-        if self.shard_extraction_workers != 4:
-            warnings.warn(
-                "LoaderConfig.shard_extraction_workers is deprecated and ignored. "
-                "Use extraction_pool=SharedExtractionPoolConfig(max_workers=N) instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
         if self.use_fp8_output:
             try:
                 import transformer_engine.pytorch  # noqa: F401, PLC0415

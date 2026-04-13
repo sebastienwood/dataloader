@@ -36,6 +36,12 @@ Pointeur LATEST [CK-3]
 ------------------------
 Un fichier ``LATEST`` pointe vers le checkpoint le plus récent pour une
 découverte rapide.  Fallback sur glob-sort pour la compat ascendante.
+
+Signature des fonctions I/O
+-----------------------------
+``save_checkpoint(path, state)`` et ``load_checkpoint(path)`` — la path
+est toujours le premier argument pour cohérence avec les conventions
+Python (pathlib, open, etc.).
 """
 
 import contextlib

@@ -10,13 +10,19 @@ Parallélisme CPU [PERF-CPU]
 ----------------------------
 ``CPUAugPipeline.run_one_batch()`` parallélise le décodage et l'augmentation
 JPEG avec un ``ThreadPoolExecutor`` interne.  Pour ``batch_size=512``, le gain
-est ~4–8× selon le nombre de cœurs disponibles, au prix d'une légère overhead
-de scheduling.  Le nombre de workers est borné à ``min(batch_size, os.cpu_count() or 4)``.
+est ~4–8× selon le nombre de cœurs disponibles.  Le nombre de workers est
+borné à ``min(batch_size, os.cpu_count() or 4, 16)``.
+
+Cycle de vie du ThreadPoolExecutor [PERF-THREAD]
+-------------------------------------------------
+``CPUAugPipeline`` expose ``close()`` pour arrêter explicitement son executor.
+``CPUBackend.build_pipeline`` crée et retourne le pipeline ; l'appelant
+(``loader.py``) est responsable de ``close()`` lors du teardown.
 
 Dispatching sur AugmentationSpec [CPU-AUG-1..4]
 -------------------------------------------------
 ``CPUBackend.build_pipeline`` sélectionne la bonne implémentation selon le
-type de spec via ``isinstance``, conformément au pattern du ``DALIBackend``.
+type de spec via ``isinstance``.
 
 Normalisation [NORM]
 --------------------
@@ -43,9 +49,9 @@ from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image, ImageFilter
 import torchvision.transforms as TV
 import torchvision.transforms.functional as TF
+from PIL import Image
 
 from dino_loader.augmentation import (
     AugmentationSpec,
@@ -80,8 +86,11 @@ def _resolve_torch_dtype(pipeline_cfg: PipelineConfig | None) -> torch.dtype:
 class InProcessShardCache:
     """Cache de shards LRU en mémoire de processus.
 
+    Conçu pour les tests et la CI — pas une alternative à ``NodeSharedShardCache``
+    en production.  Ne supporte pas /dev/shm, le prefetch async, ni le mmap pool.
+
     Args:
-        max_gb:  Budget maximum en Go.
+        max_gb: Budget maximum en Go.
 
     """
 
@@ -137,6 +146,25 @@ class InProcessShardCache:
 
 
 # ---------------------------------------------------------------------------
+# Paramètres d'augmentation par vue — évite la répétition des arguments
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ViewAugParams:
+    """Paramètres d'augmentation pour une seule vue.
+
+    Regroupe les paramètres qui varient entre les vues globales et locales
+    pour éviter de les passer un par un à ``_augment_one``.
+    """
+
+    crop_size: int
+    scale:     tuple[float, float]
+    blur_prob: float
+    sol_prob:  float
+
+
+# ---------------------------------------------------------------------------
 # Helpers d'augmentation
 # ---------------------------------------------------------------------------
 
@@ -153,7 +181,6 @@ def _random_resized_crop(
         ratio         = ratio,
         interpolation = TV.InterpolationMode.BICUBIC,
     )(img)
-    
 
 
 def _center_crop(img: Image.Image, size: int) -> Image.Image:
@@ -175,9 +202,9 @@ def _color_jitter(
     if random.random() > prob:
         return img
     return TV.ColorJitter(
-            brightness=brightness, contrast=contrast,
-            saturation=saturation, hue=hue,
-        )(img)
+        brightness=brightness, contrast=contrast,
+        saturation=saturation, hue=hue,
+    )(img)
 
 
 def _gaussian_blur(
@@ -208,19 +235,24 @@ def _to_tensor_normalized(
 def _augment_one(
     jpeg_bytes: bytes,
     aug_cfg:    DINOAugConfig,
-    crop_size:  int,
-    scale:      tuple[float, float],
-    blur_prob:  float,
-    sol_prob:   float,
+    params:     _ViewAugParams,
     out_dtype:  torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Augmentation DINOv2 sur un seul JPEG — thread-safe (pas d'état partagé)."""
+    """Augmentation DINOv2 sur un seul JPEG — thread-safe (pas d'état partagé).
+
+    Args:
+        jpeg_bytes: Bytes JPEG bruts.
+        aug_cfg:    Configuration d'augmentation (probabilités, sigmas, etc.).
+        params:     Paramètres spécifiques à cette vue (crop_size, scale, proba).
+        out_dtype:  Dtype de sortie.
+
+    """
     try:
         img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
     except Exception:  # noqa: BLE001
-        return torch.zeros(3, crop_size, crop_size, dtype=out_dtype)
+        return torch.zeros(3, params.crop_size, params.crop_size, dtype=out_dtype)
 
-    img = _random_resized_crop(img, crop_size, scale)
+    img = _random_resized_crop(img, params.crop_size, params.scale)
     if random.random() < aug_cfg.flip_prob:
         img = img.transpose(Image.FLIP_LEFT_RIGHT)
     img = _color_jitter(
@@ -229,8 +261,8 @@ def _augment_one(
     )
     if random.random() < aug_cfg.grayscale_prob:
         img = img.convert("L").convert("RGB")
-    img = _gaussian_blur(img, aug_cfg.blur_sigma_min, aug_cfg.blur_sigma_max, blur_prob)
-    if sol_prob > 0 and random.random() < sol_prob:
+    img = _gaussian_blur(img, aug_cfg.blur_sigma_min, aug_cfg.blur_sigma_max, params.blur_prob)
+    if params.sol_prob > 0 and random.random() < params.sol_prob:
         img = TF.solarize(img, 128)
     return _to_tensor_normalized(img, aug_cfg.norm_stats, out_dtype=out_dtype)
 
@@ -246,9 +278,11 @@ class CPUAugPipeline:
     [PERF-CPU] Le décodage et l'augmentation de chaque JPEG sont parallélisés
     via un ``ThreadPoolExecutor`` interne.  Le GIL est relâché pendant les
     opérations PIL (I/O decode) — le gain réel dépend de la charge CPU.
+
+    [PERF-THREAD] Appeler ``close()`` explicitement pour libérer les threads
+    dès que le pipeline n'est plus utilisé.
     """
 
-    # Nombre de workers : borné à cpu_count pour éviter la sursouscription.
     _MAX_WORKERS: int = min(os.cpu_count() or 4, 16)
 
     def __init__(
@@ -265,16 +299,19 @@ class CPUAugPipeline:
         self._batch_size     = batch_size
         self._resolution_src = resolution_src
         self._out_dtype      = out_dtype
-        # seed global pour reproductibilité des tests — les workers utilisent
-        # leurs propres états RNG locaux (thread-local random).
         random.seed(seed)
         self._executor = ThreadPoolExecutor(
             max_workers        = min(batch_size, self._MAX_WORKERS),
             thread_name_prefix = "cpu-aug",
         )
+        self._closed = False
 
     def run_one_batch(self) -> dict[str, torch.Tensor]:
         """Produit un batch augmenté en parallèle."""
+        if self._closed:
+            msg = "CPUAugPipeline.run_one_batch() called after close()"
+            raise RuntimeError(msg)
+
         global_size_arr, local_size_arr = self._resolution_src()
         global_size = int(global_size_arr)
         local_size  = int(local_size_arr)
@@ -283,53 +320,61 @@ class CPUAugPipeline:
         assert len(jpeg_batch) == self._batch_size
 
         cfg = self._aug_cfg
-        n_views = cfg.n_views
+
+        # Pré-calculer les _ViewAugParams pour toutes les vues une seule fois.
+        view_params: list[_ViewAugParams] = []
+        for i in range(cfg.n_global_crops):
+            blur_p = cfg.blur_prob_global1 if i == 0 else cfg.blur_prob_global2
+            sol_p  = cfg.solarize_prob if i == 1 else 0.0
+            view_params.append(_ViewAugParams(
+                crop_size = global_size,
+                scale     = cfg.global_crops_scale,
+                blur_prob = blur_p,
+                sol_prob  = sol_p,
+            ))
+        for _ in range(cfg.n_local_crops):
+            view_params.append(_ViewAugParams(
+                crop_size = local_size,
+                scale     = cfg.local_crops_scale,
+                blur_prob = cfg.blur_prob_local,
+                sol_prob  = 0.0,
+            ))
+
+        out_dtype = self._out_dtype
 
         def _augment_sample(jpeg_arr: np.ndarray) -> list[torch.Tensor]:
-            """Augmente un seul sample — appelé en parallèle."""
             jpeg_bytes = bytes(jpeg_arr)
-            views: list[torch.Tensor] = []
-            for i in range(cfg.n_global_crops):
-                blur_p = cfg.blur_prob_global1 if i == 0 else cfg.blur_prob_global2
-                sol_p  = cfg.solarize_prob if i == 1 else 0.0
-                views.append(_augment_one(
-                    jpeg_bytes, cfg,
-                    crop_size=global_size, scale=cfg.global_crops_scale,
-                    blur_prob=blur_p, sol_prob=sol_p,
-                    out_dtype=self._out_dtype,
-                ))
-            for _ in range(cfg.n_local_crops):
-                views.append(_augment_one(
-                    jpeg_bytes, cfg,
-                    crop_size=local_size, scale=cfg.local_crops_scale,
-                    blur_prob=cfg.blur_prob_local, sol_prob=0.0,
-                    out_dtype=self._out_dtype,
-                ))
-            return views
+            return [
+                _augment_one(jpeg_bytes, cfg, params, out_dtype)
+                for params in view_params
+            ]
 
-        # Exécution parallèle : futures indexées pour préserver l'ordre.
         futures = {
             self._executor.submit(_augment_sample, jpeg): idx
             for idx, jpeg in enumerate(jpeg_batch)
         }
 
-        # Reconstruction dans l'ordre original.
         results: list[list[torch.Tensor]] = [[] for _ in range(self._batch_size)]
         for future in as_completed(futures):
             idx = futures[future]
             results[idx] = future.result()
 
-        # Transposition : (batch × views) → (views × batch).
-        output: dict[str, torch.Tensor] = {}
-        for view_idx in range(n_views):
-            output[f"view_{view_idx}"] = torch.stack(
+        return {
+            f"view_{view_idx}": torch.stack(
                 [results[sample_idx][view_idx] for sample_idx in range(self._batch_size)]
             )
-        return output
+            for view_idx in range(cfg.n_views)
+        }
+
+    def close(self) -> None:
+        """Arrête l'executor et libère les threads."""
+        if not self._closed:
+            self._closed = True
+            self._executor.shutdown(wait=False, cancel_futures=True)
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
-            self._executor.shutdown(wait=False)
+            self.close()
 
 
 class CPUEvalPipeline:
@@ -366,6 +411,9 @@ class CPUEvalPipeline:
             tensors.append(t)
 
         return {"view_0": torch.stack(tensors)}
+
+    def close(self) -> None:
+        """No-op — pas d'executor à libérer."""
 
 
 class CPULeJEPAPipeline:
@@ -414,6 +462,9 @@ class CPULeJEPAPipeline:
 
         return {k: torch.stack(v) for k, v in output.items()}
 
+    def close(self) -> None:
+        """No-op — pas d'executor à libérer."""
+
 
 class CPUUserAugPipeline:
     """Pipeline CPU pour UserAugSpec : decode → normalise → aug_fn utilisateur."""
@@ -448,12 +499,15 @@ class CPUUserAugPipeline:
 
         return spec.aug_fn(torch.stack(tensors))
 
+    def close(self) -> None:
+        """No-op — pas d'executor à libérer."""
+
 
 class CPUPipelineIterator:
     """Enveloppe un pipeline CPU dans l'API ``DALIGenericIterator``."""
 
     def __init__(self, pipeline: Any, output_map: list[str], batch_size: int) -> None:
-        self._pipe      = pipeline
+        self._pipe       = pipeline
         self._output_map = output_map
         self._exhausted  = False
 
@@ -600,6 +654,9 @@ class CPUBackend:
         specs:        Any = None,
     ) -> Any:
         """Dispatche sur le type de spec et construit le pipeline CPU approprié.
+
+        Le pipeline retourné expose ``close()`` — appeler explicitement
+        lors du teardown pour libérer les threads.
 
         Args:
             source:       Source callable compatible MixingSource.

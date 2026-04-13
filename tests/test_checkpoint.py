@@ -3,6 +3,11 @@
 Tests unitaires pour :class:`dino_loader.checkpoint.DataLoaderCheckpointer`
 et les fonctions ``save_checkpoint`` / ``load_checkpoint``.
 
+Convention de signature
+-----------------------
+``save_checkpoint(path, state)`` — la path est toujours le premier argument,
+cohérent avec les conventions Python standard (pathlib, open, json.dump, etc.).
+
 Coverage
 --------
 save_checkpoint / load_checkpoint
@@ -152,6 +157,13 @@ class TestSaveLoadCheckpoint:
         state = load_checkpoint(path)
         assert state.step == 1
 
+    def test_path_is_first_argument(self, tmp_path: Path) -> None:
+        """Canonical signature: save_checkpoint(path, state) — path first."""
+        path  = tmp_path / "sig.json"
+        state = _state(step=55)
+        save_checkpoint(path, state)
+        assert load_checkpoint(path).step == 55
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DataLoaderCheckpointer.save
@@ -263,7 +275,6 @@ class TestLatestPointer:
         assert f"{n:012d}" in latest_name
 
     def test_fallback_to_glob_when_no_latest(self, tmp_path: Path) -> None:
-        """Sans fichier LATEST, load() doit tomber en glob-sort."""
         path = tmp_path / "dl_state_000000000050.json"
         save_checkpoint(path, _state(step=50))
         ckpt = DataLoaderCheckpointer(str(tmp_path), every_n_steps=1, rank=0)
@@ -314,7 +325,6 @@ class TestCheckpointerPruning:
 class TestCheckpointStateIsDataclass:
 
     def test_has_no_save_method(self) -> None:
-        """CheckpointState est un pur dataclass — save/load sont dans checkpoint.py."""
         assert not hasattr(CheckpointState, "save"), (
             "CheckpointState.save() a été trouvé — la logique I/O doit vivre "
             "dans DataLoaderCheckpointer / save_checkpoint()."

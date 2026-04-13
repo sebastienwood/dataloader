@@ -22,7 +22,7 @@
 - **Niveau module uniquement.** Les imports lourds conditionnels (`torch.distributed`, `nvidia.dali`, etc.)
   restent locaux à leur fonction avec `# noqa: PLC0415` et un commentaire de justification.
 - **Pas d'imports circulaires.** L'ordre de dépendance est :
-  `config → augmentation → sources → shard_reader → batch_node → pipeline_graph → backends → loader`.
+  `config → augmentation → sources → shard_reader → dali_node → pipeline_graph → backends → loader`.
   `monitor.*` est importé seulement depuis les couches qui en ont besoin.
 - Les blocs `TYPE_CHECKING` sont autorisés uniquement pour les références forward dans les annotations.
 
@@ -57,6 +57,13 @@
 Toutes les statistiques de normalisation sont stockées et transmises en **échelle [0, 1]** dans tout le codebase.
 La source de vérité unique est `NormStats` (dans `config.py`).
 
+La construction de tables de normalisation et des tableaux par batch est centralisée dans `norm_utils.py` :
+
+| Fonction | Usage |
+|---|---|
+| `build_norm_table(aug_cfg, specs)` | Construit la table indexée par dataset |
+| `build_norm_arrays(indices, table, fallback)` | Construit les arrays `(B, 3)` par batch |
+
 Les conversions vers d'autres échelles se font **uniquement au point d'utilisation**, via les méthodes helper de `NormStats` :
 
 | Méthode | Échelle | Utilisé par |
@@ -73,15 +80,16 @@ Les conversions vers d'autres échelles se font **uniquement au point d'utilisat
 | Fichier | Responsabilité |
 |------|---------------|
 | `config.py` | Dataclasses pures : `DINOAugConfig`, `LoaderConfig`, `CheckpointState`, `NormStats`, `PipelineConfig` |
-| `augmentation.py` | Hiérarchie `AugmentationSpec` + protocole `SamplePredicate` + `split_views` par spec |
-| `checkpoint.py` | `save_checkpoint`, `load_checkpoint`, `DataLoaderCheckpointer` — toute la logique I/O + SHA-256 |
-| `batch_node.py` | `_DALINode` — pilote l'itérateur backend, assemble `Batch`, métriques, stall watchdog |
+| `augmentation.py` | `SampleRecord`, `SampleMeta`, `SamplePredicate` + hiérarchie `AugmentationSpec` + `split_views` par spec |
+| `norm_utils.py` | `build_norm_table`, `build_norm_arrays` — partagé entre pipelines DALI statique et dynamique |
+| `checkpoint.py` | `save_checkpoint(path, state)`, `load_checkpoint`, `DataLoaderCheckpointer` — toute la logique I/O + SHA-256 |
+| `dali_node.py` | `_DALINode` — pilote l'itérateur backend, assemble `Batch`, métriques, stall watchdog |
 | `sources/protocol.py` | `SourceProtocol` — interface commune pour toutes les sources de données |
 | `sources/_weights.py` | `MixingWeights` — vecteur de poids normalisé thread-safe |
 | `sources/resolution.py` | `ResolutionSource` — holder thread-safe de la résolution de crop |
 | `sources/hpc_source.py` | `MixingSource`, `ShardIterator` — source de production HPC (Lustre + /dev/shm) |
 | `sources/wds_source.py` | `WDSSource` — source alternative basée webdataset |
-| `shard_reader.py` | `ShardReaderNode`, `build_reader_graph` — stages 1-2 : I/O shards + mixing |
+| `shard_reader.py` | `ShardReaderNode`, `_ReaderAdapter`, `build_reader_graph` — stages 1-2 : I/O shards + mixing |
 | `pipeline_graph.py` | `MetadataNode`, `MaskMapNode`, `BatchMapNode`, `BatchFilterNode`, `NodePipeline`, `wrap_loader` |
 | `pipeline.py` | Constructeur de pipeline DALI statique + `NormSource` |
 | `memory.py` | `Batch`, `H2DStream`, `FP8Formatter`, `allocate_buffers` |
@@ -102,10 +110,18 @@ Les conversions vers d'autres échelles se font **uniquement au point d'utilisat
   Il n'y a **pas de dispatch `isinstance`** dans `loader.py` pour ces opérations.
 
 - **`CheckpointState` est un pur dataclass** sans `save()` ni `load()`.
-  Ces méthodes sont dans `checkpoint.py` (`save_checkpoint`, `load_checkpoint`).
+  Ces méthodes sont dans `checkpoint.py` (`save_checkpoint(path, state)`, `load_checkpoint(path)`).
+  **La path est toujours le premier argument** (cohérent avec les conventions Python standard).
 
-- **`_DALINode` est dans `batch_node.py`** — il pilote l'itérateur backend et assemble les Batch.
-  `pipeline_graph.py` le ré-exporte pour la compat mais n'en dépend pas pour sa logique propre.
+- **`_DALINode` est dans `dali_node.py`** — il pilote l'itérateur backend et assemble les Batch.
+  Importer directement depuis `dino_loader.dali_node`.
+
+- **`_ReaderAdapter` est dans `shard_reader.py`** — il est le bridge entre `ShardReaderNode`
+  et le callable attendu par les backends.  Il n'a aucune dépendance sur `loader.py`.
+
+- **`SampleRecord`, `SampleMeta`, `SamplePredicate` sont dans `augmentation.py`** —
+  ils constituent le contrat entre les sources (qui produisent des `SampleRecord`) et le
+  filtrage/augmentation (qui les consomme).
 
 - `shard_reader.py` ne connaît **pas** `pipeline_graph.py`. La dépendance est unidirectionnelle :
   `loader.py → shard_reader.py → sources/`, jamais l'inverse.
@@ -122,8 +138,7 @@ Les conversions vers d'autres échelles se font **uniquement au point d'utilisat
 - Les modules `monitor/` sont importés **paresseusement** avec `# noqa: PLC0415`.
 
 - Toutes les statistiques de normalisation passent par `NormStats`. Pas de conversion `× 255` en ligne.
-
-- **`nodes.py` a été supprimé.** Importer directement depuis `shard_reader` et `pipeline_graph`.
+  La logique de construction des arrays par batch est dans `norm_utils.py`.
 
 ---
 
@@ -131,17 +146,32 @@ Les conversions vers d'autres échelles se font **uniquement au point d'utilisat
 
 Deux implémentations de source, toutes deux conformes à `SourceProtocol` :
 
-### `MixingSource` (HPC, production)
+### `MixingSource` (HPC, production) — `sources/hpc_source.py`
 - Cache /dev/shm + double-buffering strict I/O + extraction
 - Pool d'extraction partagé (`SharedExtractionPoolConfig`) — borne le budget de threads
 - Recommandée sur B200 / GB200 NVL72 avec Lustre lent (≥ 8 rangs/nœud)
+- `ShardIterator` est interne à `hpc_source.py` — ne pas l'importer directement depuis `loader.py`
 
-### `WDSSource` (simple, alternative)
+### `WDSSource` (simple, alternative) — `sources/wds_source.py`
 - Délègue cycling, shuffle et mixing à `webdataset`
 - Recommandée sur NVMe local ou Lustre MDS rapide (≤ 8 rangs/nœud)
 
 ### Règle d'or
 Typer les arguments de source avec `SourceProtocol`, pas avec une implémentation concrète.
+
+---
+
+## Checkpoint I/O
+
+La signature canonique est **`save_checkpoint(path, state)`** — la path est le premier argument,
+cohérent avec les conventions Python standard (pathlib, open, json.dump, etc.).
+
+```python
+from dino_loader.checkpoint import save_checkpoint, load_checkpoint
+
+save_checkpoint(path, state)   # path en premier
+state = load_checkpoint(path)
+```
 
 ---
 
@@ -193,6 +223,8 @@ Le dispatch sur les sous-types de `AugmentationSpec` doit être **limité aux ba
 
 `CPUAugPipeline.run_one_batch()` parallélise le décodage + augmentation JPEG via un `ThreadPoolExecutor` interne.  Le nombre de workers est `min(batch_size, cpu_count, 16)`.  La reproductibilité des tests est assurée par un seed initial commun ; les workers utilisent leurs propres états RNG thread-locaux.
 
+`CPUAugPipeline` expose une méthode `close()` — appeler explicitement via `CPUBackend` ou dans un context manager pour éviter les fuites de threads.
+
 ---
 
 ## Tests
@@ -201,10 +233,22 @@ Le dispatch sur les sous-types de `AugmentationSpec` doit être **limité aux ba
 - **Isolation** : chaque test est indépendant. Les singletons et l'état global sont patchés dans les fixtures.
 - **Tests lents** : tout test qui démarre de vrais threads `ShardIterator`, construit un graphe `tn.Loader` complet,
   ou exécute plusieurs opérations d'I/O de shards doit être décoré avec `@pytest.mark.slow`.
-- **Imports directs** : les tests importent depuis `shard_reader` et `pipeline_graph`,
-  **jamais depuis `nodes`** (supprimé).
-- **`test_nodes.py` a été remplacé par `test_shard_reader.py`.**
-- **Pas de `from __future__ import annotations`** dans les fichiers de test.
+
+### Organisation des fichiers de tests
+
+La convention suit la structure de `src/dino_loader/` :
+
+- Un module de premier niveau `src/dino_loader/foo.py` → `tests/test_foo.py`
+- Un sous-package `src/dino_loader/sources/` → `tests/sources/test_hpc_source.py`, `tests/sources/test_wds_source.py`, etc.
+- Les fixtures partagées vivent dans `tests/fixtures/__init__.py` (fonctions pures) et `tests/conftest.py` (fixtures pytest).
+
+`make_spec` est défini **uniquement** dans `tests/fixtures/__init__.py` et importé par `conftest.py` — pas de doublon.
+
+### Imports dans les tests
+
+- Importer directement depuis `shard_reader` et `pipeline_graph`.
+- Importer `_DALINode` depuis `dino_loader.dali_node`.
+- Importer `_ReaderAdapter` depuis `dino_loader.shard_reader`.
 
 ---
 
@@ -215,6 +259,7 @@ Le dispatch sur les sous-types de `AugmentationSpec` doit être **limité aux ba
 - **`NormSource` copy-on-write** : `set_dataset_indices()` construit la nouvelle liste hors du lock et swap atomiquement.
 - **Budget de threads** : le pool d'extraction est partagé entre tous les `ShardIterator` via `SharedExtractionPoolConfig`.
 - **Parallélisme CPU** : `CPUAugPipeline` utilise un `ThreadPoolExecutor` pour paralléliser le décodage JPEG.
+- **`build_norm_arrays`** est factorisé dans `norm_utils.py` — ne pas dupliquer la logique de lookup par batch.
 
 ---
 

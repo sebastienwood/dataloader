@@ -1,20 +1,16 @@
 """tests/test_dali_queue.py
 ===========================
-Tests verifying the removal of AsyncPrefetchIterator and correct DALI queue
-sizing after that removal.
+Tests verifying DALI queue sizing and end-to-end CPU pipeline correctness.
 
 Background
 ----------
-AsyncPrefetchIterator was removed because DALI's internal prefetch queues
-(controlled by ``dali_cpu_queue`` / ``dali_gpu_queue``) already provide
-equivalent double-buffering natively.  ``dali_cpu_queue`` was raised to
-≥ 16 to compensate.
+DALI's internal prefetch queues (controlled by ``dali_cpu_queue`` /
+``dali_gpu_queue``) provide native double-buffering. ``dali_cpu_queue``
+must be ≥ 16 to maintain adequate throughput.
 
 Coverage
 --------
-- AsyncPrefetchIterator is absent from memory.py and loader.py
 - dali_cpu_queue default is ≥ 16 in LoaderConfig
-- _raw_iter iterates directly over self._dali_iter (no Future/executor layer)
 - End-to-end: multiple epochs produce valid Batch objects (CPU backend)
 - Batch content: global_crops shape, dtype, values finite
 - set_epoch between epochs does not raise or corrupt state
@@ -22,7 +18,6 @@ Coverage
 
 from __future__ import annotations
 
-import inspect
 import sys
 from pathlib import Path
 
@@ -34,21 +29,6 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 
-class TestAsyncPrefetchIteratorRemoved:
-
-    def test_not_in_memory_module(self):
-        import dino_loader.memory as m
-        assert not hasattr(m, "AsyncPrefetchIterator"), (
-            "AsyncPrefetchIterator still exists in memory.py — it should be removed."
-        )
-
-    def test_not_referenced_in_loader(self):
-        loader_path = Path(_SRC) / "dino_loader" / "loader.py"
-        assert "AsyncPrefetchIterator" not in loader_path.read_text(), (
-            "loader.py still references AsyncPrefetchIterator."
-        )
-
-
 class TestDALICpuQueueSize:
 
     def test_default_dali_cpu_queue_at_least_16(self):
@@ -56,28 +36,13 @@ class TestDALICpuQueueSize:
         cfg = LoaderConfig()
         assert cfg.dali_cpu_queue >= 16, (
             f"dali_cpu_queue={cfg.dali_cpu_queue} is insufficient; "
-            "set to ≥ 16 to replace AsyncPrefetchIterator buffering."
+            "must be ≥ 16 for adequate double-buffering."
         )
 
     def test_custom_cpu_queue_accepted(self):
         from dino_loader.config import LoaderConfig
         cfg = LoaderConfig(dali_cpu_queue=32)
         assert cfg.dali_cpu_queue == 32
-
-
-class TestRawIterIsSimpleLoop:
-
-    def test_no_future_or_executor_in_raw_iter(self):
-        from dino_loader.loader import DINODataLoader
-        src = inspect.getsource(DINODataLoader._raw_iter)
-        assert "Future" not in src
-        assert "ThreadPoolExecutor" not in src
-        assert "executor" not in src.lower()
-
-    def test_raw_iter_drives_dali_iter_directly(self):
-        from dino_loader.loader import DINODataLoader
-        src = inspect.getsource(DINODataLoader._raw_iter)
-        assert "self._dali_iter" in src
 
 
 class TestEndToEndMultipleEpochs:
@@ -105,7 +70,7 @@ class TestEndToEndMultipleEpochs:
                 node_shm_gb=0.1,
                 stall_timeout_s=0,
                 stateful_dataloader=False,
-                checkpoint_dir=str(tmp_path / "ckpt"),
+                checkpoint_dir="",
             ),
             backend="cpu",
         )
@@ -142,23 +107,19 @@ class TestEndToEndMultipleEpochs:
             )
 
     def test_set_epoch_between_epochs_does_not_raise(self, tmp_path):
-        """set_epoch() called before each epoch must not raise or corrupt the loader."""
         loader = self._make_loader(tmp_path)
         for epoch in range(3):
             loader.set_epoch(epoch)
-            # Consuming at least one batch exercises the full pipeline.
             batch = next(iter(loader))
-            assert batch.global_crops[0].shape[0] == 4  # batch dimension intact
+            assert batch.global_crops[0].shape[0] == 4
 
     def test_metadata_length_matches_batch_size(self, tmp_path):
-        """batch.metadata must have one entry per sample."""
         loader = self._make_loader(tmp_path)
         loader.set_epoch(0)
         batch = next(iter(loader))
         assert len(batch.metadata) == 4
 
     def test_masks_none_without_mask_generator(self, tmp_path):
-        """Without a MaskingGenerator, batch.masks must be None."""
         loader = self._make_loader(tmp_path)
         loader.set_epoch(0)
         batch = next(iter(loader))

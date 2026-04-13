@@ -3,6 +3,9 @@
 ``ShardReaderNode`` — nœud ``torchdata.nodes`` encapsulant les stages 1-2
 du pipeline dino_loader (I/O shards + mixing multi-dataset).
 
+``_ReaderAdapter`` — bridge entre ``ShardReaderNode`` et le callable attendu
+par les backends (DALI ExternalSource ou pipeline CPU).
+
 Pourquoi ce module est séparé
 ------------------------------
 ``ShardReaderNode`` est une primitive d'I/O qui ne dépend ni de DALI ni de
@@ -16,11 +19,22 @@ et clarifie les responsabilités :
 - ``shard_reader`` → stages 1-2 : lecture des shards, mixing, prédication.
 - ``pipeline_graph`` → stages post-DALI : Batch assembly, masking, filtering.
 
+``_ReaderAdapter``
+-------------------
+Adaptateur exposant ``ShardReaderNode`` comme callable source DALI/CPU.
+Il vit dans ce module car il n'a aucune dépendance sur ``DINODataLoader``
+et doit être accessible sans importer ``loader.py``.
+
+[FIX-META-FIFO] ``_meta_queue`` est une ``queue.Queue`` (FIFO) garantissant
+l'alignement strict entre les batches DALI et leurs métadonnées, même
+quand DALI appelle ``__call__()`` de façon préemptive depuis son thread
+de prefetch.
+
 Public API
 ----------
 ::
 
-    from dino_loader.shard_reader import ShardReaderNode, build_reader_graph
+    from dino_loader.shard_reader import ShardReaderNode, _ReaderAdapter, build_reader_graph
 
     cache  = InProcessShardCache(max_gb=1.0)
     loader, reader = build_reader_graph(
@@ -42,6 +56,7 @@ créée qu'une seule fois à la première construction.
 from __future__ import annotations
 
 import logging
+import queue
 from typing import Any
 
 import numpy as np
@@ -49,9 +64,11 @@ import torchdata.nodes as tn
 from dino_datasets import DatasetSpec
 from torchdata.nodes import BaseNode
 
+from dino_loader.augmentation import SamplePredicate
 from dino_loader.config import SharedExtractionPoolConfig
-from dino_loader.sources.hpc_source import MixingSource, SamplePredicate
+from dino_loader.sources.hpc_source import MixingSource
 from dino_loader.sources.protocol import SourceProtocol
+from dino_loader.sources.resolution import ResolutionSource
 
 log = logging.getLogger(__name__)
 
@@ -113,7 +130,6 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
         debug_log_keys:      str | None                = None,
         sample_predicate:    SamplePredicate | None    = None,
     ) -> None:
-        """Initialise un ShardReaderNode."""
         super().__init__()
 
         self._specs         = specs
@@ -264,6 +280,79 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
                 source.close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+# ---------------------------------------------------------------------------
+# _ReaderAdapter — bridge ShardReaderNode → callable DALI/CPU ExternalSource
+# ---------------------------------------------------------------------------
+
+
+class _ReaderAdapter:
+    """Adaptateur exposant ``ShardReaderNode`` comme callable source DALI/CPU.
+
+    [FIX-META-FIFO] ``_meta_queue`` est une ``queue.Queue`` (FIFO) garantissant
+    l'alignement strict entre les batches DALI et leurs métadonnées, même
+    quand DALI appelle ``__call__()`` de façon préemptive depuis son thread
+    de prefetch.
+
+    Attributs de convention
+    -----------------------
+    ``_batch_size`` et ``_resolution_src`` sont lus par les backends via
+    ``getattr`` pour inférer batch_size et la source de résolution.
+
+    """
+
+    _META_QUEUE_MAXSIZE: int = 32
+
+    def __init__(
+        self,
+        reader:         ShardReaderNode,
+        resolution_src: ResolutionSource,
+        batch_size:     int,
+    ) -> None:
+        self._reader         = reader
+        self._resolution_src = resolution_src
+        self._batch_size     = batch_size
+        self._meta_queue: queue.Queue[list[dict | None]] = queue.Queue(
+            maxsize=self._META_QUEUE_MAXSIZE,
+        )
+
+    def __call__(self) -> list:
+        """Retourne un batch de tableaux JPEG (appelé par DALI à chaque step)."""
+        jpegs, metadata = self._reader.next()
+        try:
+            self._meta_queue.put_nowait(metadata)
+        except queue.Full:
+            log.warning(
+                "_ReaderAdapter: queue de métadonnées pleine (%d slots). "
+                "Augmenter _META_QUEUE_MAXSIZE ou réduire les profondeurs de queue DALI.",
+                self._META_QUEUE_MAXSIZE,
+            )
+            try:
+                self._meta_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._meta_queue.put_nowait(metadata)
+        return jpegs
+
+    def pop_last_metadata(self) -> list[dict | None]:
+        """Retourne les métadonnées du batch le plus ancien (FIFO)."""
+        try:
+            return self._meta_queue.get_nowait()
+        except queue.Empty:
+            log.debug("_ReaderAdapter.pop_last_metadata: queue vide, retour []")
+            return []
+
+    def register_dataset_index_callback(self, cb: Any) -> None:
+        """Propage les callbacks NormSource vers la MixingSource interne."""
+        source = self._reader._source  # type: ignore[attr-defined]
+        if source is not None and hasattr(source, "register_dataset_index_callback"):
+            source.register_dataset_index_callback(cb)
+        else:
+            log.warning(
+                "_ReaderAdapter: register_dataset_index_callback appelé avant "
+                "ShardReaderNode.reset() — callback non enregistré.",
+            )
 
 
 # ---------------------------------------------------------------------------

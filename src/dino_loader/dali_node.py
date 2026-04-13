@@ -1,34 +1,28 @@
 """dino_loader.dali_node
 ======================
-``_DALINode`` — torchdata BaseNode that drives the DALI/CPU iterator and
-assembles fully-formed ``Batch`` objects.
+``_DALINode`` — torchdata ``BaseNode`` qui pilote un itérateur backend
+(DALI ou CPU) et assemble des ``Batch`` prêts pour la boucle d'entraînement.
 
-Responsibilities
-----------------
-This node is the boundary between ``torchdata.nodes`` and the augmentation
-pipeline (DALI or CPU).  It:
+Responsabilité unique
+---------------------
+Ce nœud est la frontière entre ``torchdata.nodes`` et le pipeline
+d'augmentation.  Il ne contient aucune logique d'augmentation, de filtrage
+ou de composition de pipeline.
 
-- Drives the DALI/CPU iterator via ``next()``.
-- Assembles views into a ``Batch`` via the injected ``build_batch_fn``.
-- Updates per-rank metrics (``loader_batches_yielded``, ``pipeline_yield_ms``,
-  ``heartbeat``).
-- Detects stalls: if no batch is produced and ``stall_timeout_s > 0``, raises
-  ``RuntimeError`` with an actionable diagnostic message.
+Séparation des responsabilités
+--------------------------------
+::
 
-Placement rationale
--------------------
-``_DALINode`` is not a backend (it doesn't build pipelines or manage GPU
-resources) and not a post-processing transform (it doesn't operate on
-``Batch`` objects flowing through a graph).  It is the pivot point between
-the two worlds and lives here at the loader layer.
+    BackendProtocol.build_pipeline_iterator()   → produit un itérateur
+    _DALINode                                   → consomme l'itérateur, assemble Batch
+    pipeline_graph.NodePipeline                 → compose des transforms sur les Batch
 
 Thread safety
 -------------
-``reset_iter()`` (called from ``set_epoch()`` in the main thread) and
-``next()`` (called from the torchdata worker thread) are protected by
-``_iter_lock`` to prevent a race on ``_iter``.
-
-[REFACTOR-R2] Extracted from ``pipeline_graph.py``.
+``reset_iter()`` et ``next()`` peuvent être appelés depuis des threads
+différents.  ``_iter_lock`` protège l'accès à ``_iter`` contre la race
+condition entre ``set_epoch()`` (thread principal) et ``next()`` (thread
+torchdata).
 """
 
 import logging
@@ -46,18 +40,17 @@ log = logging.getLogger(__name__)
 
 
 class _DALINode(BaseNode):  # type: ignore[misc]
-    """Drives a DALI/CPU iterator and emits ``Batch`` objects.
+    """Pilote un itérateur DALI/CPU et émet des ``Batch`` fully assembled.
 
     Args:
-        dali_iter_factory: ``() -> iterator`` called at each ``reset()``.
-            Must produce a DALI/CPU-compatible iterator.
-        pop_metadata_fn: ``() -> list[dict | None]`` — retrieves the metadata
-            for the current batch (called once per ``next()``).
-        build_batch_fn: ``(views, metadata) -> Batch`` — assembles views into
-            a ``Batch`` (H2D transfer, FP8 quantisation, masking).
-        output_map: Ordered view names produced by the iterator.
-        stall_timeout_s: Seconds before raising on no batches. 0 = disabled.
-        rank: Global rank (used in error messages).
+        dali_iter_factory: ``() -> iterator`` appelé à chaque ``reset()``.
+            Produit un itérateur compatible ``DALIGenericIterator``.
+        pop_metadata_fn: ``() -> list[dict | None]`` — récupère les
+            métadonnées du batch courant depuis l'adaptateur source.
+        build_batch_fn: ``(views, metadata) -> Batch`` — assemble le batch.
+        output_map: Noms des vues produites par l'itérateur.
+        stall_timeout_s: Secondes avant levée si aucun batch. 0 = désactivé.
+        rank: Rang global pour les messages d'erreur.
 
     """
 
@@ -82,29 +75,28 @@ class _DALINode(BaseNode):  # type: ignore[misc]
         self._iter_lock     = threading.Lock()
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
-        """Re-initialise the iterator for a new epoch."""
+        """(Re-)initialise l'itérateur pour une nouvelle époque."""
         super().reset(initial_state)
         with self._iter_lock:
             self._iter        = self._iter_factory()
             self._num_yielded = 0
 
     def reset_iter(self) -> None:
-        """Invalidate the current iterator so reset() recreates it.
+        """Invalide l'itérateur courant — appelé par ``set_epoch()`` (thread-safe).
 
-        Called by ``DINODataLoader.set_epoch()`` from the main thread.
-        Thread-safe via ``_iter_lock``.
-
+        La prochaine invocation de ``reset()`` recréera l'itérateur via la
+        factory, prenant en compte la nouvelle configuration d'époque.
         """
         with self._iter_lock:
             self._iter = None
 
     def next(self) -> Batch:
-        """Return the next assembled Batch.
+        """Retourne le prochain ``Batch`` assemblé.
 
         Raises:
-            AssertionError: If ``reset()`` has not been called.
-            StopIteration: At end of epoch.
-            RuntimeError: On stall (no batch produced, stall_timeout_s > 0).
+            StopIteration: En fin d'époque.
+            RuntimeError: Si aucun batch n'est produit et stall_timeout_s > 0.
+            AssertionError: Si ``reset()`` n'a pas été appelé.
 
         """
         with self._iter_lock:
@@ -120,16 +112,16 @@ class _DALINode(BaseNode):  # type: ignore[misc]
             if self._num_yielded == 0 and self._stall_timeout > 0:
                 if os.environ.get("DINO_DISABLE_EMPTY_CHECK"):
                     log.warning(
-                        "_DALINode rank %d: no batch produced but "
-                        "DINO_DISABLE_EMPTY_CHECK is active — continuing silently.",
+                        "_DALINode rank %d: aucun batch produit mais "
+                        "DINO_DISABLE_EMPTY_CHECK est actif.",
                         self._rank,
                     )
                 else:
                     msg = (
-                        f"_DALINode (rank {self._rank}): no batch produced. "
-                        "Possible causes: corrupt shards, /dev/shm full, "
-                        "sample_predicate rejected all samples, slow MDS startup. "
-                        "Disable: DINO_DISABLE_EMPTY_CHECK=1 or stall_timeout_s=0."
+                        f"_DALINode (rank {self._rank}): aucun batch produit. "
+                        "Causes possibles : shards corrompus, /dev/shm plein, "
+                        "sample_predicate a rejeté tous les samples, démarrage MDS lent. "
+                        "Désactiver : DINO_DISABLE_EMPTY_CHECK=1 ou stall_timeout_s=0."
                     )
                     raise RuntimeError(msg) from None
             raise
@@ -146,12 +138,12 @@ class _DALINode(BaseNode):  # type: ignore[misc]
         return batch
 
     def get_state(self) -> dict[str, Any]:
-        """Return persistable state."""
+        """Retourne l'état persistable de ce nœud."""
         return {"_num_yielded": self._num_yielded}
 
 
 def _update_metrics(elapsed_ms: int) -> None:
-    """Increment loader metrics via the module-level registry."""
+    """Incrémente les métriques loader via le registry global."""
     try:
         from dino_loader.monitor.metrics import get_registry  # noqa: PLC0415
         reg = get_registry()
