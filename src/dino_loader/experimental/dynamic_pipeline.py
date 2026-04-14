@@ -57,6 +57,14 @@ Limitations
 
 See ``scripts/benchmark.py`` for a head-to-head throughput comparison.
 
+Corrections
+-----------
+[FIX-NORM-UTILS-DEDUP] La fonction locale ``_build_norm_table`` a été
+    supprimée.  La logique centralisée dans ``dino_loader.norm_utils`` est
+    maintenant utilisée directement (``build_norm_table``), éliminant le
+    doublon et garantissant que les deux pipelines (statique et dynamique)
+    utilisent exactement la même logique de construction de la table.
+
 Public API
 ----------
 ::
@@ -97,6 +105,11 @@ from dino_loader.augmentation import (
 )
 from dino_loader.config import DINOAugConfig, NormStats
 
+# [FIX-NORM-UTILS-DEDUP] Use the shared norm_utils module instead of a local
+# copy.  Both the static DALI pipeline and this dynamic pipeline must share
+# the same normalisation table construction logic.
+from dino_loader.norm_utils import build_norm_table
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -123,36 +136,6 @@ def _require_dynamic_dali() -> None:
             "Note: dynamic mode is experimental and may not be available in all builds."
         )
         raise ImportError(msg)
-
-
-# ---------------------------------------------------------------------------
-# Per-dataset normalisation lookup table
-# ---------------------------------------------------------------------------
-
-
-def _build_norm_table(
-    aug_cfg: DINOAugConfig,
-    specs:   list[DatasetSpec],
-) -> list[NormStats]:
-    """Build a lookup table of per-dataset normalisation statistics.
-
-    Falls back to the global ``aug_cfg`` norm stats for datasets that have
-    no per-dataset override.
-
-    Args:
-        aug_cfg: Global augmentation config (provides fallback mean/std).
-        specs: Dataset specifications (may carry per-dataset mean/std).
-
-    Returns:
-        List of ``NormStats`` aligned with ``specs`` (index ``i`` →
-        ``specs[i]``).  Stats are stored in [0, 1] scale.
-
-    """
-    global_stats = aug_cfg.norm_stats
-    return [
-        NormStats.from_config(mean=spec.mean, std=spec.std, fallback=global_stats)
-        for spec in specs
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -217,19 +200,16 @@ def _make_dinov2_aug_fn(
     """Return a dynamic-mode batch function implementing DINOv2 multi-crop.
 
     All stochastic parameters are driven by ``ndd.random.*`` operators to
-    produce **per-sample** independent draws within each batch.  Using Python
-    ``random`` or ``numpy.random`` here would produce a single scalar shared
-    by every sample, making all samples in the batch augmented identically —
-    which would destroy the contrastive diversity required by DINOv3.
+    produce **per-sample** independent draws within each batch.
 
-    Per-sample normalisation uses a full per-sample index lookup (not just the
-    first sample's index), matching the ``NormSource`` semantics of the static
-    pipeline.
+    Per-sample normalisation uses a full per-sample index lookup, matching
+    the ``NormSource`` semantics of the static pipeline.
 
     Args:
         aug_cfg: Augmentation configuration.
         resolution: Thread-safe resolution holder (updated by ``set_resolution``).
         norm_table: Per-dataset normalisation statistics in [0, 1] scale.
+            Built via ``norm_utils.build_norm_table`` (shared with static pipeline).
 
     Returns:
         Callable compatible with the dynamic pipeline iteration protocol.
@@ -240,37 +220,30 @@ def _make_dinov2_aug_fn(
     n_global = aug_cfg.n_global_crops
     n_local  = aug_cfg.n_local_crops
 
-    # Pre-convert norm table to [0, 255] scale once at construction time
-    # rather than on every batch call.
+    # Pre-convert norm table to [0, 255] scale once at construction time.
     norm_table_255: list[tuple[list[float], list[float]]] = [
         stats.to_dali_scale() for stats in norm_table
     ]
-    # Fallback for batches with no dataset index information.
     fallback_mean_255, fallback_std_255 = aug_cfg.norm_stats.to_dali_scale()
 
     def _aug_fn(jpegs: ndd.Batch, ds_indices: list[int]) -> dict[str, ndd.Batch]:
         global_size = resolution.global_size
         local_size  = resolution.local_size
 
-        # Decode once; subsequent crops share the decoded buffer.
         decoded = ndd.decoders.image(jpegs, device="gpu", output_type=types.RGB)
 
-        # Build per-sample mean/std arrays for batch normalisation.
-        # Each sample gets the stats of its own dataset — not a shared scalar.
-        # This matches the NormSource semantics from the static pipeline.
         if ds_indices:
             batch_means = np.stack([
                 np.array(norm_table_255[min(idx, len(norm_table_255) - 1)][0],
                          dtype=np.float32)
                 for idx in ds_indices
-            ])  # shape (B, 3)
+            ])
             batch_stds = np.stack([
                 np.array(norm_table_255[min(idx, len(norm_table_255) - 1)][1],
                          dtype=np.float32)
                 for idx in ds_indices
-            ])  # shape (B, 3)
+            ])
         else:
-            # No index information: use global fallback for all samples.
             b = len(jpegs)
             batch_means = np.tile(
                 np.array(fallback_mean_255, dtype=np.float32), (b, 1),
@@ -287,7 +260,6 @@ def _make_dinov2_aug_fn(
             blur_prob = aug_cfg.blur_prob_global1 if is_first else aug_cfg.blur_prob_global2
             sol_prob  = aug_cfg.solarize_prob if (i == 1) else 0.0
 
-            # ndd.random.* produces one independent draw per sample in the batch.
             crop = ndd.random_resized_crop(
                 decoded,
                 size                = global_size,
@@ -295,8 +267,6 @@ def _make_dinov2_aug_fn(
                 random_aspect_ratio = (3 / 4, 4 / 3),
                 device              = "gpu",
             )
-
-            # Per-sample colour jitter — ndd.random.uniform draws B independent values.
             crop = ndd.color_twist(
                 crop,
                 brightness = ndd.random.uniform(range=(0.6, 1.4)),
@@ -306,7 +276,6 @@ def _make_dinov2_aug_fn(
             )
             crop = ndd.flip(crop, horizontal=ndd.random.coin_flip(), vertical=0)
 
-            # Gaussian blur — applied only to samples where coin_flip fires.
             blur_mask = ndd.random.coin_flip(probability=blur_prob)
             blurred   = ndd.gaussian_blur(
                 crop,
@@ -315,11 +284,10 @@ def _make_dinov2_aug_fn(
             )
             crop = blur_mask * blurred + (1 - blur_mask) * crop
 
-            # Solarisation — second global crop only.
             if sol_prob > 0.0:
-                sol_mask = ndd.random.coin_flip(probability=sol_prob)
+                sol_mask  = ndd.random.coin_flip(probability=sol_prob)
                 solarised = ndd.solarize(crop, threshold=128)
-                crop = sol_mask * solarised + (1 - sol_mask) * crop
+                crop      = sol_mask * solarised + (1 - sol_mask) * crop
 
             crop = ndd.crop_mirror_normalize(
                 crop,
@@ -383,8 +351,8 @@ def _make_eval_aug_fn(aug_spec: EvalAugSpec) -> Any:
     """
     _require_dynamic_dali()
 
-    crop_size      = aug_spec.crop_size
-    resize_size    = int(crop_size * 256 / 224)
+    crop_size         = aug_spec.crop_size
+    resize_size       = int(crop_size * 256 / 224)
     mean_255, std_255 = aug_spec.norm_stats.to_dali_scale()
 
     def _aug_fn(jpegs: ndd.Batch, ds_indices: list[int]) -> dict[str, ndd.Batch]:  # noqa: ARG001
@@ -409,9 +377,6 @@ def _make_eval_aug_fn(aug_spec: EvalAugSpec) -> Any:
 def _make_lejpa_aug_fn(aug_spec: LeJEPAAugSpec) -> Any:
     """Return a dynamic-mode batch function for LeJEPA (context + target crops).
 
-    All stochastic parameters for the context crop use ``ndd.random.*`` to
-    produce per-sample diversity, consistent with the DINOv2 aug function.
-
     Args:
         aug_spec: LeJEPA augmentation specification.
 
@@ -432,7 +397,6 @@ def _make_lejpa_aug_fn(aug_spec: LeJEPAAugSpec) -> Any:
             random_area = aug_spec.context_scale,
             device      = "gpu",
         )
-        # Per-sample colour jitter via ndd.random.uniform.
         context = ndd.color_twist(
             context,
             brightness = ndd.random.uniform(range=(0.6, 1.4)),
@@ -451,7 +415,6 @@ def _make_lejpa_aug_fn(aug_spec: LeJEPAAugSpec) -> Any:
 
         views: dict[str, ndd.Batch] = {"context": context}
 
-        # Target crops — no colour jitter (preserve reconstruction signal).
         for i in range(aug_spec.n_target_views):
             target = ndd.random_resized_crop(
                 decoded,
@@ -493,8 +456,7 @@ class DynamicDINOPipeline:
         device_id: GPU index.
         resolution: Thread-safe resolution holder (for ``DinoV2AugSpec`` only).
         ds_index_fn: Optional callable returning the current batch's per-sample
-            dataset indices.  When provided, enables per-sample normalisation
-            in the DINOv2 aug function.
+            dataset indices.
 
     """
 
@@ -523,17 +485,9 @@ class DynamicDINOPipeline:
         return self
 
     def __next__(self) -> list[dict[str, Any]]:
-        """Return one batch in DALIGenericIterator-compatible format.
-
-        If a ``ds_index_fn`` was registered (via
-        ``MixingSource.register_dataset_index_callback``), per-sample dataset
-        indices are forwarded to the aug function to enable per-sample
-        normalisation.  Otherwise the aug function falls back to global stats.
-        """
+        """Return one batch in DALIGenericIterator-compatible format."""
         jpegs = self._source()
 
-        # Per-sample dataset indices — populated if MixingSource has a
-        # registered callback (set up by build_dynamic_pipeline).
         ds_indices: list[int] = (
             self._ds_index_fn() if self._ds_index_fn is not None else []
         )
@@ -546,7 +500,7 @@ class DynamicDINOPipeline:
         return [views]
 
     def reset(self) -> None:
-        """No-op — stateless between epochs (matches static pipeline behaviour)."""
+        """No-op — stateless between epochs."""
 
     @property
     def output_map(self) -> list[str]:
@@ -585,26 +539,17 @@ def build_dynamic_pipeline(
 ) -> DynamicDINOPipeline:
     """Build a ``DynamicDINOPipeline`` dispatched on ``aug_spec`` type.
 
-    This is a drop-in replacement for the ``build_pipeline`` call in
-    ``DALIBackend.build_pipeline``.  The returned object supports the same
-    iteration interface as ``DALIGenericIterator``.
-
-    Per-sample dataset indices are wired automatically when ``source`` is a
-    ``MixingSource`` instance: a lightweight callback captures the indices
-    from the last ``__call__`` and forwards them to the aug function.  This
-    enables per-sample normalisation matching the static pipeline's
-    ``NormSource``.
+    [FIX-NORM-UTILS-DEDUP] Uses ``norm_utils.build_norm_table`` (shared with
+    the static DALI pipeline) instead of the previously duplicated local
+    ``_build_norm_table`` function.
 
     Args:
-        aug_spec: Augmentation specification — determines which dynamic batch
-            function is constructed.
+        aug_spec: Augmentation specification.
         batch_size: Samples per batch.
         device_id: GPU index.
         source: ``MixingSource``-compatible callable.
-        specs: Dataset specifications for per-dataset normalisation (required
-            for ``DinoV2AugSpec``; ignored otherwise).
-        seed: RNG seed (forwarded to DALI's internal seed; Python/NumPy RNG
-            is intentionally NOT seeded here to avoid global state mutation).
+        specs: Dataset specifications for per-dataset normalisation.
+        seed: RNG seed.
 
     Returns:
         ``DynamicDINOPipeline`` ready for iteration.
@@ -619,10 +564,7 @@ def build_dynamic_pipeline(
     resolution:  _ResolutionHolder | None = None
     ds_index_fn: Any | None = None
 
-    # Wire up per-sample dataset index capture if the source supports it.
-    # MixingSource.register_dataset_index_callback stores the last batch's
-    # indices; we read them back in __next__ via ds_index_fn().
-    _last_ds_indices: list[list[int]] = [[]]  # mutable container for closure
+    _last_ds_indices: list[list[int]] = [[]]
 
     def _capture_indices(indices: list[int]) -> None:
         _last_ds_indices[0] = indices
@@ -630,7 +572,6 @@ def build_dynamic_pipeline(
     def _read_indices() -> list[int]:
         return _last_ds_indices[0]
 
-    # Register only if the source exposes the callback API (MixingSource does).
     if hasattr(source, "register_dataset_index_callback"):
         source.register_dataset_index_callback(_capture_indices)
         ds_index_fn = _read_indices
@@ -638,8 +579,9 @@ def build_dynamic_pipeline(
     match aug_spec:
         case DinoV2AugSpec():
             effective_specs = specs or []
-            norm_table      = _build_norm_table(aug_spec.aug_cfg, effective_specs)
-            resolution      = _ResolutionHolder(
+            # [FIX-NORM-UTILS-DEDUP] Shared norm table construction.
+            norm_table  = build_norm_table(aug_spec.aug_cfg, effective_specs)
+            resolution  = _ResolutionHolder(
                 aug_spec.aug_cfg.global_crop_size,
                 aug_spec.aug_cfg.local_crop_size,
             )
@@ -655,9 +597,6 @@ def build_dynamic_pipeline(
             output_map = aug_spec.output_map
 
         case UserAugSpec():
-            # UserAugSpec already carries a custom Python aug function.
-            # In dynamic mode this is trivial — we decode + normalise with DALI
-            # and hand the result to the user function.
             mean_255, std_255 = aug_spec.norm_stats.to_dali_scale()
 
             def aug_fn(jpegs: Any, ds_indices: list[int]) -> dict[str, Any]:  # noqa: ARG001
