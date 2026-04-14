@@ -564,8 +564,7 @@ class DINODataLoader:
             # returned a 1-D array but of the grid shape, not n_tokens, and the
             # intent (repeat for the whole batch) was never implemented.
             mask_np = self._mask_generator(flat=True)           # shape: (H*W,)
-            import torch as _torch  # noqa: PLC0415
-            mask_1d = _torch.from_numpy(mask_np)                # (H*W,)
+            mask_1d = torch.from_numpy(mask_np)                # (H*W,)
             batch_size = g_gpu[0].shape[0] if g_gpu else len(metadata)
             masks = mask_1d.unsqueeze(0).expand(batch_size, -1) # (B, H*W)
 

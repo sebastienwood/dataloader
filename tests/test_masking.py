@@ -184,7 +184,14 @@ class TestMaskingGeneratorCall:
         assert int(mask.sum()) == 16
 
     def test_1x1_grid(self) -> None:
-        gen = MaskingGenerator(input_size=(1, 1), num_masking_patches=1)
+        # A 1×1 grid has only 1 patch total; min_num_patches must be ≤ 1
+        # so block placement (which requires at least min_num_patches) can work.
+        # The completeness guarantee via _complete_randomly covers the gap.
+        gen = MaskingGenerator(
+            input_size=(1, 1),
+            num_masking_patches=1,
+            min_num_patches=1,
+        )
         mask = gen()
         assert int(mask.sum()) == 1
 
@@ -227,7 +234,8 @@ class TestCompleteRandomly:
 
     def test_complete_randomly_does_not_exceed_target(self) -> None:
         """Shortfall clamped by available unmasked positions."""
-        gen  = MaskingGenerator(input_size=(2, 2), num_masking_patches=2)
+        # Use min_num_patches=1 so the generator is constructible on a 2×2 grid.
+        gen  = MaskingGenerator(input_size=(2, 2), num_masking_patches=2, min_num_patches=1)
         mask = np.zeros((2, 2), dtype=bool)
         # Only 4 positions available; target of 6 should be clamped to 4.
         result = gen._complete_randomly(mask, target=6)
