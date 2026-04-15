@@ -32,10 +32,17 @@ de prefetch.
 
 [FIX-META-QUEUE-SIZE] ``_META_QUEUE_MAXSIZE`` est maintenant calibré sur la
 profondeur réelle de la queue DALI (cpu_queue + gpu_queue + prefetch_factor)
-plutôt que sur une valeur fixe de 32.  La valeur par défaut de 32 était
-insuffisante et pouvait provoquer une perte silencieuse de métadonnées avec
-dali_cpu_queue=16 + prefetch_factor=2.  La nouvelle valeur par défaut de 64
+plutôt que sur une valeur fixe de 32.  La valeur par défaut de 64
 donne une marge suffisante pour tous les régimes recommandés.
+
+[FIX-META-QUEUE-OVERFLOW] Suppression du mécanisme "drop-oldest" qui causait
+une corruption silencieuse des métadonnées.  Si _meta_queue.put_nowait()
+lève queue.Full, c'est une erreur de configuration (meta_queue_size trop
+petit par rapport aux profondeurs de queue DALI) et non une situation à
+absorber silencieusement.  On lève RuntimeError immédiatement pour forcer
+une correction explicite.  La queue ne doit jamais déborder en régime
+normal : meta_queue_size (défaut 64) >> cpu_queue (16) + gpu_queue (6)
++ prefetch_factor (2) ≈ 24 slots max en vol simultanément.
 
 Public API
 ----------
@@ -86,7 +93,7 @@ ReaderBatch = tuple[list[np.ndarray], list[dict[str, Any] | None]]
 # the maximum number of DALI prefetch calls in flight simultaneously.
 # With dali_cpu_queue=16, dali_gpu_queue=6, and prefetch_factor=2, DALI can
 # call __call__() up to ~24 times ahead of the consumer.  We use 64 as the
-# default to give a comfortable safety margin and avoid silent metadata loss.
+# default to give a comfortable safety margin and avoid metadata loss.
 # Operators can override this via the meta_queue_size parameter.
 _DEFAULT_META_QUEUE_SIZE: int = 64
 
@@ -299,6 +306,22 @@ class _ReaderAdapter:
     ``meta_queue_size`` (défaut : 64) pour absorber la profondeur maximale
     de prefetch DALI sans perte silencieuse de métadonnées.
 
+    [FIX-META-QUEUE-OVERFLOW] Si la queue déborde malgré le dimensionnement
+    généreux (64 slots >> ~24 max en vol), c'est un bug de configuration et
+    non une situation à absorber silencieusement.  ``put_nowait`` peut alors
+    lever ``queue.Full`` : on le laisse se propager comme ``RuntimeError``
+    explicite plutôt que de supprimer silencieusement des entrées, ce qui
+    causerait un décalage permanent entre les batches DALI et leurs
+    métadonnées.
+
+    Invariant de correction
+    -----------------------
+    Les métadonnées doivent être alignées 1:1 avec les batches DALI.
+    DALI appelle ``__call__()`` (qui enfile les métadonnées) dans le même
+    ordre que les batches qu'il yield.  ``pop_last_metadata()`` consomme
+    dans le même ordre FIFO.  Tout mécanisme qui altère cet ordre (drop
+    silencieux, swap d'entrées) est une corruption de données.
+
     Attributs de convention
     -----------------------
     ``_batch_size`` et ``_resolution_src`` sont lus par les backends via
@@ -321,24 +344,35 @@ class _ReaderAdapter:
         )
 
     def __call__(self) -> list:
-        """Retourne un batch de tableaux JPEG (appelé par DALI à chaque step)."""
+        """Retourne un batch de tableaux JPEG (appelé par DALI à chaque step).
+
+        Raises:
+            RuntimeError: Si ``_meta_queue`` déborde, indiquant que
+                ``meta_queue_size`` est trop petit par rapport aux profondeurs
+                de queue DALI configurées.  Augmenter ``meta_queue_size`` ou
+                réduire ``dali_cpu_queue`` / ``dali_gpu_queue``.
+
+        """
         jpegs, metadata = self._reader.next()
         try:
             self._meta_queue.put_nowait(metadata)
         except queue.Full:
-            log.warning(
-                "_ReaderAdapter: metadata queue full (%d slots). "
-                "Increase meta_queue_size or reduce DALI queue depths. "
-                "Dropping oldest metadata entry to preserve alignment.",
-                self._meta_queue.maxsize,
+            # [FIX-META-QUEUE-OVERFLOW] Ne jamais supprimer silencieusement
+            # des métadonnées : cela décalerait l'alignement batch↔métadonnées
+            # de façon permanente et silencieuse pour toute la durée de
+            # l'entraînement.  On échoue bruyamment à la place.
+            msg = (
+                f"_ReaderAdapter: metadata queue full "
+                f"({self._meta_queue.maxsize} slots). "
+                "This indicates meta_queue_size is too small relative to the "
+                "configured DALI queue depths (dali_cpu_queue + dali_gpu_queue). "
+                "Increase meta_queue_size in _ReaderAdapter or reduce DALI "
+                "queue depths. "
+                f"Current meta_queue_size={self._meta_queue.maxsize}. "
+                "Expected max in-flight ≈ dali_cpu_queue + dali_gpu_queue + "
+                "prefetch_factor (typically ≤ 24 with defaults)."
             )
-            # Drop oldest to maintain FIFO alignment rather than the incoming
-            # entry — the consumer is behind, not ahead.
-            try:
-                self._meta_queue.get_nowait()
-            except queue.Empty:
-                pass
-            self._meta_queue.put_nowait(metadata)
+            raise RuntimeError(msg)
         return jpegs
 
     def pop_last_metadata(self) -> list[dict | None]:
